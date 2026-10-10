@@ -1,0 +1,43 @@
+# `prek run --all-files` applies every hook to all files. CI runs the same command.
+# Local hooks call tools through `mise exec`, so that git hooks get the
+# versions pinned in mise.toml.
+
+default_install_hook_types = ["pre-commit", "commit-msg"]
+# Without this, every hook also runs in the commit-msg stage.
+default_stages = ["pre-commit"]
+
+[[repos]]
+repo = "builtin"
+hooks = [
+  { id = "trailing-whitespace" },
+  { id = "end-of-file-fixer" },
+  { id = "mixed-line-ending" },
+  { id = "check-yaml" },
+  { id = "check-toml" },
+  { id = "check-merge-conflict" },
+  { id = "check-added-large-files" },
+  { id = "detect-private-key" },
+]
+
+[[repos]]
+repo = "local"
+hooks = [
+  { id = "golangci-fmt", name = "golangci-lint fmt", language = "system", entry = "mise exec -- golangci-lint fmt", pass_filenames = false, types = [
+    "go",
+  ] },
+  { id = "golangci-lint", name = "golangci-lint run", language = "system", entry = "mise exec -- golangci-lint run ./...", pass_filenames = false, types = [
+    "go",
+  ] },
+  { id = "golangci-lint-darwin", name = "golangci-lint run (darwin)", language = "system", entry = "env GOOS=darwin mise exec -- golangci-lint run --build-tags e2e ./...", pass_filenames = false, types = [
+    "go",
+  ] },
+  { id = "go-mod-tidy", name = "go mod tidy", language = "system", entry = "mise exec -- go mod tidy", pass_filenames = false, files = '(^|/)go\.(mod|sum)$|\.go$' },
+  { id = "jactionlint", name = "jactionlint", language = "system", entry = "mise exec -- jactionlint", files = '^\.github/workflows/.*\.ya?ml$' },
+]
+
+# Conventional Commits subject. git's own merge, revert, and autosquash subjects also pass.
+[[repos]]
+repo = "local"
+hooks = [
+  { id = "conventional-commit", name = "commit subject is <type>[(scope)][!]: <summary> (feat fix perf refactor test docs build ci chore)", language = "pygrep", stages = ["commit-msg"], args = ["--negate", "--multiline"], entry = '\A(?:(?:feat|fix|perf|refactor|test|docs|build|ci|chore)(?:\([a-z0-9-]+\))?!?: \S|Merge |Revert "|(?:fixup|squash|amend)! )' },
+]

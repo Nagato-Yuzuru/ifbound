@@ -1,0 +1,55 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - errorlint
+    - err113
+    - containedctx
+    - contextcheck
+    - exhaustive
+    - gochecksumtype
+    - bodyclose
+    - noctx
+    - gochecknoglobals
+    - gochecknoinits
+    - gocognit
+    - nestif
+    - revive
+    - sloglint
+    - nolintlint
+    - godox
+  settings:
+    godox:
+      keywords: [XXX, BUG] # the non-canonical spellings of WARN and FIXME
+    errorlint:
+      errorf: false # deliberate %v keeps foreign causes out of the %w contract chain
+    sloglint:
+      static-msg: true # variables go in attrs, not the message
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+    gocognit:
+      min-complexity: 20
+    exhaustive:
+      default-signifies-exhaustive: false # a default case never satisfies exhaustiveness
+    revive:
+      rules:
+        - name: context-as-argument
+        - name: deep-exit
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - err113 # ad-hoc errors are fine in test bodies
+          - gochecknoglobals
+
+issues:
+  uniq-by-line: false # report every finding, even on the same line
+
+formatters:
+  enable:
+    - gofmt
