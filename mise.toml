@@ -1,0 +1,32 @@
+[tools]
+go = "1.27.1"
+golangci-lint = "2.14.0"
+jactionlint = "2.1.0"
+# The local end-to-end VM needs a macOS host. CI sets MISE_DISABLE_TOOLS=lima.
+lima = { version = "2.2.1", os = ["macos"] }
+prek = "0.5.4"
+
+[tasks."e2e:build"]
+description = "Compile the end-to-end test binary for darwin/arm64"
+env = { GOOS = "darwin", GOARCH = "arm64", CGO_ENABLED = "0" }
+run = "go test -c -tags e2e -o bin/e2e.test ./e2e"
+
+[tasks.e2e]
+description = "Run end-to-end tests as root on this host. Use only on a disposable host (CI, VM)"
+depends = ["e2e:build"]
+run = '''
+sudo env \
+  IFBOUND_E2E_DISPOSABLE="${IFBOUND_E2E_DISPOSABLE:-}" \
+  IFBOUND_E2E_STRICT="${IFBOUND_E2E_STRICT:-}" \
+  ./bin/e2e.test -test.v
+'''
+
+[tasks."vm:e2e"]
+description = "Run end-to-end tests in the Lima macOS guest `ifbound-e2e`"
+depends = ["e2e:build"]
+run = '''
+limactl shell ifbound-e2e sudo env \
+  IFBOUND_E2E_DISPOSABLE=1 \
+  IFBOUND_E2E_STRICT=1 \
+  "{{config_root}}/bin/e2e.test" -test.v
+'''
