@@ -22,13 +22,21 @@ import (
 
 const (
 	// MaxFrameSize is the largest accepted JSON payload, in bytes. It fits
-	// about 2400 IPv6 addresses, the largest DNS-over-TCP answer.
-	MaxFrameSize = 128 << 10
+	// the observation of the largest DNS-over-TCP message (64 KiB). The
+	// densest address form is an ipv4hint: 4 octets for each address. So
+	// one message has at most 16384 addresses, and each takes up to 18
+	// JSON bytes (288 KiB). MaxAliases names of 255 octets add at most
+	// about 49 KiB, because JSON can escape one octet into 6 bytes. The
+	// qname adds at most 1.5 KiB. The sum is about 339 KiB.
+	MaxFrameSize = 512 << 10
 	// MaxQNameLen is the longest accepted qname, in bytes of presentation
 	// text. A wire name has up to 255 octets, and the presentation form can
 	// escape each octet as \DDD (4 bytes), so 1024 covers every valid name.
-	// The package does not parse labels. The handler owns that check.
+	// The package does not parse labels. The handler owns that check. The
+	// same limit applies to an alias name.
 	MaxQNameLen = 1024
+	// MaxAliases is the largest number of aliases in one observation.
+	MaxAliases = 32
 	// MaxTimeout is the largest handler deadline that the server honors.
 	// Report clamps the deadline that it sends to this value.
 	MaxTimeout = 30 * time.Second
@@ -37,7 +45,7 @@ const (
 	// below MaxFrameSize, whatever the peer sent.
 	maxReasonLen = 256
 
-	protocolVersion = 1
+	protocolVersion = 2
 
 	typeObserve = "observe"
 	typeAck     = "ack"
@@ -58,12 +66,18 @@ type envelope struct {
 }
 
 type observeBody struct {
-	QName      string   `json:"qname"`
-	Addrs      []string `json:"addrs"`
-	TTLSeconds uint32   `json:"ttl_s"`
+	QName      string      `json:"qname"`
+	Addrs      []string    `json:"addrs"`
+	TTLSeconds uint32      `json:"ttl_s"`
+	Aliases    []aliasBody `json:"aliases,omitempty"`
 	// TimeoutMS is the time the client waits, from 1 to MaxTimeout. The
 	// server gives the handler a context with this deadline.
 	TimeoutMS int64 `json:"timeout_ms"`
+}
+
+type aliasBody struct {
+	Name       string `json:"name"`
+	TTLSeconds uint32 `json:"ttl_s"`
 }
 
 type rejectBody struct {
