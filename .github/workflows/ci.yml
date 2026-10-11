@@ -13,8 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # CI does not start a VM, so it does not need Lima.
-  MISE_DISABLE_TOOLS: lima
+  # CI does not start a VM, so it does not need tart.
+  MISE_DISABLE_TOOLS: tart
 
 jobs:
   check:

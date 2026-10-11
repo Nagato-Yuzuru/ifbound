@@ -190,3 +190,6 @@ Temporary Items
 
 # Claude Code private instructions
 CLAUDE.local.md
+
+# Per-host mise overrides, such as a registry mirror
+mise.local.toml

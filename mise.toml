@@ -2,9 +2,14 @@
 go = "1.27.1"
 golangci-lint = "2.14.0"
 jactionlint = "2.1.0"
-# The local end-to-end VM needs a macOS host. CI sets MISE_DISABLE_TOOLS=lima.
-lima = { version = "2.2.1", os = ["macos"] }
 prek = "0.5.4"
+# The local end-to-end VM needs a macOS host. CI sets MISE_DISABLE_TOOLS=tart.
+tart = { version = "2.40.1", os = ["macos"] }
+
+[env]
+# Base image of the end-to-end guest, pinned by digest. A registry mirror
+# serves the same digest: override the host in mise.local.toml.
+IFBOUND_VM_IMAGE = "ghcr.io/cirruslabs/macos-golden-gate-base@sha256:5302a9ea6cd68c059d00fa253fe75c8ebdf4e0dc8c45d4e136ecc6e7a4c02b70"
 
 [tasks."e2e:build"]
 description = "Compile the end-to-end test binary for darwin/arm64"
@@ -22,11 +27,34 @@ sudo env \
 '''
 
 [tasks."vm:e2e"]
-description = "Run end-to-end tests in the Lima macOS guest `ifbound-e2e`"
+description = "Run end-to-end tests in a headless tart guest. Clone and start the guest when necessary"
 depends = ["e2e:build"]
+usage = 'arg "[vm]" help="Name of the tart guest" default="ifbound-e2e"'
+# The base image has passwordless sudo and the tart guest agent, which
+# `tart exec` needs. The guest sees the repository read-only at /Volumes/My
+# Shared Files/ifbound.
 run = '''
-limactl shell ifbound-e2e sudo env \
+vm="${usage_vm}"
+if ! tart list --quiet --source local | grep -qx "$vm"; then
+  tart clone "$IFBOUND_VM_IMAGE" "$vm"
+fi
+if ! tart exec "$vm" true 2>/dev/null; then
+  nohup tart run --no-graphics --dir="ifbound:{{config_root}}:ro" "$vm" \
+    >"{{config_root}}/bin/$vm.log" 2>&1 &
+  tries=0
+  until tart exec "$vm" true 2>/dev/null; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 90 ]; then
+      echo "guest $vm is not ready after 180 s; see bin/$vm.log" >&2
+      exit 1
+    fi
+    sleep 2
+  done
+fi
+# The guest agent's PATH does not include /sbin, where ifconfig and pfctl are.
+tart exec "$vm" sudo env \
+  PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   IFBOUND_E2E_DISPOSABLE=1 \
   IFBOUND_E2E_STRICT=1 \
-  "{{config_root}}/bin/e2e.test" -test.v
+  "/Volumes/My Shared Files/ifbound/bin/e2e.test" -test.v
 '''
