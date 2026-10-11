@@ -119,6 +119,14 @@ func (f *fixture) observe(t *testing.T, name policy.Name, addrs ...string) {
 	}
 }
 
+// learn records aliases of a policy, as a DNS report does.
+func (f *fixture) learn(t *testing.T, name policy.Name, aliases ...string) {
+	t.Helper()
+	if _, err := f.book.ObserveAliases(name, aliases, time.Minute); err != nil {
+		t.Fatalf("ObserveAliases: %v", err)
+	}
+}
+
 func (f *fixture) reconfigure(t *testing.T, cfgText string) {
 	t.Helper()
 	f.cfg = parse(t, cfgText)
@@ -204,10 +212,10 @@ func TestConvergeInstallsDesiredStateFromEmptyWorld(t *testing.T) {
 	if got, want := f.world.Ruleset().ID(), f.compiled(t, en0); got != want {
 		t.Errorf("loaded ruleset = %q, want %q", got, want)
 	}
-	checkResolver(t, f.world, f.cfg.DNS.Listen, "ads.example", "example.com", "example.net")
-	// Two table fills, one load, three resolver entries.
-	if rep.Writes != 6 || f.world.Writes() != 6 {
-		t.Errorf("writes: report %d, world %d, want 6", rep.Writes, f.world.Writes())
+	checkResolver(t, f.world, f.cfg.DNS.Listen, entriesV1...)
+	// Two table fills, one load, three apex entries, the canary entry.
+	if rep.Writes != 7 || f.world.Writes() != 7 {
+		t.Errorf("writes: report %d, world %d, want 7", rep.Writes, f.world.Writes())
 	}
 	if rep.Installed != f.compiled(t, en0) {
 		t.Errorf("installed = %q, want the compiled ruleset", rep.Installed)
@@ -233,7 +241,7 @@ func TestConvergeRepairsExternalFlush(t *testing.T) {
 	rep := f.converge(t)
 
 	checkTables(t, f.world, tablesV1)
-	checkResolver(t, f.world, f.cfg.DNS.Listen, "ads.example", "example.com", "example.net")
+	checkResolver(t, f.world, f.cfg.DNS.Listen, entriesV1...)
 	if rep.Writes != 2 {
 		t.Errorf("writes = %d, want 2 (one table fill, one resolver entry)", rep.Writes)
 	}
@@ -270,7 +278,7 @@ func TestConvergeConfigChangeAddsAndRemovesPolicy(t *testing.T) {
 	if got := f.world.Referenced(); !slices.Equal(got, []policy.Name{"web", "mail"}) {
 		t.Errorf("referenced tables = %v, want [web mail]", got)
 	}
-	checkResolver(t, f.world, f.cfg.DNS.Listen, "example.com", "example.net", "mail.example.org")
+	checkResolver(t, f.world, f.cfg.DNS.Listen, "example.com", "example.net", "mail.example.org", canary)
 }
 
 func TestConvergeWithNoPoliciesRemovesEverything(t *testing.T) {
@@ -312,9 +320,9 @@ func TestConvergeRewritesResolverEntryWhenListenChanges(t *testing.T) {
 
 	rep := f.converge(t)
 
-	checkResolver(t, f.world, f.cfg.DNS.Listen, "ads.example", "example.com", "example.net")
-	if rep.Writes != 3 {
-		t.Errorf("writes = %d, want 3", rep.Writes)
+	checkResolver(t, f.world, f.cfg.DNS.Listen, entriesV1...)
+	if rep.Writes != 4 {
+		t.Errorf("writes = %d, want 4", rep.Writes)
 	}
 }
 
@@ -347,9 +355,9 @@ func TestConvergeRunsResolverPartWhenBackendFails(t *testing.T) {
 	if f.world.Ruleset().ID() != "" {
 		t.Error("ruleset loaded after a failed table fill")
 	}
-	checkResolver(t, f.world, f.cfg.DNS.Listen, "ads.example", "example.com", "example.net")
-	if rep.Writes != 3 {
-		t.Errorf("writes = %d, want 3 (resolver only)", rep.Writes)
+	checkResolver(t, f.world, f.cfg.DNS.Listen, entriesV1...)
+	if rep.Writes != 4 {
+		t.Errorf("writes = %d, want 4 (resolver only)", rep.Writes)
 	}
 	if rep.Installed != "" {
 		t.Errorf("installed = %q after a failed Backend part, want empty", rep.Installed)

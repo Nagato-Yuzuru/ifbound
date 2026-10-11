@@ -51,8 +51,8 @@ func (f fault) String() string {
 func TestFaultAtEveryWriteKeepsAcknowledgedAddressesBlocked(t *testing.T) {
 	var total int
 	synctest.Test(t, func(t *testing.T) { total = faultScenario(t, 0, crash) })
-	if total != 21 {
-		t.Fatalf("the scenario has %d writes, want 21: it no longer covers every kind of step", total)
+	if total != 22 {
+		t.Fatalf("the scenario has %d writes, want 22: it no longer covers every kind of step", total)
 	}
 	for _, mode := range []fault{crash, transient} {
 		for failAt := 1; failAt <= total; failAt++ {
@@ -159,7 +159,7 @@ func checkRecovered(t *testing.T, world *reconciletest.World, acks *ackLog) {
 	for _, e := range world.ResolverEntries() {
 		domains = append(domains, e.Domain.String())
 	}
-	if want := []string{"example.com", "example.net", "mail.example.org"}; !slices.Equal(domains, want) {
+	if want := []string{"example.com", "example.net", "mail.example.org", "use-application-dns.net"}; !slices.Equal(domains, want) {
 		t.Errorf("resolver entries = %v, want %v", domains, want)
 	}
 }
