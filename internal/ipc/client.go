@@ -1,0 +1,153 @@
+package ipc
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/netip"
+	"time"
+)
+
+var (
+	// ErrUnavailable means the client could not reach ifboundd or lost the
+	// connection before it got a reply.
+	ErrUnavailable = errors.New("ipc: server unavailable")
+	// ErrRejected means ifboundd refused the observation.
+	ErrRejected = errors.New("ipc: observation rejected")
+)
+
+// DefaultTimeout bounds a Report call whose context has no deadline.
+const DefaultTimeout = 5 * time.Second
+
+// Observation is one DNS answer.
+type Observation struct {
+	QName string
+	Addrs []netip.Addr
+	TTL   time.Duration
+}
+
+// Client reports observations to ifboundd. It is safe for concurrent use.
+// The in-flight limit is per Client, so a process should create one Client
+// and share it.
+// Each call uses its own connection, so a broken connection never affects
+// the next call.
+type Client struct {
+	path      string
+	serverUID uint32
+	inflight  chan struct{}
+}
+
+// maxInFlight bounds the Reports that run at once. It stays below the
+// smallest common listen backlog (128), so a burst waits in the client and
+// does not overflow the server queue.
+const maxInFlight = 32
+
+// NewClient returns a client for the socket at path. It trusts a reply only
+// from a server that runs as serverUID. Production passes 0.
+func NewClient(path string, serverUID uint32) *Client {
+	return &Client{path: path, serverUID: serverUID, inflight: make(chan struct{}, maxInFlight)}
+}
+
+// Report sends o and waits for the ack. It returns nil only after an ack.
+// The error set is: ErrUnavailable (no connection, lost connection),
+// ErrRejected (the server refused; the message has the reason), ErrProtocol
+// (malformed reply), ErrFrameTooLarge, and the context error when ctx ends.
+// Without a ctx deadline, DefaultTimeout applies. At most maxInFlight calls
+// run at once; a call that waits for a slot ends with the ctx error when ctx
+// ends. The server honors waits of up to 30 seconds. A server that runs as
+// another uid than the expected one gives ErrUnavailable.
+func (c *Client) Report(ctx context.Context, o Observation) error {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultTimeout)
+		defer cancel()
+	}
+
+	select {
+	case c.inflight <- struct{}{}:
+		defer func() { <-c.inflight }()
+	case <-ctx.Done():
+		return fmt.Errorf("reporting %s: %w", o.QName, ctx.Err())
+	}
+	err := c.roundTrip(ctx, o)
+	if err != nil && ctx.Err() != nil {
+		return fmt.Errorf("reporting %s: %w", o.QName, ctx.Err())
+	}
+	return err
+}
+
+func (c *Client) roundTrip(ctx context.Context, o Observation) error {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "unix", c.path)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	defer func() { _ = conn.Close() }() // read-only use after the reply; nothing to flush
+
+	uid, err := peerUID(conn)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+	}
+	if uid != c.serverUID {
+		return fmt.Errorf("%w: server runs as uid %d, want %d", ErrUnavailable, uid, c.serverUID)
+	}
+
+	// The context is the only source of deadlines. This keeps the context
+	// error and the I/O error in the same order.
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
+
+	if err := writeFrame(conn, newObserveEnvelope(ctx, o)); err != nil {
+		return wrapIO(err)
+	}
+	reply, err := readFrame(conn)
+	if err != nil {
+		return wrapIO(err)
+	}
+	return interpretReply(reply)
+}
+
+func newObserveEnvelope(ctx context.Context, o Observation) envelope {
+	addrs := make([]string, len(o.Addrs))
+	for i, a := range o.Addrs {
+		addrs[i] = a.String()
+	}
+	body := observeBody{
+		QName:      o.QName,
+		Addrs:      addrs,
+		TTLSeconds: uint32(min(max(o.TTL/time.Second, 0), 1<<32-1)), //nolint:gosec // clamped to the uint32 range
+	}
+	// Report sets a deadline, so ctx always has one.
+	dl, _ := ctx.Deadline()
+	body.TimeoutMS = min(max(time.Until(dl).Milliseconds(), 1), MaxTimeout.Milliseconds())
+	return envelopeOf(typeObserve, body)
+}
+
+// wrapIO keeps protocol errors visible and maps transport failures to
+// ErrUnavailable.
+func wrapIO(err error) error {
+	if errors.Is(err, ErrFrameTooLarge) || errors.Is(err, ErrProtocol) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrUnavailable, err)
+}
+
+func interpretReply(env envelope) error {
+	if env.Version != protocolVersion {
+		return fmt.Errorf("%w: reply version %d", ErrProtocol, env.Version)
+	}
+	switch env.Type {
+	case typeAck:
+		return nil
+	case typeReject:
+		var b rejectBody
+		if err := json.Unmarshal(env.Body, &b); err != nil {
+			return fmt.Errorf("%w: reject body: %v", ErrProtocol, err)
+		}
+		return fmt.Errorf("%w: %s", ErrRejected, b.Reason)
+	default:
+		return fmt.Errorf("%w: reply type %q", ErrProtocol, env.Type)
+	}
+}
