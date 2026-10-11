@@ -43,6 +43,23 @@ jobs:
       - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
       - run: go test -race ./...
 
+  test-root:
+    name: test (linux, root)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@7a4e45a543138629540c9a1616d08632b893e492 # v5.0.1
+      # The peer uid checks need a second, real uid, so these tests skip
+      # without root. A skip here is a failure: grep finds it.
+      - shell: bash # adds pipefail, so a test failure is not hidden by tee
+        run: |
+          sudo env "PATH=$PATH" go test -race -count=1 -v \
+            -run 'TestCrossUID|Impostor' ./internal/ipc/ | tee root-test.log
+          ! grep -E -- '--- SKIP: (TestCrossUID|TestCrossUIDImpostor) ' root-test.log
+
   e2e:
     name: e2e (macOS, root)
     runs-on: macos-latest
