@@ -1,0 +1,39 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+  extends: ["config:recommended", "helpers:pinGitHubActionDigestsToSemver"],
+  // The commit-msg hook and the pr-title check require Conventional Commits.
+  semanticCommits: "enabled",
+  // A new release must be 7 days old before an update branch exists.
+  minimumReleaseAge: "7 days",
+  internalChecksFilter: "strict",
+  postUpdateOptions: ["gomodTidy"],
+  packageRules: [
+    {
+      matchUpdateTypes: ["minor", "patch", "digest", "pinDigest"],
+      automerge: true,
+    },
+    {
+      // The default disables indirect Go modules. A vulnerability in an
+      // indirect module (for example golang.org/x/net) then gets no update.
+      matchManagers: ["gomod"],
+      matchDepTypes: ["indirect"],
+      enabled: true,
+      groupName: "indirect Go modules",
+    },
+    {
+      // The DNS plugin depends on the behavior of these modules. A person
+      // reviews each update.
+      matchPackageNames: [
+        "github.com/coredns/coredns",
+        "github.com/coredns/caddy",
+        "github.com/miekg/dns",
+      ],
+      automerge: false,
+    },
+    {
+      // Renovate cannot always refresh mise.lock.
+      matchManagers: ["mise"],
+      automerge: false,
+    },
+  ],
+}
