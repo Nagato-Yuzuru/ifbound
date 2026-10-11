@@ -7,6 +7,16 @@
   minimumReleaseAge: "7 days",
   internalChecksFilter: "strict",
   postUpdateOptions: ["gomodTidy"],
+  // GitHub advisories miss many Go vulnerabilities. osv.dev includes the
+  // Go vulnerability database that govulncheck uses.
+  osvVulnerabilityAlerts: true,
+  // A security update skips the 7-day wait and goes to the lowest fixed
+  // version. Without the wait, a compromised release is not filtered out,
+  // so a person reviews each one.
+  vulnerabilityAlerts: {
+    automerge: false,
+    labels: ["security"],
+  },
   packageRules: [
     {
       matchUpdateTypes: ["minor", "patch", "digest", "pinDigest"],
