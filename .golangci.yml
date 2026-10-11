@@ -36,6 +36,8 @@ linters:
       min-complexity: 20
     exhaustive:
       default-signifies-exhaustive: false # a default case never satisfies exhaustiveness
+    gochecksumtype:
+      default-signifies-exhaustive: false # same rule for sealed interfaces
     revive:
       rules:
         - name: context-as-argument
