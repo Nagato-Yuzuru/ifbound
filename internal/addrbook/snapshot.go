@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -14,10 +15,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/dnsname"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
-const snapshotVersion = 1
+// snapshotVersion is the version that Save writes. Version 2 added the
+// aliases. Load also reads version 1, which has no aliases key.
+const snapshotVersion = 2
 
 // Errors that Save and Load return.
 var (
@@ -39,8 +43,10 @@ var (
 var (
 	errNull             = errors.New("null value")
 	errEmptyName        = errors.New("empty policy name")
-	errNotCanonical     = errors.New("address is not canonical")
+	errNotCanonical     = errors.New("key is not in canonical form")
 	errExpiryBeforeSeen = errors.New("expiry before last_seen")
+	errNotArray         = errors.New("not an array")
+	errDuplicate        = errors.New("duplicate")
 )
 
 const tempInfix = ".addrbook-tmp-"
@@ -48,6 +54,7 @@ const tempInfix = ".addrbook-tmp-"
 type snapshotFile struct {
 	Version int             `json:"version"`
 	Entries []snapshotEntry `json:"entries"`
+	Aliases []snapshotAlias `json:"aliases"`
 }
 
 // snapshotEntry stores times as integers. A monotonic clock reading then
@@ -60,10 +67,32 @@ type snapshotEntry struct {
 	ExpiryNano   int64       `json:"expiry_unix_nano"`
 }
 
-func topFields() []string { return []string{"version", "entries"} }
+// snapshotAlias is one alias record. Alias holds the String of a
+// dnsname.Name.
+type snapshotAlias struct {
+	Policy       policy.Name `json:"policy"`
+	Alias        string      `json:"alias"`
+	LastSeenNano int64       `json:"last_seen_unix_nano"`
+	TTLNano      int64       `json:"ttl_nano"`
+	ExpiryNano   int64       `json:"expiry_unix_nano"`
+}
 
-func entryFields() []string {
-	return []string{"policy", "addr", "last_seen_unix_nano", "ttl_nano", "expiry_unix_nano"}
+// topFields returns the top-level keys of a snapshot version. The bool
+// is false for a version that Load does not know.
+func topFields(version int) ([]string, bool) {
+	switch version {
+	case 1:
+		return []string{"version", "entries"}, true
+	case snapshotVersion:
+		return []string{"version", "entries", "aliases"}, true
+	}
+	return nil, false
+}
+
+// itemFields returns the keys of an entry (key "addr") or an alias (key
+// "alias").
+func itemFields(key string) []string {
+	return []string{"policy", key, "last_seen_unix_nano", "ttl_nano", "expiry_unix_nano"}
 }
 
 // Save writes the book to path. It removes the temporary files of earlier
@@ -100,34 +129,55 @@ func (b *AddrBook) Save(path string) error {
 	if err := syncDir(dir); err != nil {
 		return fmt.Errorf("save addrbook: %w", err)
 	}
-	for _, byAddr := range b.entries {
-		for _, r := range byAddr {
+	markSaved(b.entries)
+	markSaved(b.aliases)
+	return nil
+}
+
+func markSaved[K comparable](byPolicy map[policy.Name]map[K]*record) {
+	for _, byKey := range byPolicy {
+		for _, r := range byKey {
 			r.savedExpiry = r.expiry
 		}
 	}
-	return nil
 }
 
 func osRename(oldpath, newpath string) error { return os.Rename(oldpath, newpath) }
 
 func (b *AddrBook) encode() ([]byte, error) {
-	var all []Entry
-	for name, byAddr := range b.entries {
-		for a, r := range byAddr {
-			all = append(all, entryOf(name, a, r))
-		}
-	}
-	sortEntries(all)
-	out := make([]snapshotEntry, len(all))
-	for i, e := range all {
-		for _, t := range []time.Time{e.LastSeen, e.Expiry} {
-			if !t.Equal(time.Unix(0, t.UnixNano())) {
-				return nil, fmt.Errorf("%w: %v", ErrTimeRange, t)
+	f := snapshotFile{Version: snapshotVersion, Entries: []snapshotEntry{}, Aliases: []snapshotAlias{}}
+	for _, name := range slices.Sorted(maps.Keys(b.entries)) {
+		for _, a := range b.Addrs(name) {
+			r := b.entries[name][a]
+			seen, exp, err := unixNanos(r)
+			if err != nil {
+				return nil, err
 			}
+			f.Entries = append(f.Entries, snapshotEntry{name, a, seen, int64(r.ttl), exp})
 		}
-		out[i] = snapshotEntry{e.Policy, e.Addr, e.LastSeen.UnixNano(), int64(e.TTL), e.Expiry.UnixNano()}
 	}
-	return json.Marshal(snapshotFile{Version: snapshotVersion, Entries: out})
+	for _, name := range slices.Sorted(maps.Keys(b.aliases)) {
+		for _, n := range b.Aliases(name) {
+			r := b.aliases[name][n]
+			seen, exp, err := unixNanos(r)
+			if err != nil {
+				return nil, err
+			}
+			f.Aliases = append(f.Aliases, snapshotAlias{name, n.String(), seen, int64(r.ttl), exp})
+		}
+	}
+	return json.Marshal(f)
+}
+
+// unixNanos returns last_seen and expiry as Unix nanoseconds, or
+// ErrTimeRange for a time that they cannot hold.
+func unixNanos(r *record) (seen, exp int64, err error) {
+	for _, t := range []time.Time{r.lastSeen, r.expiry} {
+		if !t.Equal(time.Unix(0, t.UnixNano())) {
+			return 0, 0, fmt.Errorf("%w: %v", ErrTimeRange, t)
+		}
+	}
+	return r.lastSeen.UnixNano(), r.expiry.UnixNano(), nil
 }
 
 // removeTemps deletes the temporary files that an earlier crashed Save
@@ -196,11 +246,11 @@ func (b *AddrBook) Load(path string) error {
 	if missing {
 		return nil
 	}
-	loaded, err := b.decode(data)
+	entries, aliases, err := b.decode(data)
 	if err != nil {
 		return fmt.Errorf("load addrbook %s: %w", path, err)
 	}
-	b.entries = loaded
+	b.entries, b.aliases = entries, aliases
 	return nil
 }
 
@@ -232,74 +282,128 @@ func badf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrSnapshot, fmt.Sprintf(format, args...))
 }
 
-func (b *AddrBook) decode(data []byte) (map[policy.Name]map[netip.Addr]*record, error) {
-	top, err := objectFields(data, topFields())
+func (b *AddrBook) decode(data []byte) (map[policy.Name]map[netip.Addr]*record, map[policy.Name]map[dnsname.Name]*record, error) {
+	top, err := objectFields(data)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if _, ok := top["version"]; !ok {
+		return nil, nil, badf("missing key %q", "version")
 	}
 	var version int
-	if err := json.Unmarshal(top["version"], &version); err != nil || version != snapshotVersion {
-		return nil, badf("unknown version %s", top["version"])
+	if err := json.Unmarshal(top["version"], &version); err != nil {
+		return nil, nil, badf("unknown version %s", top["version"])
 	}
-	rawEntries := bytes.TrimSpace(top["entries"])
-	if len(rawEntries) == 0 || rawEntries[0] != '[' {
-		return nil, badf("entries is not an array")
+	want, ok := topFields(version)
+	if !ok {
+		return nil, nil, badf("unknown version %s", top["version"])
+	}
+	if err := exactFields(top, want); err != nil {
+		return nil, nil, err
+	}
+	entries, err := decodeItems(b, top["entries"], "addr", parseAddr)
+	if err != nil {
+		return nil, nil, badf("entries: %v", err)
+	}
+	aliases := make(map[policy.Name]map[dnsname.Name]*record)
+	if raw, ok := top["aliases"]; ok {
+		if aliases, err = decodeItems(b, raw, "alias", parseAlias); err != nil {
+			return nil, nil, badf("aliases: %v", err)
+		}
+	}
+	return entries, aliases, nil
+}
+
+func parseAddr(s string) (netip.Addr, error) {
+	a, err := netip.ParseAddr(s)
+	switch {
+	case err != nil:
+		return netip.Addr{}, err
+	case a.Zone() != "" || a.Is4In6():
+		return netip.Addr{}, errNotCanonical
+	}
+	return a, nil
+}
+
+// parseAlias accepts only the String of a dnsname.Name, so one alias has
+// one spelling in a snapshot.
+func parseAlias(s string) (dnsname.Name, error) {
+	n, err := dnsname.Parse(s)
+	switch {
+	case err != nil:
+		return dnsname.Name{}, err
+	case n.String() != s:
+		return dnsname.Name{}, errNotCanonical
+	}
+	return n, nil
+}
+
+// decodeItems decodes a JSON array of records. Each record has the key
+// field keyField, which parse reads.
+func decodeItems[K comparable](b *AddrBook, raw json.RawMessage, keyField string, parse func(string) (K, error)) (map[policy.Name]map[K]*record, error) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || raw[0] != '[' {
+		return nil, errNotArray
 	}
 	var items []json.RawMessage
-	if err := json.Unmarshal(rawEntries, &items); err != nil {
-		return nil, badf("entries: %v", err)
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, err
 	}
-	out := make(map[policy.Name]map[netip.Addr]*record)
+	out := make(map[policy.Name]map[K]*record)
 	for i, item := range items {
-		name, a, r, err := b.decodeEntry(item)
+		name, keyText, r, err := b.decodeItem(item, keyField)
 		if err != nil {
-			return nil, badf("entry %d: %v", i, err)
+			return nil, fmt.Errorf("item %d: %w", i, err)
+		}
+		k, err := parse(keyText)
+		if err != nil {
+			return nil, fmt.Errorf("item %d: %s: %w", i, keyField, err)
 		}
 		if out[name] == nil {
-			out[name] = make(map[netip.Addr]*record)
+			out[name] = make(map[K]*record)
 		}
-		if _, dup := out[name][a]; dup {
-			return nil, badf("entry %d: duplicate", i)
+		if _, dup := out[name][k]; dup {
+			return nil, fmt.Errorf("item %d: %w", i, errDuplicate)
 		}
-		out[name][a] = r
+		out[name][k] = r
 	}
 	return out, nil
 }
 
-func (b *AddrBook) decodeEntry(item json.RawMessage) (policy.Name, netip.Addr, *record, error) {
-	f, err := objectFields(item, entryFields())
+// decodeItem decodes one record. It returns the text of the key field
+// unparsed.
+func (b *AddrBook) decodeItem(item json.RawMessage, keyField string) (policy.Name, string, *record, error) {
+	f, err := objectFields(item)
 	if err != nil {
-		return "", netip.Addr{}, nil, err
+		return "", "", nil, err
+	}
+	if err := exactFields(f, itemFields(keyField)); err != nil {
+		return "", "", nil, err
 	}
 	var (
 		name                       string
-		addrText                   string
+		keyText                    string
 		seenNano, ttlNano, expNano int64
 	)
 	targets := map[string]any{
-		"policy": &name, "addr": &addrText,
+		"policy": &name, keyField: &keyText,
 		"last_seen_unix_nano": &seenNano, "ttl_nano": &ttlNano, "expiry_unix_nano": &expNano,
 	}
 	for field, dst := range targets {
 		if string(bytes.TrimSpace(f[field])) == "null" {
-			return "", netip.Addr{}, nil, fmt.Errorf("%s: %w", field, errNull)
+			return "", "", nil, fmt.Errorf("%s: %w", field, errNull)
 		}
 		if err := json.Unmarshal(f[field], dst); err != nil {
-			return "", netip.Addr{}, nil, fmt.Errorf("%s: %w", field, err)
+			return "", "", nil, fmt.Errorf("%s: %w", field, err)
 		}
 	}
-	a, err := netip.ParseAddr(addrText)
 	switch {
 	case name == "":
-		return "", netip.Addr{}, nil, errEmptyName
-	case err != nil:
-		return "", netip.Addr{}, nil, fmt.Errorf("addr: %w", err)
-	case a.Zone() != "" || a.Is4In6():
-		return "", netip.Addr{}, nil, errNotCanonical
+		return "", "", nil, errEmptyName
 	case ttlNano < 0:
-		return "", netip.Addr{}, nil, ErrNegativeTTL
+		return "", "", nil, ErrNegativeTTL
 	case expNano < seenNano:
-		return "", netip.Addr{}, nil, errExpiryBeforeSeen
+		return "", "", nil, errExpiryBeforeSeen
 	}
 	r := &record{
 		lastSeen:    time.Unix(0, seenNano).UTC(),
@@ -310,27 +414,24 @@ func (b *AddrBook) decodeEntry(item json.RawMessage) (policy.Name, netip.Addr, *
 	if floor := r.lastSeen.Add(max(r.ttl, b.retain)); floor.After(r.expiry) {
 		r.expiry = floor
 	}
-	return policy.Name(name), a, r, nil
+	return policy.Name(name), keyText, r, nil
 }
 
-// objectFields splits a JSON object into its raw values. It accepts only
-// the allowed keys, spelled exactly, each once and all present, and
-// nothing after the object. The standard decoder folds key case and
-// allows duplicate keys, so the walk is by hand.
-func objectFields(data []byte, allowed []string) (map[string]json.RawMessage, error) {
+// objectFields splits a JSON object into its raw values. It accepts each
+// key once, spelled exactly, and nothing after the object. The caller
+// checks the key set with exactFields. The standard decoder folds key
+// case and allows duplicate keys, so the walk is by hand.
+func objectFields(data []byte) (map[string]json.RawMessage, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return nil, badf("not an object")
 	}
-	fields := make(map[string]json.RawMessage, len(allowed))
+	fields := make(map[string]json.RawMessage)
 	for dec.More() {
 		tok, err := dec.Token()
 		key, isStr := tok.(string)
 		if err != nil || !isStr {
 			return nil, badf("malformed object")
-		}
-		if !slices.Contains(allowed, key) {
-			return nil, badf("unknown key %q", key)
 		}
 		if _, dup := fields[key]; dup {
 			return nil, badf("duplicate key %q", key)
@@ -347,10 +448,20 @@ func objectFields(data []byte, allowed []string) (map[string]json.RawMessage, er
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, badf("data after the document")
 	}
-	for _, k := range allowed {
+	return fields, nil
+}
+
+// exactFields checks that fields has each key of want and no other key.
+func exactFields(fields map[string]json.RawMessage, want []string) error {
+	for _, k := range want {
 		if _, ok := fields[k]; !ok {
-			return nil, badf("missing key %q", k)
+			return badf("missing key %q", k)
 		}
 	}
-	return fields, nil
+	for k := range fields {
+		if !slices.Contains(want, k) {
+			return badf("unknown key %q", k)
+		}
+	}
+	return nil
 }
