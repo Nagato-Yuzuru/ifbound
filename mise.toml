@@ -22,10 +22,11 @@ sudo env \
 '''
 
 [tasks."vm:e2e"]
-description = "Run end-to-end tests in the Lima macOS guest `ifbound-e2e`"
+description = "Run end-to-end tests in a Lima macOS guest"
 depends = ["e2e:build"]
+usage = 'arg "[vm]" help="Name of the Lima guest" default="ifbound-e2e"'
 run = '''
-limactl shell ifbound-e2e sudo env \
+limactl shell "${usage_vm}" sudo env \
   IFBOUND_E2E_DISPOSABLE=1 \
   IFBOUND_E2E_STRICT=1 \
   "{{config_root}}/bin/e2e.test" -test.v
