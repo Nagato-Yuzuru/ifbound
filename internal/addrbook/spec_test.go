@@ -315,7 +315,7 @@ func TestLoadStrictDecode(t *testing.T) {
 		"missing entries":    `{"version":1}`,
 		"null entries":       `{"version":1,"entries":null}`,
 		"entries object":     `{"version":1,"entries":{}}`,
-		"version 2":          `{"version":2,"entries":[]}`,
+		"version 99":         `{"version":99,"entries":[]}`,
 		"version 0":          `{"version":0,"entries":[]}`,
 		"version string":     `{"version":"1","entries":[]}`,
 		"version float":      `{"version":1.0,"entries":[]}`,

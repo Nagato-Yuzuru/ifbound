@@ -1,12 +1,13 @@
 package addrbook
 
 // Model-based test of the persist rule. A random sequence of Observe,
-// Save (success, failure, crash before rename), clock moves, Expire and
-// Prune runs against the book and against an independent model of the
-// spec. The model computes needSave from its own savedExpiry (the expiry
-// the last successful Save wrote) and checks it against Observe. At each
-// crash, a fresh book loads the snapshot, and for every acknowledged
-// observation o of address k, Expire at o + retain - slack must keep k.
+// ObserveAliases, Save (success, failure, crash before rename), clock
+// moves, Expire and Prune runs against the book and against an
+// independent model of the spec. The model computes needSave from its own
+// savedExpiry (the expiry the last successful Save wrote) and checks it
+// against Observe and ObserveAliases. At each crash, a fresh book loads
+// the snapshot, and for every acknowledged observation o of address or
+// alias k, Expire at o + retain - slack must keep k.
 
 import (
 	"errors"
@@ -21,12 +22,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/dnsname"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
+// oKey is an address key (alias "") or an alias key (a invalid). The
+// alias is the canonical text from oAliasPool, not from the book.
 type oKey struct {
-	p policy.Name
-	a netip.Addr
+	p     policy.Name
+	a     netip.Addr
+	alias string
 }
 
 type oMem struct {
@@ -84,7 +89,7 @@ type oWorld struct {
 }
 
 // oStats shows that a run exercised the paths the guarantee is about.
-type oStats struct{ quietAcks, savedAcks, checks, failedSaves, rangeErrs int }
+type oStats struct{ quietAcks, savedAcks, aliasAcks, checks, aliasChecks, failedSaves, rangeErrs int }
 
 func (w *oWorld) fail(format string, args ...any) {
 	w.t.Helper()
@@ -102,10 +107,22 @@ var oPool = []netip.Addr{
 	netip.MustParseAddr("::ffff:192.0.2.1"), // unmaps to the first
 }
 
+// oAliasPool holds alias spellings with the canonical text that the
+// model expects. Some spellings name one alias.
+var oAliasPool = []struct{ raw, canon string }{
+	{"cdn.example.net", "cdn.example.net"},
+	{"CDN.Example.NET.", "cdn.example.net"},
+	{`a\.b.example`, `a\.b.example`},
+	{"a.b.example", "a.b.example"},
+	{`\065\.B.example`, `a\.b.example`},
+}
+
 func pick[T any](r *rand.Rand, xs []T) T { return xs[r.IntN(len(xs))] }
 
+// step picks one operation. The first 100 of the 120 slots keep the
+// address mix; the last 20 add the alias operations on top of it.
 func (w *oWorld) step() {
-	n := w.rng.IntN(100)
+	n := w.rng.IntN(120)
 	switch {
 	case n < 35:
 		w.observe()
@@ -123,8 +140,12 @@ func (w *oWorld) step() {
 		w.expire()
 	case n < 97 && w.withExp:
 		w.prune()
-	default:
+	case n < 100:
 		w.observeBad()
+	case n < 119:
+		w.observeAliases()
+	default:
+		w.observeBadAlias()
 	}
 }
 
@@ -133,7 +154,7 @@ func (w *oWorld) move() {
 	d := pick(w.rng, []time.Duration{
 		time.Nanosecond, time.Second, 30 * time.Minute, time.Hour - time.Nanosecond,
 		time.Hour, time.Hour + time.Nanosecond, r / 2, r - w.slack, r - w.slack + time.Nanosecond,
-		r, r + time.Nanosecond, 2 * r, -time.Second, -time.Hour, -r,
+		w.slack + time.Nanosecond, r, r + time.Nanosecond, 2 * r, -time.Second, -time.Hour, -r,
 	})
 	if w.rng.IntN(60) == 0 {
 		d = pick(w.rng, []time.Duration{240 * 365 * 24 * time.Hour, -240 * 365 * 24 * time.Hour})
@@ -156,10 +177,37 @@ func (w *oWorld) observe() {
 	if err != nil {
 		w.fail("observe: %v", err)
 	}
-	want := false
 	var keys []oKey
 	for _, a := range addrs {
-		k := oKey{name, a.Unmap()}
+		keys = append(keys, oKey{p: name, a: a.Unmap()})
+	}
+	w.expectObserve(keys, ttl, got)
+}
+
+func (w *oWorld) observeAliases() {
+	name := pick(w.rng, []policy.Name{"p", "q"})
+	var raws []string
+	var keys []oKey
+	for _, al := range oAliasPool {
+		if w.rng.IntN(3) == 0 {
+			raws = append(raws, al.raw)
+			keys = append(keys, oKey{p: name, alias: al.canon})
+		}
+	}
+	ttl := pick(w.rng, []time.Duration{0, time.Second, 30 * time.Minute, 3 * time.Hour, 8 * 24 * time.Hour})
+	got, err := w.book.ObserveAliases(name, raws, ttl)
+	w.logf("observe aliases %s %q ttl=%v -> %v %v", name, raws, ttl, got, err)
+	if err != nil {
+		w.fail("observe aliases: %v", err)
+	}
+	w.expectObserve(keys, ttl, got)
+}
+
+// expectObserve applies one observation of keys to the model, checks the
+// needSave that the book gave, and acks or queues the keys.
+func (w *oWorld) expectObserve(keys []oKey, ttl time.Duration, got bool) {
+	want := false
+	for _, k := range keys {
 		newExp := w.now.Add(max(ttl, w.retain))
 		saved := time.Time{}
 		if m, ok := w.mem[k]; ok {
@@ -170,7 +218,6 @@ func (w *oWorld) observe() {
 			want = true
 		}
 		w.mem[k] = &oMem{lastSeen: w.now, ttl: ttl, expiry: newExp, saved: saved}
-		keys = append(keys, k)
 	}
 	if got != want {
 		w.fail("needSave = %v, model says %v", got, want)
@@ -198,11 +245,29 @@ func (w *oWorld) observeBad() {
 	}
 }
 
+func (w *oWorld) observeBadAlias() {
+	before := w.snapshotMem()
+	bad := pick(w.rng, []string{"", "a..b", ".", `a\`, `x\256.example`})
+	_, err := w.book.ObserveAliases("p", []string{oAliasPool[0].raw, bad}, 0)
+	w.logf("observe bad alias %q -> %v", bad, err)
+	if err == nil {
+		w.fail("observe of a bad alias succeeded")
+	}
+	if after := w.snapshotMem(); !slices.Equal(before, after) {
+		w.fail("refused alias observe changed the book: %v -> %v", before, after)
+	}
+}
+
 func (w *oWorld) snapshotMem() []string {
 	var out []string
 	for name, m := range w.book.entries {
 		for a, r := range m {
 			out = append(out, fmt.Sprintf("%s %v %v %v %v", name, a, r.lastSeen, r.ttl, r.expiry))
+		}
+	}
+	for name, m := range w.book.aliases {
+		for n, r := range m {
+			out = append(out, fmt.Sprintf("%s alias %v %v %v %v", name, n, r.lastSeen, r.ttl, r.expiry))
 		}
 	}
 	slices.Sort(out)
@@ -212,6 +277,9 @@ func (w *oWorld) snapshotMem() []string {
 // ack records the keep-until instant that the guarantee gives an
 // acknowledged observation at t under the current retain.
 func (w *oWorld) ack(k oKey, t time.Time) {
+	if k.alias != "" {
+		w.stats.aliasAcks++
+	}
 	until := t.Add(w.retain - w.slack)
 	if old, ok := w.acked[k]; !ok || until.After(old) {
 		w.acked[k] = until
@@ -286,10 +354,20 @@ func (w *oWorld) expire() {
 		w.fail("expire removed %d, model %d", len(got), len(want))
 	}
 	for _, e := range got {
-		if !slices.Contains(want, oKey{e.Policy, e.Addr}) {
-			w.fail("expire removed %v %v, model did not", e.Policy, e.Addr)
+		if !slices.Contains(want, oKeyOf(e)) {
+			w.fail("expire removed %v %v %v, model did not", e.Policy, e.Addr, e.Alias)
 		}
 	}
+}
+
+func oKeyOf(e Entry) oKey { return oKey{p: e.Policy, a: e.Addr, alias: e.Alias.String()} }
+
+// holds reports whether the book holds k.
+func holds(b *AddrBook, k oKey) bool {
+	if k.alias == "" {
+		return slices.Contains(b.Addrs(k.p), k.a)
+	}
+	return slices.ContainsFunc(b.Aliases(k.p), func(n dnsname.Name) bool { return n.String() == k.alias })
 }
 
 func (w *oWorld) prune() {
@@ -337,8 +415,11 @@ func (w *oWorld) crash() {
 		}
 		b.Expire()
 		w.stats.checks++
-		if !slices.Contains(b.Addrs(k.p), k.a) {
-			w.fail("LEAK: %s %v is gone after Load+Expire at %v, its keep-until", k.p, k.a, at)
+		if k.alias != "" {
+			w.stats.aliasChecks++
+		}
+		if !holds(b, k) {
+			w.fail("LEAK: %s %v %q is gone after Load+Expire at %v, its keep-until", k.p, k.a, k.alias, at)
 		}
 	}
 	w.book = New(w.retain, func() time.Time { return w.now })
@@ -372,7 +453,7 @@ func runModel(t *testing.T, withExp bool) {
 		}
 		w.logf("seed %d retain %v", seed, r)
 		w.book = New(r, func() time.Time { return w.now })
-		for range 40 {
+		for range 48 { // 40 steps from the first 100 slots
 			w.step()
 		}
 		w.crash()

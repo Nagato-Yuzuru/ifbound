@@ -457,7 +457,7 @@ func TestLoadRejectsBadSnapshots(t *testing.T) {
 		"malformed":         `{"version":1,`,
 		"empty file":        ``,
 		"not an object":     `[]`,
-		"unknown version":   `{"version":2,"entries":[]}`,
+		"unknown version":   `{"version":99,"entries":[]}`,
 		"missing version":   `{"entries":[]}`,
 		"missing entries":   `{"version":1}`,
 		"null entries":      `{"version":1,"entries":null}`,
