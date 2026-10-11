@@ -135,16 +135,42 @@ type ResolverEntry struct {
 	Server netip.AddrPort
 }
 
+// ManagedEntry is a resolver entry that ifbound manages, as the
+// SysResolver reads it.
+type ManagedEntry struct {
+	ResolverEntry
+	// Active is true when the system now sends the queries for Domain to
+	// Server. An entry that is not active yet is present, but the system
+	// can still send its queries to another resolver.
+	Active bool
+}
+
 // ResolverState is the set of resolver entries that ifbound manages now.
 type ResolverState struct {
-	Entries []ResolverEntry // at most one entry per domain
+	Entries []ManagedEntry // at most one entry per domain
 	// Problems are conflicts with entries that ifbound does not manage.
 	Problems []Problem
 }
 
 // SysResolver manages the system resolver entries of ifbound. It never
-// touches an entry that ifbound does not manage. The write methods are
-// idempotent in the same way as the Backend ones.
+// touches an entry that ifbound does not manage.
+//
+// Contract:
+//   - The write methods are idempotent in the same way as the Backend
+//     ones.
+//   - The system applies the changes in call order. A platform that
+//     applies changes after a delay never applies a Remove before an
+//     earlier Write. So an entry that a Write adds keeps its domain covered
+//     while the system still applies a later Remove of a broader entry.
+//   - Read reports for each entry whether it is active. The platform
+//     decides this by its own rule, and it derives the answer from the
+//     system state, never from a cache. For example, a platform that
+//     applies a new entry after a delay compares the modification time
+//     of the entry with a settle time. A platform that applies an entry
+//     at once reports it as active after a successful Write.
+//   - Each Write, also of unchanged content, can make the system flush
+//     its whole DNS cache (macOS does this), and it can make an active
+//     entry not active again until the system applies it.
 type SysResolver interface {
 	// Read returns the managed entries. It writes nothing.
 	Read(ctx context.Context) (ResolverState, error)

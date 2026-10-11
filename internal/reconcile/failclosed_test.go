@@ -5,11 +5,9 @@ import (
 	"fmt"
 	"net/netip"
 	"slices"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
 )
@@ -17,7 +15,9 @@ import (
 // enforcement is what is blocked and resolved on one side of a change.
 type enforcement struct {
 	tables map[policy.Name][]netip.Prefix
-	apexes []string
+	// resolver lists the domains of the resolver entries, apexes and
+	// aliases, sorted.
+	resolver []string
 }
 
 // transition is one change that a single convergence applies.
@@ -53,6 +53,33 @@ to = ["mail.example.org", "198.51.100.0/24"]
 deny_via = ["en1"]
 `
 
+// aliasTo is configV2 with a new apex, cover.test, above an alias that
+// configV1 learns.
+const aliasTo = header + `
+[[policy]]
+name = "web"
+to = ["example.com", "*.example.net", "192.0.2.10", "198.51.100.0/24"]
+only_via = ["utun*"]
+
+[[policy]]
+name = "mail"
+to = ["mail.example.org", "*.cover.test", "203.0.113.0/28"]
+deny_via = ["en1"]
+`
+
+// apexGone is configV1 without the apex example.com.
+const apexGone = header + `
+[[policy]]
+name = "web"
+to = ["*.example.net", "192.0.2.10", "198.51.100.0/24"]
+only_via = ["en0"]
+
+[[policy]]
+name = "ads"
+to = ["*.ads.example", "2001:db8::/32"]
+deny_via = ["@tunnel"]
+`
+
 func transitions() []transition {
 	return []transition{{
 		name: "config change with expiry",
@@ -74,7 +101,7 @@ func transitions() []transition {
 				"web":  prefixes("198.51.100.0/24", "192.0.2.10/32", "203.0.113.2/32", "203.0.113.3/32"),
 				"mail": prefixes("203.0.113.0/28", "192.0.2.25/32"),
 			},
-			apexes: []string{"example.com", "example.net", "mail.example.org"},
+			resolver: []string{"example.com", "example.net", "mail.example.org", canary},
 		},
 		// Two table fills, one load, one removal, one drop, one resolver
 		// write and one resolver removal.
@@ -89,11 +116,62 @@ func transitions() []transition {
 				"web":  nil,
 				"mail": prefixes("198.51.100.0/24"),
 			},
-			apexes: []string{"mail.example.org", "shop.example"},
+			resolver: []string{"mail.example.org", "shop.example", canary},
 		},
 		// One fill, one load, one removal, two resolver writes, one
 		// resolver removal.
 		writes: 6,
+	}, {
+		name: "aliases learned, expired, pruned, and met by an apex",
+		from: configV1,
+		install: func(t *testing.T, f *fixture) {
+			f.learn(t, "web", "cdn.web.test", "old.web.test", "www.example.net", "edge.cover.test", "cover.test")
+			f.learn(t, "ads", "track.ads.test")
+		},
+		change: func(t *testing.T, f *fixture) {
+			f.now = f.now.Add(40 * time.Minute)
+			f.learn(t, "web", "cdn.web.test", "new.web.test", "edge.cover.test", "cover.test")
+			f.learn(t, "ads", "track.ads.test")
+			f.now = f.now.Add(21 * time.Minute)
+			f.book.Expire()           // old.web.test and www.example.net expire
+			f.reconfigure(t, aliasTo) // the prune removes track.ads.test
+		},
+		next: enforcement{
+			tables: map[policy.Name][]netip.Prefix{
+				"web":  prefixes("198.51.100.0/24", "192.0.2.10/32"),
+				"mail": prefixes("203.0.113.0/28"),
+			},
+			// The new apex cover.test is equal to an alias, and
+			// edge.cover.test is below it: both keep their one entry.
+			resolver: []string{
+				"cdn.web.test", "cover.test", "edge.cover.test", "example.com", "example.net",
+				"mail.example.org", "new.web.test", canary,
+			},
+		},
+		// One fill, one load, one drop, two resolver writes (an apex and
+		// an alias), four resolver removals (an apex, two expired aliases,
+		// and a pruned alias).
+		writes: 9,
+	}, {
+		name: "apex removed while aliases below it stay learned",
+		from: configV1,
+		install: func(t *testing.T, f *fixture) {
+			f.learn(t, "ads", "cdn.example.com")
+		},
+		change: func(t *testing.T, f *fixture) {
+			f.learn(t, "ads", "cdn.example.com", "new.example.com")
+			f.reconfigure(t, apexGone)
+		},
+		next: enforcement{
+			tables: map[policy.Name][]netip.Prefix{
+				"web": prefixes("198.51.100.0/24", "192.0.2.10/32"),
+				"ads": prefixes("2001:db8::/32"),
+			},
+			resolver: []string{"ads.example", "cdn.example.com", "example.net", "new.example.com", canary},
+		},
+		// One resolver write (the new alias below the old apex) and one
+		// resolver removal (the apex).
+		writes: 2,
 	}}
 }
 
@@ -106,8 +184,10 @@ func transitions() []transition {
 //     only one side has the policy.
 //   - An entry that is blocked before and after the change, also in
 //     another policy, is in some table that the loaded ruleset refers to.
-//   - A name that an old resolver entry covers, and a new one also
-//     covers, stays covered.
+//   - A resolver entry, apex or alias, that is present before and desired
+//     after the change stays present.
+//   - A name of an old or a new resolver entry that both sides cover stays
+//     covered.
 //
 // A later pass with no fault reaches the desired state.
 func TestConvergeIsFailClosedAtEveryStep(t *testing.T) {
@@ -129,7 +209,7 @@ func failClosedAt(t *testing.T, tr transition, failAt int) {
 	f := newFixture(t, tr.from)
 	tr.install(t, f)
 	f.converge(t)
-	old := enforcement{tables: f.world.Tables(), apexes: domains(f)}
+	old := enforcement{tables: f.world.Tables(), resolver: domains(f.world)}
 	tr.change(t, f)
 	base := f.world.Writes()
 	f.world.SetAfterWrite(func() { checkFailClosed(t, f, old, tr.next) })
@@ -150,7 +230,7 @@ func failClosedAt(t *testing.T, tr transition, failAt int) {
 	if got, want := f.world.Ruleset().ID(), f.compiled(t, en0); got != want {
 		t.Errorf("loaded ruleset = %q, want %q", got, want)
 	}
-	checkResolver(t, f.world, f.cfg.DNS.Listen, tr.next.apexes...)
+	checkResolver(t, f.world, f.cfg.DNS.Listen, tr.next.resolver...)
 }
 
 func prepare(t *testing.T, tr transition) *fixture {
@@ -162,12 +242,9 @@ func prepare(t *testing.T, tr transition) *fixture {
 	return f
 }
 
-func domains(f *fixture) []string {
-	var out []string
-	for _, d := range matcher.New(f.cfg.Policies).Apexes() {
-		out = append(out, d.String())
-	}
-	return out
+// domains returns the domains of the resolver entries, sorted.
+func domains(w *reconciletest.World) []string {
+	return entryDomains(w.ResolverEntries())
 }
 
 func prefixes(ss ...string) []netip.Prefix {
@@ -194,12 +271,14 @@ func checkFailClosed(t *testing.T, f *fixture, old, next enforcement) {
 			t.Errorf("after write %d: %v is in no table that the ruleset refers to", f.world.Writes(), p)
 		}
 	}
-	var entries []string
-	for _, e := range f.world.ResolverEntries() {
-		entries = append(entries, e.Domain.String())
+	entries := domains(f.world)
+	for _, d := range old.resolver {
+		if slices.Contains(next.resolver, d) && !slices.Contains(entries, d) {
+			t.Errorf("after write %d: resolver entry %s is absent, which both sides have", f.world.Writes(), d)
+		}
 	}
-	for _, d := range old.apexes {
-		if covered(d, next.apexes) && !covered(d, entries) {
+	for _, d := range slices.Concat(old.resolver, next.resolver) {
+		if covered(d, old.resolver) && covered(d, next.resolver) && !covered(d, entries) {
 			t.Errorf("after write %d: no resolver entry covers %s, which both sides cover", f.world.Writes(), d)
 		}
 	}
@@ -234,10 +313,4 @@ func kept(old, next map[policy.Name][]netip.Prefix) []netip.Prefix {
 		}
 	}
 	return out
-}
-
-func covered(name string, apexes []string) bool {
-	return slices.ContainsFunc(apexes, func(a string) bool {
-		return name == a || strings.HasSuffix(name, "."+a)
-	})
 }

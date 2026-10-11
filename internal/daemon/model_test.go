@@ -420,6 +420,7 @@ type omRun struct {
 	rsDamageSeq             int
 	seg, phase              int
 	segFailed               bool
+	resolverFailed          []string // domains of the failed resolver Writes in this convergence
 	failAt, failFrom        int
 	saveFail                bool
 	block, entered, release chan struct{}
@@ -652,38 +653,43 @@ func (s *omResolver) Read(ctx context.Context) (reconcile.ResolverState, error) 
 		omStats["prune due with pending entries"] += min(len(r.pending), 1)
 		clear(r.pending)
 	}
-	r.seg, r.phase, r.segFailed = segResolver, 0, false
+	r.seg, r.phase, r.segFailed, r.resolverFailed = segResolver, 0, false, nil
 	return st, err
 }
 
-func (s *omResolver) write(kind int, name string, f func() error) error {
+// write checks the order of the resolver part: every Write before every
+// Remove, and no Remove of an entry on the same label path as a domain
+// whose Write failed. A failed write does not stop the others.
+func (s *omResolver) write(kind int, name string, d policy.Domain, f func() error) error {
 	r := s.r
 	r.mu.Lock()
 	switch {
 	case r.seg != segResolver:
 		r.violate("spec3: resolver %s outside a convergence", name)
-	case r.segFailed:
-		r.violate("spec3: resolver %s after a failed resolver write", name)
 	case kind < r.phase:
 		r.violate("spec3: resolver %s after a resolver Remove", name)
+	case kind == 2 && slices.ContainsFunc(r.resolverFailed, func(f string) bool {
+		return f == d.String() || strings.HasSuffix(f, "."+d.String()) || strings.HasSuffix(d.String(), "."+f)
+	}):
+		r.violate("spec3: resolver Remove of %s on the label path of a failed resolver Write", d)
 	}
 	r.phase = kind
 	r.mu.Unlock()
 	err := f()
-	if err != nil {
+	if err != nil && kind == 1 {
 		r.mu.Lock()
-		r.segFailed = true
+		r.resolverFailed = append(r.resolverFailed, d.String())
 		r.mu.Unlock()
 	}
 	return err
 }
 
 func (s *omResolver) Write(ctx context.Context, e reconcile.ResolverEntry) error {
-	return s.write(1, "Write", func() error { return s.in.Write(ctx, e) })
+	return s.write(1, "Write", e.Domain, func() error { return s.in.Write(ctx, e) })
 }
 
 func (s *omResolver) Remove(ctx context.Context, d policy.Domain) error {
-	return s.write(2, "Remove", func() error { return s.in.Remove(ctx, d) })
+	return s.write(2, "Remove", d, func() error { return s.in.Remove(ctx, d) })
 }
 
 // ---- daemon lifecycle ----

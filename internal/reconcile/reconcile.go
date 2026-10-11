@@ -2,10 +2,11 @@
 // entries equal to the desired state.
 //
 // The desired state comes from the policies, the current interfaces, and
-// the learned addresses. Each convergence reads the actual state from the
-// platform and writes only the difference, so it repairs any drift: a
-// crash halfway through an earlier pass, an external flush, or a
-// configuration change. A second pass with the same inputs writes nothing.
+// the learned addresses and aliases. Each convergence reads the actual
+// state from the platform and writes only the difference, so it repairs
+// any drift: a crash halfway through an earlier pass, an external flush,
+// or a configuration change. A second pass with the same inputs writes
+// nothing.
 //
 // The write order is fail-closed. An address that a loaded rule blocks
 // stays in its table until it expires or its policy leaves the loaded
@@ -23,23 +24,27 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/dnsname"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
-// AddrSource gives the learned addresses of a policy. *addrbook.AddrBook
-// implements it.
+// AddrSource gives the learned addresses and aliases of a policy.
+// *addrbook.AddrBook implements it.
 type AddrSource interface {
 	Addrs(name policy.Name) []netip.Addr
+	Aliases(name policy.Name) []dnsname.Name
 }
 
 // Inputs is everything that the desired state depends on, apart from the
 // interfaces, which the Reconciler reads from its IfInventory.
 type Inputs struct {
 	Policies []policy.Policy
-	// Book gives the learned addresses of each policy.
+	// Book gives the learned addresses and aliases of each policy.
 	Book AddrSource
 	// Apexes are the domains that get a resolver entry: the apex list of
-	// the Matcher for Policies.
+	// the Matcher for Policies. Each learned alias of a policy that
+	// AliasEntry accepts also gets an entry, and so does the canary domain
+	// of Firefox. See Reconciler.Converge.
 	Apexes []policy.Domain
 	// Listen is the server address of every resolver entry.
 	Listen netip.AddrPort
@@ -79,11 +84,29 @@ type Reconciler struct {
 //  3. Remove the entries that are no longer desired, then drop the tables
 //     of removed policies. The loaded ruleset no longer refers to them.
 //
-// The SysResolver part runs after it, also when the Backend part failed:
-// it writes the new and changed entries, then removes the old ones.
+// The SysResolver part runs after it, also when the Backend part failed.
+// The desired entries are:
+//
+//   - one entry for each apex;
+//   - one entry for each learned alias that AliasEntry accepts, also when
+//     the alias is at or below an apex: the apex entry can go away while
+//     the alias stays learned;
+//   - one entry for the Firefox canary domain (use-application-dns.net),
+//     when there is at least one other entry. An answer from ifbound-dns
+//     for the canary can then turn off the DNS-over-HTTPS of Firefox,
+//     which does not use the system resolver.
+//
+// The part writes the new and changed entries, then removes the old ones.
+// It does not write an entry that is present with the desired server,
+// also when the entry is not active yet: each write can flush the whole
+// DNS cache of the system and restart the delay of a platform. A failed
+// write does not stop the others. The part keeps an old entry when the
+// write of a desired entry on the same label path failed: at or below the
+// old entry, because the old entry still covers that domain; at or above
+// it, because the failed entry was to cover the names of the old entry.
 //
 // The error joins the errors of both parts. The Report holds what was
-// done and seen up to the failure; the next call continues from there.
+// done and seen; the next call continues from there.
 func (r Reconciler) Converge(ctx context.Context, in Inputs) (Report, error) {
 	var rep Report
 	berr := r.convergeBackend(ctx, in, &rep)
@@ -218,14 +241,19 @@ func (r Reconciler) convergeResolver(ctx context.Context, in Inputs, rep *Report
 	for _, e := range actual.Entries {
 		have[e.Domain] = e.Server
 	}
-	want := make(map[policy.Domain]bool, len(in.Apexes))
-	for _, d := range in.Apexes {
+	domains := desiredDomains(in)
+	want := make(map[policy.Domain]bool, len(domains))
+	var errs []error
+	var failed []policy.Domain
+	for _, d := range domains {
 		want[d] = true
 		if s, ok := have[d]; ok && s == in.Listen {
 			continue
 		}
 		if err := r.Resolver.Write(ctx, ResolverEntry{Domain: d, Server: in.Listen}); err != nil {
-			return fmt.Errorf("writing resolver entry %s: %w", d, err)
+			errs = append(errs, fmt.Errorf("writing resolver entry %s: %w", d, err))
+			failed = append(failed, d)
+			continue
 		}
 		rep.Writes++
 	}
@@ -235,15 +263,59 @@ func (r Reconciler) convergeResolver(ctx context.Context, in Inputs, rep *Report
 			old = append(old, d)
 		}
 	}
-	slices.SortFunc(old, func(a, b policy.Domain) int { return strings.Compare(a.String(), b.String()) })
+	slices.SortFunc(old, compareDomains)
 	for _, d := range old {
+		if slices.ContainsFunc(failed, func(f policy.Domain) bool { return atOrBelow(f, d) || atOrBelow(d, f) }) {
+			continue
+		}
 		if err := r.Resolver.Remove(ctx, d); err != nil {
-			return fmt.Errorf("removing resolver entry %s: %w", d, err)
+			errs = append(errs, fmt.Errorf("removing resolver entry %s: %w", d, err))
+			continue
 		}
 		rep.Writes++
 	}
-	return nil
+	return errors.Join(errs...)
 }
+
+// desiredDomains returns the domains that get a resolver entry: the
+// apexes, then the accepted aliases and the canary, sorted and without
+// duplicates.
+func desiredDomains(in Inputs) []policy.Domain {
+	seen := make(map[policy.Domain]bool, len(in.Apexes))
+	for _, a := range in.Apexes {
+		seen[a] = true
+	}
+	var extra []policy.Domain
+	add := func(d policy.Domain) {
+		if !seen[d] {
+			seen[d] = true
+			extra = append(extra, d)
+		}
+	}
+	for _, p := range in.Policies {
+		for _, n := range in.Book.Aliases(p.Name) {
+			if d, err := AliasEntry(n); err == nil {
+				add(d)
+			}
+		}
+	}
+	if len(in.Apexes)+len(extra) == 0 {
+		return nil
+	}
+	add(canaryDomain())
+	slices.SortFunc(extra, compareDomains)
+	return append(slices.Clone(in.Apexes), extra...)
+}
+
+// atOrBelow reports whether d is equal to apex or below it. It compares
+// whole labels, so "badexample.com" is not below "example.com".
+func atOrBelow(d, apex policy.Domain) bool {
+	dl := strings.Split(d.String(), ".")
+	al := strings.Split(apex.String(), ".")
+	return len(dl) >= len(al) && slices.Equal(dl[len(dl)-len(al):], al)
+}
+
+func compareDomains(a, b policy.Domain) int { return strings.Compare(a.String(), b.String()) }
 
 // desiredTables has a key for every policy, also when its table is empty:
 // a missing key marks a table to drop.

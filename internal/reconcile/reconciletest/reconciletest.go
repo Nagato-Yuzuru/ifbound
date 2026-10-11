@@ -34,6 +34,12 @@ type World struct {
 	ruleset  reconcile.Ruleset
 	tables   map[policy.Name]map[netip.Prefix]struct{}
 	resolver map[policy.Domain]netip.AddrPort
+	// applied are the resolver entries that the fake system uses now.
+	applied map[policy.Domain]netip.AddrPort
+	// pending holds the entries that a Write changed since the system
+	// applied the entries last.
+	pending  map[policy.Domain]struct{}
+	delay    bool
 	bproblem []reconcile.Problem
 	rproblem []reconcile.Problem
 	writes   int
@@ -47,6 +53,8 @@ func NewWorld() *World {
 	return &World{
 		tables:   make(map[policy.Name]map[netip.Prefix]struct{}),
 		resolver: make(map[policy.Domain]netip.AddrPort),
+		applied:  make(map[policy.Domain]netip.AddrPort),
+		pending:  make(map[policy.Domain]struct{}),
 	}
 }
 
@@ -80,6 +88,39 @@ func (w *World) SetProblems(backend, resolver []reconcile.Problem) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.bproblem, w.rproblem = slices.Clone(backend), slices.Clone(resolver)
+}
+
+// SetResolverDelay selects how the fake system applies resolver changes.
+// When on is false (the default), the system applies each Write and
+// Remove at once. When on is true, it applies them only at
+// SettleResolver, all together, as a platform that applies changes after
+// a delay does. An entry that a Write changed is not active until then.
+func (w *World) SetResolverDelay(on bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.delay = on
+}
+
+// SettleResolver applies every resolver change, as the end of the
+// platform delay does. It is not a write: no hook runs.
+func (w *World) SettleResolver() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.settleLocked()
+}
+
+func (w *World) settleLocked() {
+	w.applied = maps.Clone(w.resolver)
+	clear(w.pending)
+}
+
+// AppliedResolverEntries returns the resolver entries that the fake
+// system uses now, sorted by domain. With a delay, they can differ from
+// ResolverEntries.
+func (w *World) AppliedResolverEntries() []reconcile.ResolverEntry {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return sortedEntries(w.applied)
 }
 
 // Writes returns the number of write calls so far, failed ones included.
@@ -132,8 +173,12 @@ func (w *World) ResolverEntries() []reconcile.ResolverEntry {
 }
 
 func (w *World) resolverLocked() []reconcile.ResolverEntry {
-	out := make([]reconcile.ResolverEntry, 0, len(w.resolver))
-	for d, s := range w.resolver {
+	return sortedEntries(w.resolver)
+}
+
+func sortedEntries(m map[policy.Domain]netip.AddrPort) []reconcile.ResolverEntry {
+	out := make([]reconcile.ResolverEntry, 0, len(m))
+	for d, s := range m {
 		out = append(out, reconcile.ResolverEntry{Domain: d, Server: s})
 	}
 	slices.SortFunc(out, func(a, b reconcile.ResolverEntry) int {
@@ -168,11 +213,20 @@ func (w *World) ExternalLoad(body []byte) {
 }
 
 // RemoveResolverEntry deletes a resolver entry, as an external tool
-// would. It is not a write: no hook runs.
+// would. It is not a write: no hook runs. The system applies it as it
+// applies a Remove.
 func (w *World) RemoveResolverEntry(d policy.Domain) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.removeLocked(d)
+}
+
+func (w *World) removeLocked(d policy.Domain) {
 	delete(w.resolver, d)
+	delete(w.pending, d)
+	if !w.delay {
+		delete(w.applied, d)
+	}
 }
 
 // write runs one write call: the before hook, apply, the after hook.
@@ -260,20 +314,35 @@ var _ reconcile.SysResolver = (*Resolver)(nil)
 func (r *Resolver) Read(context.Context) (reconcile.ResolverState, error) {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
+	entries := r.w.resolverLocked()
+	out := make([]reconcile.ManagedEntry, len(entries))
+	for i, e := range entries {
+		_, pending := r.w.pending[e.Domain]
+		out[i] = reconcile.ManagedEntry{ResolverEntry: e, Active: !pending}
+	}
 	return reconcile.ResolverState{
-		Entries:  r.w.resolverLocked(),
+		Entries:  out,
 		Problems: slices.Clone(r.w.rproblem),
 	}, nil
 }
 
-// Write implements reconcile.SysResolver.
+// Write implements reconcile.SysResolver. With a delay, each Write makes
+// the entry not active until SettleResolver, also when its content does
+// not change.
 func (r *Resolver) Write(_ context.Context, e reconcile.ResolverEntry) error {
-	return r.w.write(func() { r.w.resolver[e.Domain] = e.Server })
+	return r.w.write(func() {
+		r.w.resolver[e.Domain] = e.Server
+		if r.w.delay {
+			r.w.pending[e.Domain] = struct{}{}
+		} else {
+			r.w.applied[e.Domain] = e.Server
+		}
+	})
 }
 
 // Remove implements reconcile.SysResolver.
 func (r *Resolver) Remove(_ context.Context, d policy.Domain) error {
-	return r.w.write(func() { delete(r.w.resolver, d) })
+	return r.w.write(func() { r.w.removeLocked(d) })
 }
 
 // Compiler is a fake reconcile.Compiler. Its ruleset text has one
