@@ -47,6 +47,9 @@ func (h *handler) Name() string { return name }
 // observation). Otherwise the client gets SERVFAIL. A reply without an
 // address and without an alias goes out without a report.
 //
+// The handler answers the resolver.arpa zone of the DDR probe and the
+// Firefox canary domain itself (see localRcode). Those queries do not go to the next plugin.
+//
 // The handler inspects the reply as the client will decode it: it packs the
 // reply when the next plugin writes it, unpacks those bytes, reports the
 // addresses and aliases in the result, and sends that result. Thus a Go
@@ -60,6 +63,15 @@ func (h *handler) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 	// report and the server's error reply must carry the question that the
 	// client asked.
 	qname := (&request.Request{Req: r}).QName()
+	if rcode, ok := localRcode(qname); ok {
+		// No plugin below sees the query, so no upstream answer can tell
+		// the client to go around ifbound-dns. The reply has no address
+		// and no alias, so it needs no report.
+		if err := w.WriteMsg(localReply(r, rcode)); err != nil {
+			return dns.RcodeServerFailure, plugin.Error(name, err)
+		}
+		return rcode, nil
+	}
 	question := slices.Clone(r.Question)
 	defer func() { r.Question = question }()
 
