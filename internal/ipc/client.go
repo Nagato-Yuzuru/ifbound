@@ -23,9 +23,20 @@ const DefaultTimeout = 5 * time.Second
 
 // Observation is one DNS answer.
 type Observation struct {
-	QName string
-	Addrs []netip.Addr
-	TTL   time.Duration
+	QName   string
+	Addrs   []netip.Addr
+	TTL     time.Duration
+	Aliases []Alias
+}
+
+// Alias is a name that the answer points the client to: a CNAME target or
+// an HTTPS or SVCB TargetName. The client can send a follow-up query for
+// it. Name has the presentation form that the client decodes; the package
+// does not canonicalize it. TTL is the largest TTL among the records that
+// point to the name.
+type Alias struct {
+	Name string
+	TTL  time.Duration
 }
 
 // Client reports observations to ifboundd. It is safe for concurrent use.
@@ -114,15 +125,24 @@ func newObserveEnvelope(ctx context.Context, o Observation) envelope {
 	for i, a := range o.Addrs {
 		addrs[i] = a.String()
 	}
+	var aliases []aliasBody
+	for _, a := range o.Aliases {
+		aliases = append(aliases, aliasBody{Name: a.Name, TTLSeconds: ttlSeconds(a.TTL)})
+	}
 	body := observeBody{
 		QName:      o.QName,
 		Addrs:      addrs,
-		TTLSeconds: uint32(min(max(o.TTL/time.Second, 0), 1<<32-1)), //nolint:gosec // clamped to the uint32 range
+		TTLSeconds: ttlSeconds(o.TTL),
+		Aliases:    aliases,
 	}
 	// Report sets a deadline, so ctx always has one.
 	dl, _ := ctx.Deadline()
 	body.TimeoutMS = min(max(time.Until(dl).Milliseconds(), 1), MaxTimeout.Milliseconds())
 	return envelopeOf(typeObserve, body)
+}
+
+func ttlSeconds(d time.Duration) uint32 {
+	return uint32(min(max(d/time.Second, 0), 1<<32-1)) //nolint:gosec // clamped to the uint32 range
 }
 
 // wrapIO keeps protocol errors visible and maps transport failures to

@@ -31,7 +31,7 @@ type reporter interface {
 }
 
 // handler holds back the reply of the next plugin until ifboundd has the
-// addresses in it.
+// addresses and alias names in it.
 type handler struct {
 	next     plugin.Handler
 	reporter reporter
@@ -43,14 +43,15 @@ func (h *handler) Name() string { return name }
 
 // ServeDNS implements plugin.Handler. The rule is: every A, AAAA, and SVCB or
 // HTTPS hint address that the client gets, in any section, is reported first
-// under the qname. Otherwise the client gets SERVFAIL. A reply without an
-// address goes out without a report.
+// under the qname, together with every alias name in the reply (see
+// observation). Otherwise the client gets SERVFAIL. A reply without an
+// address and without an alias goes out without a report.
 //
 // The handler inspects the reply as the client will decode it: it packs the
 // reply when the next plugin writes it, unpacks those bytes, reports the
-// addresses in the result, and sends that result. Thus a Go value that packs
-// to a different record type cannot carry an address past the report, and a
-// change to the message after the write has no effect.
+// addresses and aliases in the result, and sends that result. Thus a Go
+// value that packs to a different record type cannot carry an address past
+// the report, and a change to the message after the write has no effect.
 //
 // SERVFAIL follows the CoreDNS contract: ServeDNS writes nothing and returns
 // dns.RcodeServerFailure, and the server writes the error reply.

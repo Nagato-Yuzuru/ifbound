@@ -1,10 +1,11 @@
 // Package dnsplugin is the ifbound CoreDNS plugin. It reports the addresses
-// in every DNS reply to ifboundd and lets the reply go to the application
-// only after ifboundd acknowledges. Every failure becomes SERVFAIL, so no
-// address reaches an application before the kernel can block it.
+// and alias names in every DNS reply to ifboundd and lets the reply go to
+// the application only after ifboundd acknowledges. Every failure becomes
+// SERVFAIL, so no address reaches an application before the kernel can
+// block it.
 //
 // The plugin does not read policies. It reports every reply that carries an
-// address, and ifboundd decides what matches.
+// address or an alias name, and ifboundd decides what matches.
 package dnsplugin
 
 import (

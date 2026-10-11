@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -95,6 +96,167 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if mode := fi.Mode().Perm(); mode != 0o660 {
 		t.Errorf("socket mode = %o, want 660", mode)
+	}
+}
+
+func TestRoundTripWithAliases(t *testing.T) {
+	var got Observation
+	c, _ := start(t, handlerFunc(func(_ context.Context, o Observation) error {
+		got = o
+		return nil
+	}))
+	o := Observation{
+		QName: "www.example.com.",
+		Aliases: []Alias{
+			{Name: "a.example.net.", TTL: 60 * time.Second},
+			{Name: `B\.x.example.net.`, TTL: 0},
+			{Name: "a.example.net.", TTL: 300 * time.Second},
+			{Name: "A.example.net.", TTL: 10 * time.Second},
+			{Name: "a.example.net.", TTL: 30 * time.Second},
+		},
+	}
+	if err := c.Report(t.Context(), o); err != nil {
+		t.Fatal(err)
+	}
+	// A duplicate keeps its largest TTL and its first position. Case is
+	// not folded.
+	want := []Alias{
+		{Name: "a.example.net.", TTL: 300 * time.Second},
+		{Name: `B\.x.example.net.`, TTL: 0},
+		{Name: "A.example.net.", TTL: 10 * time.Second},
+	}
+	if !slices.Equal(got.Aliases, want) {
+		t.Errorf("aliases = %+v, want %+v", got.Aliases, want)
+	}
+}
+
+func TestAliasLimits(t *testing.T) {
+	var calls atomic.Int32
+	c, _ := start(t, handlerFunc(func(context.Context, Observation) error {
+		calls.Add(1)
+		return nil
+	}))
+	aliases := func(n int) []Alias {
+		out := make([]Alias, n)
+		for i := range out {
+			out[i] = Alias{Name: fmt.Sprintf("a%d.example.", i)}
+		}
+		return out
+	}
+	for name, as := range map[string][]Alias{
+		"too many aliases": aliases(MaxAliases + 1),
+		"empty alias":      {{Name: "a.example."}, {Name: ""}},
+		"alias too long":   {{Name: strings.Repeat("a", MaxQNameLen+1)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := c.Report(t.Context(), Observation{QName: "a.test.", Aliases: as})
+			if !errors.Is(err, ErrRejected) {
+				t.Errorf("err = %v, want ErrRejected", err)
+			}
+		})
+	}
+	for name, as := range map[string][]Alias{
+		"aliases at the limit":    aliases(MaxAliases),
+		"alias name at the limit": {{Name: strings.Repeat("a", MaxQNameLen)}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := c.Report(t.Context(), Observation{QName: "a.test.", Aliases: as}); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if calls.Load() != 2 {
+		t.Errorf("handler called %d times, want 2", calls.Load())
+	}
+}
+
+// observePayload returns an observe payload with the given version and
+// aliases JSON.
+func observePayload(version, aliases string) string {
+	return fmt.Sprintf(`{"v":%s,"type":"observe","body":{"qname":"q.test.","addrs":["192.0.2.1"],`+
+		`"ttl_s":60,"aliases":%s,"timeout_ms":1000}}`, version, aliases)
+}
+
+func TestServerRejectsHostileAliasFrames(t *testing.T) {
+	var calls atomic.Int32
+	_, path := start(t, handlerFunc(func(context.Context, Observation) error {
+		calls.Add(1)
+		return nil
+	}))
+	tests := map[string]string{
+		"version 1 with aliases":          observePayload("1", `[{"name":"b.test.","ttl_s":1}]`),
+		"version 0":                       observePayload("0", `[]`),
+		"negative version":                observePayload("-2", `[]`),
+		"version as string":               observePayload(`"2"`, `[]`),
+		"version as float":                observePayload("2.5", `[]`),
+		"missing alias name":              observePayload("2", `[{"ttl_s":1}]`),
+		"null alias name":                 observePayload("2", `[{"name":null,"ttl_s":1}]`),
+		"alias name 513 runes 1026 bytes": observePayload("2", `[{"name":"`+strings.Repeat("é", 513)+`","ttl_s":1}]`),
+		"alias name as number":            observePayload("2", `[{"name":5,"ttl_s":1}]`),
+		"aliases as object":               observePayload("2", `{"name":"b.test."}`),
+		"alias as string":                 observePayload("2", `["b.test."]`),
+		"negative alias TTL":              observePayload("2", `[{"name":"b.test.","ttl_s":-1}]`),
+		"alias TTL above uint32":          observePayload("2", `[{"name":"b.test.","ttl_s":4294967296}]`),
+		"fractional alias TTL":            observePayload("2", `[{"name":"b.test.","ttl_s":1.5}]`),
+	}
+	for name, payload := range tests {
+		t.Run(name, func(t *testing.T) {
+			env, conn := rawExchange(t, path, frameOf(payload))
+			if env.Type != typeReject || env.Version != protocolVersion {
+				t.Errorf("reply %+v, want a v%d reject", env, protocolVersion)
+			}
+			assertClosed(t, conn)
+		})
+	}
+	if n := calls.Load(); n != 0 {
+		t.Errorf("handler called %d times, want 0", n)
+	}
+}
+
+// TestClientSendsAliasesOnTheWire reads the frame that the client writes:
+// version 2, and each alias name and TTL as given. A TTL is sent in whole
+// seconds and clamped to the uint32 range.
+func TestClientSendsAliasesOnTheWire(t *testing.T) {
+	path := shortPath(t)
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	frames := make(chan envelope, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		env, _ := readFrame(conn)
+		frames <- env
+		_ = writeFrame(conn, envelopeOf(typeAck, nil))
+	}()
+	o := Observation{
+		QName: "q.test.",
+		Aliases: []Alias{
+			{Name: `a\ b.test.`, TTL: 90 * time.Second},
+			{Name: "B.test.", TTL: 1500 * time.Millisecond},
+			{Name: "c.test.", TTL: 1<<32*time.Second + time.Hour},
+		},
+	}
+	if err := NewClient(path, self()).Report(t.Context(), o); err != nil {
+		t.Fatal(err)
+	}
+	env := <-frames
+	if env.Version != 2 || env.Type != typeObserve {
+		t.Fatalf("frame v=%d type=%q, want v=2 observe", env.Version, env.Type)
+	}
+	var body observeBody
+	if err := json.Unmarshal(env.Body, &body); err != nil {
+		t.Fatal(err)
+	}
+	want := []aliasBody{{`a\ b.test.`, 90}, {"B.test.", 1}, {"c.test.", 1<<32 - 1}}
+	if !slices.Equal(body.Aliases, want) {
+		t.Errorf("wire aliases %+v, want %+v", body.Aliases, want)
 	}
 }
 
@@ -228,13 +390,14 @@ func TestMalformedFrame(t *testing.T) {
 func TestUnknownTypeAndVersion(t *testing.T) {
 	_, path := start(t, handlerFunc(ack))
 	tests := map[string]string{
-		"unknown type":    `{"v":1,"type":"bogus"}`,
-		"unknown version": `{"v":2,"type":"observe","body":{"qname":"a.test."}}`,
-		"bad address":     `{"v":1,"type":"observe","body":{"qname":"a.test.","addrs":["nope"],"timeout_ms":1000}}`,
-		"missing body":    `{"v":1,"type":"observe"}`,
-		"zero timeout":    `{"v":1,"type":"observe","body":{"qname":"a.test.","timeout_ms":0}}`,
-		"huge timeout":    `{"v":1,"type":"observe","body":{"qname":"a.test.","timeout_ms":9223372036854775807}}`,
-		"zoned address":   `{"v":1,"type":"observe","body":{"qname":"a.test.","addrs":["fe80::1%en0"],"timeout_ms":1000}}`,
+		"unknown type":    `{"v":2,"type":"bogus"}`,
+		"old version":     `{"v":1,"type":"observe","body":{"qname":"a.test.","timeout_ms":1000}}`,
+		"unknown version": `{"v":3,"type":"observe","body":{"qname":"a.test.","timeout_ms":1000}}`,
+		"bad address":     `{"v":2,"type":"observe","body":{"qname":"a.test.","addrs":["nope"],"timeout_ms":1000}}`,
+		"missing body":    `{"v":2,"type":"observe"}`,
+		"zero timeout":    `{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":0}}`,
+		"huge timeout":    `{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":9223372036854775807}}`,
+		"zoned address":   `{"v":2,"type":"observe","body":{"qname":"a.test.","addrs":["fe80::1%en0"],"timeout_ms":1000}}`,
 	}
 	for name, payload := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -252,20 +415,20 @@ func TestClientRejectsBadReplies(t *testing.T) {
 		reply []byte
 		want  error
 	}{
-		{"unknown type", frameOf(`{"v":1,"type":"bogus"}`), ErrProtocol},
+		{"unknown type", frameOf(`{"v":2,"type":"bogus"}`), ErrProtocol},
 		{"bad version", frameOf(`{"v":9,"type":"ack"}`), ErrProtocol},
 		{"no version", frameOf(`{"type":"ack"}`), ErrProtocol},
-		{"version as string", frameOf(`{"v":"1","type":"ack"}`), ErrProtocol},
-		{"no type", frameOf(`{"v":1}`), ErrProtocol},
-		{"upper case type", frameOf(`{"v":1,"type":"ACK"}`), ErrProtocol},
-		{"type with space", frameOf(`{"v":1,"type":"ack "}`), ErrProtocol},
-		{"echoed request type", frameOf(`{"v":1,"type":"observe"}`), ErrProtocol},
+		{"version as string", frameOf(`{"v":"2","type":"ack"}`), ErrProtocol},
+		{"no type", frameOf(`{"v":2}`), ErrProtocol},
+		{"upper case type", frameOf(`{"v":2,"type":"ACK"}`), ErrProtocol},
+		{"type with space", frameOf(`{"v":2,"type":"ack "}`), ErrProtocol},
+		{"echoed request type", frameOf(`{"v":2,"type":"observe"}`), ErrProtocol},
 		{"empty object", frameOf(`{}`), ErrProtocol},
 		{"null", frameOf(`null`), ErrProtocol},
 		{"array", frameOf(`[1,"ack"]`), ErrProtocol},
 		{"not json", frameOf(`xx`), ErrProtocol},
 		{"empty frame", frameOf(``), ErrProtocol},
-		{"bad reject body", frameOf(`{"v":1,"type":"reject","body":5}`), ErrProtocol},
+		{"bad reject body", frameOf(`{"v":2,"type":"reject","body":5}`), ErrProtocol},
 		{"oversize header", binary.BigEndian.AppendUint32(nil, MaxFrameSize+1), ErrFrameTooLarge},
 		{"half header", []byte{0, 0}, ErrUnavailable},
 		{"short body", []byte{0, 0, 0, 30, '{'}, ErrUnavailable},
@@ -403,7 +566,7 @@ func TestServeStopsOnContextCancel(t *testing.T) {
 
 func TestFrameRoundTripJSON(t *testing.T) {
 	b, _ := json.Marshal(envelopeOf(typeAck, nil))
-	if string(b) != `{"v":1,"type":"ack"}` {
+	if string(b) != `{"v":2,"type":"ack"}` {
 		t.Errorf("wire = %s", b)
 	}
 }
@@ -481,7 +644,7 @@ func TestServerConnectionCap(t *testing.T) {
 
 func TestOneRequestPerConnection(t *testing.T) {
 	_, path := start(t, handlerFunc(ack))
-	req := frameOf(`{"v":1,"type":"observe","body":{"qname":"a.test.","timeout_ms":1000}}`)
+	req := frameOf(`{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":1000}}`)
 	env, conn := rawExchange(t, path, req)
 	if env.Type != typeAck {
 		t.Fatalf("type = %q, want ack", env.Type)
@@ -518,20 +681,28 @@ func TestHandlerGetsCanonicalAddrs(t *testing.T) {
 }
 
 func TestLargestDNSAnswer(t *testing.T) {
-	var n atomic.Int32
+	var got atomic.Pointer[Observation]
 	c, _ := start(t, handlerFunc(func(_ context.Context, o Observation) error {
-		n.Store(int32(len(o.Addrs))) //nolint:gosec // 2400 fits
+		got.Store(&o)
 		return nil
 	}))
-	addrs := make([]netip.Addr, 2400)
+	// The worst case of a 64 KiB message: IPv4 hints of the longest text
+	// form, and aliases of 255 octets that JSON escapes into 6 bytes each.
+	addrs := make([]netip.Addr, 16384)
 	for i := range addrs {
-		addrs[i] = netip.MustParseAddr(fmt.Sprintf("2001:db8:1234:5678:9abc:def0:%x:%x", i>>8, i&0xff))
+		addrs[i] = netip.AddrFrom4([4]byte{200, 200, byte(100 + i/156), byte(100 + i%156)})
 	}
-	if err := c.Report(t.Context(), Observation{QName: "big.test.", Addrs: addrs}); err != nil {
+	label := strings.Repeat("<", 63)
+	aliases := make([]Alias, MaxAliases)
+	for i := range aliases {
+		aliases[i] = Alias{Name: fmt.Sprintf("%s.%s.%s.%s.", label, label, label, label[:59]+fmt.Sprintf("%04d", i))}
+	}
+	o := Observation{QName: aliases[0].Name, Addrs: addrs, TTL: time.Hour, Aliases: aliases}
+	if err := c.Report(t.Context(), o); err != nil {
 		t.Fatal(err)
 	}
-	if n.Load() != 2400 {
-		t.Errorf("handler saw %d addresses", n.Load())
+	if g := got.Load(); g == nil || len(g.Addrs) != len(addrs) || len(g.Aliases) != MaxAliases {
+		t.Errorf("handler did not see the whole observation")
 	}
 }
 
@@ -539,8 +710,8 @@ func TestLongRejectionReasonStillArrives(t *testing.T) {
 	_, path := start(t, handlerFunc(ack))
 	long := strings.Repeat("x", 20<<10)
 	tests := map[string]string{
-		"long unknown type": `{"v":1,"type":"` + long + `"}`,
-		"long bad address":  `{"v":1,"type":"observe","body":{"qname":"a.test.","addrs":["` + long + `"],"timeout_ms":1000}}`,
+		"long unknown type": `{"v":2,"type":"` + long + `"}`,
+		"long bad address":  `{"v":2,"type":"observe","body":{"qname":"a.test.","addrs":["` + long + `"],"timeout_ms":1000}}`,
 	}
 	for name, payload := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -687,7 +858,7 @@ func TestListenSaturatedLiveServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := frameOf(`{"v":1,"type":"observe","body":{"qname":"a.test.","timeout_ms":30000}}`)
+	req := frameOf(`{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":30000}}`)
 	saturated := false
 	for range 6000 {
 		d := net.Dialer{Timeout: 200 * time.Millisecond}
@@ -931,7 +1102,7 @@ func TestTimeoutBounds(t *testing.T) {
 	tests := map[string]string{"0": typeReject, "-1": typeReject, "1": typeAck, "30000": typeAck, "30001": typeReject}
 	for ms, want := range tests {
 		t.Run(ms, func(t *testing.T) {
-			env, _ := rawExchange(t, path, frameOf(`{"v":1,"type":"observe","body":{"qname":"a.test.","timeout_ms":`+ms+`}}`))
+			env, _ := rawExchange(t, path, frameOf(`{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":`+ms+`}}`))
 			if env.Type != want {
 				t.Errorf("type = %q, want %q", env.Type, want)
 			}
@@ -1061,7 +1232,7 @@ func TestHelperImpostor(t *testing.T) {
 			go func() {
 				defer func() { _ = c.Close() }()
 				if _, err := readFrame(c); err == nil {
-					_, _ = c.Write(frameOf(`{"v":1,"type":"ack"}`))
+					_, _ = c.Write(frameOf(`{"v":2,"type":"ack"}`))
 				}
 			}()
 		}
