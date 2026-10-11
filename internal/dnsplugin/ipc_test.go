@@ -3,6 +3,7 @@ package dnsplugin
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -74,8 +75,12 @@ func TestReportReachesIfboundd(t *testing.T) {
 	}
 	select {
 	case got := <-seen:
-		want := ipc.Observation{QName: "www.example.org.", Addrs: addrs("2001:db8::1"), TTL: 60 * time.Second}
-		if got.QName != want.QName || got.TTL != want.TTL || !slices.Equal(got.Addrs, want.Addrs) {
+		want := ipc.Observation{
+			QName: "www.example.org.", Addrs: addrs("2001:db8::1"), TTL: 60 * time.Second,
+			Aliases: []ipc.Alias{{Name: "a.example.net.", TTL: 60 * time.Second}},
+		}
+		if got.QName != want.QName || got.TTL != want.TTL || !slices.Equal(got.Addrs, want.Addrs) ||
+			!slices.Equal(got.Aliases, want.Aliases) {
 			t.Errorf("ifboundd got %+v, want %+v", got, want)
 		}
 	default:
@@ -94,5 +99,38 @@ func TestRejectionByIfbounddGivesServfail(t *testing.T) {
 	rec, rcode, err := serve(t.Context(), h, "example.org.")
 	if rcode != dns.RcodeServerFailure || !errors.Is(err, ipc.ErrRejected) || rec.Msg != nil {
 		t.Errorf("ServeDNS = %d, %v, client got %v; want SERVFAIL, ErrRejected, no reply", rcode, err, rec.Msg)
+	}
+}
+
+// TestDenseIPv4HintReplyIsReported sends a 64 KiB reply that holds its
+// addresses in one ipv4hint, the densest address form. The observation
+// must fit in one frame, so the client gets the reply after the ack.
+func TestDenseIPv4HintReplyIsReported(t *testing.T) {
+	seen := make(chan int, 1)
+	client := startServer(t, observeFunc(func(_ context.Context, o ipc.Observation) error {
+		seen <- len(o.Addrs)
+		return nil
+	}))
+	var hint []net.IP
+	for x := 100; x < 256 && len(hint) < 16000; x++ {
+		for y := 100; y < 256 && len(hint) < 16000; y++ {
+			hint = append(hint, net.IPv4(100, 100, byte(x), byte(y)).To4())
+		}
+	}
+	up := &upstream{answer: []dns.RR{&dns.HTTPS{SVCB: dns.SVCB{
+		Hdr:      dns.RR_Header{Name: "q.example.", Rrtype: dns.TypeHTTPS, Class: dns.ClassINET, Ttl: 60},
+		Priority: 1, Target: ".",
+		Value: []dns.SVCBKeyValue{&dns.SVCBIPv4Hint{Hint: hint}},
+	}}}}
+	h := &handler{next: up, reporter: client, timeout: 5 * time.Second}
+	rec, rcode, err := serve(t.Context(), h, "q.example.")
+	if err != nil || rec.Msg == nil {
+		t.Fatalf("ServeDNS = %d, %v; want the reply after an ack", rcode, err)
+	}
+	if wire, err := rec.Msg.Pack(); err != nil || len(wire) < 60000 {
+		t.Errorf("reply is %d bytes (%v), want a reply near 64 KiB", len(wire), err)
+	}
+	if n := <-seen; n != len(hint) {
+		t.Errorf("ifboundd got %d addresses, want %d", n, len(hint))
 	}
 }

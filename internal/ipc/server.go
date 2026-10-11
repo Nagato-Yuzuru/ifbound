@@ -40,12 +40,15 @@ var (
 	errAlreadyServing = errors.New("ipc: Serve already called")
 	errInvalidQName   = errors.New("invalid qname")
 	errInvalidAddr    = errors.New("invalid address")
+	errInvalidAlias   = errors.New("invalid alias")
+	errTooManyAliases = errors.New("too many aliases")
 	errInvalidTimeout = errors.New("invalid timeout_ms")
 )
 
 // Handler decides what to do with an observation. The server parses and
 // limits the input and does nothing else with it. Addresses are canonical:
-// no zone, and IPv4-mapped IPv6 is unmapped. A nil return becomes an ack. An
+// no zone, and IPv4-mapped IPv6 is unmapped. Alias names are unique as
+// byte strings; the server does not fold case. A nil return becomes an ack. An
 // error becomes a rejection, and the first 256 bytes of its text go to the
 // client. ctx ends when the client deadline passes or the server shuts down.
 type Handler interface {
@@ -391,10 +394,43 @@ func decodeObserve(raw []byte) (Observation, time.Duration, error) {
 		}
 		addrs[i] = a.Unmap()
 	}
+	aliases, err := decodeAliases(b.Aliases)
+	if err != nil {
+		return Observation{}, 0, err
+	}
 	obs := Observation{
-		QName: b.QName,
-		Addrs: addrs,
-		TTL:   time.Duration(b.TTLSeconds) * time.Second,
+		QName:   b.QName,
+		Addrs:   addrs,
+		TTL:     time.Duration(b.TTLSeconds) * time.Second,
+		Aliases: aliases,
 	}
 	return obs, time.Duration(b.TimeoutMS) * time.Millisecond, nil
+}
+
+// decodeAliases checks the aliases and removes duplicate names. Names are
+// compared as byte strings. A duplicate keeps its first position and its
+// largest TTL, so the handler sees the longest TTL that the client sent
+// for the name.
+func decodeAliases(in []aliasBody) ([]Alias, error) {
+	if len(in) > MaxAliases {
+		return nil, fmt.Errorf("%w: %d, limit %d", errTooManyAliases, len(in), MaxAliases)
+	}
+	if len(in) == 0 {
+		return nil, nil
+	}
+	out := make([]Alias, 0, len(in))
+	at := make(map[string]int, len(in))
+	for _, a := range in {
+		if a.Name == "" || len(a.Name) > MaxQNameLen {
+			return nil, fmt.Errorf("%w: name length %d", errInvalidAlias, len(a.Name))
+		}
+		ttl := time.Duration(a.TTLSeconds) * time.Second
+		if i, ok := at[a.Name]; ok {
+			out[i].TTL = max(out[i].TTL, ttl)
+			continue
+		}
+		at[a.Name] = len(out)
+		out = append(out, Alias{Name: a.Name, TTL: ttl})
+	}
+	return out, nil
 }
