@@ -18,7 +18,7 @@ import (
 
 const (
 	// DefaultListen is the DNS listen address when [dns] has no listen key.
-	DefaultListen = "127.0.0.1:53553"
+	DefaultListen = "127.0.0.1:10053"
 	// DefaultRetain is how long the address book keeps an entry when
 	// [addrbook] has no retain key.
 	DefaultRetain = 7 * 24 * time.Hour
