@@ -1,10 +1,9 @@
 # autofix.ci identifies this workflow by its name. Do not change the name.
 name: autofix.ci
 
+# Only a PR can take a fix: the rules on main do not allow a direct push.
 on:
   pull_request:
-  push:
-    branches: [main]
 
 permissions:
   contents: read

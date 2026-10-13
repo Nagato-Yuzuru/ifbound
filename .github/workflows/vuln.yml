@@ -1,10 +1,17 @@
 name: vuln
 
 on:
-  push:
-    branches: [main]
+  # The Go version from mise decides the standard library that is checked.
   pull_request:
-  # A new advisory can affect code that did not change.
+    paths:
+      - "**.go"
+      - go.mod
+      - go.sum
+      - mise.toml
+      - mise.lock
+      - .github/workflows/vuln.yml
+  # A new advisory can affect code that did not change. The daily run also
+  # covers main after each merge.
   schedule:
     - cron: "17 3 * * *"
 
