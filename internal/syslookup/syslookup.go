@@ -31,13 +31,16 @@ import (
 	"time"
 )
 
-// Errors of Resolve. Only ErrNotFound means that the system resolver
-// answered that the name has no addresses. A done context gives an error
-// that wraps the context error. Each other error means that the lookup
-// failed and tells nothing about the name.
+// Errors of Resolve. A done context gives an error that wraps the context
+// error. Each error other than ErrNotFound means that the lookup failed
+// and tells nothing about the name.
 var (
-	// ErrNotFound means that the system resolver answered: the name has no
-	// A and no AAAA records, or the name does not exist.
+	// ErrNotFound means that getaddrinfo gave no addresses and reported
+	// "no such name" (EAI_NONAME), and mDNSResponder accepts connections.
+	// getaddrinfo reports EAI_NONAME also when the upstream server failed
+	// (SERVFAIL) and for some other failures that it does not tell apart.
+	// So ErrNotFound does not prove that the name has no addresses: do not
+	// use it as a reason to unblock or to trust an empty answer.
 	ErrNotFound = errors.New("no addresses for the name")
 	// ErrUnavailable means that the lookup found no addresses and the
 	// mDNSResponder socket does not accept connections. getaddrinfo then
@@ -75,7 +78,9 @@ func absName(name string) (string, error) {
 // classify turns a lookup error into the error set of Resolve. probe
 // checks that mDNSResponder accepts connections. libSystem reports "no
 // such name" also when it cannot reach mDNSResponder, so a not-found
-// result is ErrNotFound only when probe succeeds.
+// result is ErrNotFound only when probe succeeds. The net package gives
+// the same error for an upstream SERVFAIL, so ErrNotFound can stand for
+// one (see ErrNotFound).
 func classify(ctx context.Context, name string, err error, probe func(context.Context) error) error {
 	if cerr := ctx.Err(); cerr != nil {
 		return fmt.Errorf("resolve %s: %w", name, cerr)
