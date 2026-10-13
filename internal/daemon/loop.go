@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
+	"github.com/Nagato-Yuzuru/ifbound/internal/dnsname"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
@@ -28,6 +29,12 @@ type loop struct {
 	cfg     policy.Config
 	matcher *matcher.Matcher
 	apexes  []policy.Domain
+	// gen counts the configuration changes. A probe completes only under
+	// the configuration that it started with.
+	gen uint64
+
+	// resolver is rec.Resolver: it keeps the proofs of the alias entries.
+	resolver *resolverWatch
 
 	phase phase
 	// recheck asks Run for a convergence after the current request. A
@@ -43,7 +50,10 @@ func newLoop(c Config) *loop {
 		log:      c.Logger,
 		retain:   c.Policy.AddrBook.Retain,
 		phase:    startingPhase("the snapshot is not loaded yet"),
+
+		resolver: newResolverWatch(c.Platform.Resolver),
 	}
+	l.rec.Resolver = l.resolver
 	l.book = l.newBook()
 	l.setConfig(c.Policy)
 	return l
@@ -53,8 +63,14 @@ func (l *loop) newBook() *addrbook.AddrBook { return addrbook.New(l.retain, time
 
 func (l *loop) setConfig(cfg policy.Config) {
 	l.cfg = cfg
+	l.gen++
+	l.resolver.listen = cfg.DNS.Listen
 	l.matcher = matcher.New(cfg.Policies)
 	l.apexes = l.matcher.Apexes()
+}
+
+func (l *loop) configured(name policy.Name) bool {
+	return slices.ContainsFunc(l.cfg.Policies, func(p policy.Policy) bool { return p.Name == name })
 }
 
 func (l *loop) policyNames() []policy.Name {
@@ -97,17 +113,25 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	return err
 }
 
-// loadBook builds a book from the snapshot. A snapshot without entries
-// (most often a missing file) makes it adopt the learned-looking entries
-// of the kernel tables and save them first: a lost snapshot then keeps
-// addresses blocked for one retain period instead of unblocking them.
-// Entries that expired while the daemon was down leave the book here.
+// loadBook builds a book from the snapshot. A snapshot without addresses
+// of the configured policies (most often a missing file) makes it adopt
+// the learned-looking entries of the kernel tables and save them first:
+// a lost snapshot then keeps addresses blocked for one retain period
+// instead of unblocking them. Aliases do not count here: adoption keeps
+// the addresses of the tables, and aliases are not in the tables.
+//
+// The rule looks at the configured policies only, so it also adopts when
+// the snapshot holds addresses only of policies that the configuration
+// removed. This is broader than "the snapshot is empty", and it fails
+// closed: adoption adds entries that the tables already hold, and each
+// one expires after one retain period. Entries that expired while the
+// daemon was down leave the book here.
 func (l *loop) loadBook(ctx context.Context) (*addrbook.AddrBook, error) {
 	book := l.newBook()
 	if err := book.Load(l.snapshot); err != nil {
 		return nil, fmt.Errorf("loading snapshot: %w", err)
 	}
-	if _, nonEmpty := book.NextExpiry(); !nonEmpty {
+	if !slices.ContainsFunc(l.policyNames(), func(n policy.Name) bool { return len(book.Addrs(n)) > 0 }) {
 		if err := l.adopt(ctx, book); err != nil {
 			return nil, err
 		}
@@ -172,36 +196,105 @@ func (l *loop) reconfigure(ctx context.Context, cfg policy.Config) error {
 	return l.reconcile(ctx, "config")
 }
 
-// observe handles one DNS report. The report is untrusted: only the
-// policies that match its name get its addresses. The order keeps the
-// acknowledgement honest: book, tables, snapshot, a check that the
+// observe handles one DNS report, up to the probe. The report is
+// untrusted: only the policies that match its name get its addresses
+// and aliases. The order keeps the acknowledgement honest: book, tables,
+// snapshot, the resolver entries of the aliases, a check that the
 // installed ruleset is still loaded, and only then nil. The check costs
-// one LoadedID read per report that matches a policy. After a failure the
-// book keeps the addresses, so the next report or convergence completes
-// the work.
-func (l *loop) observe(ctx context.Context, o ipc.Observation) error {
+// one LoadedID read per report that matches a policy. After a failure
+// the book keeps the addresses and aliases, so the next report or
+// convergence completes the work.
+//
+// A non-nil pending means that the entries of some aliases need a probe
+// before the ack.
+func (l *loop) observe(ctx context.Context, o ipc.Observation) (*pending, error) {
 	switch {
 	case !l.phase.loaded():
-		return ErrNotReady
+		return nil, ErrNotReady
 	case !l.phase.acks():
-		return ErrUnenforced
+		return nil, ErrUnenforced
 	}
-	names, err := l.matcher.Match(o.QName)
+	names, err := l.match(o.QName)
+	if err != nil || len(names) == 0 {
+		return nil, err
+	}
+	aliases, err := parseAliases(o.Aliases)
 	if err != nil {
-		return fmt.Errorf("classifying qname: %w", err)
-	}
-	if len(names) == 0 {
-		return nil
+		return nil, err
 	}
 	addrs := canonical(o.Addrs)
-	needSave := false
+	needSave, err := l.learn(names, addrs, o.TTL, aliases)
+	if err != nil {
+		return nil, err
+	}
+	if err := l.enforce(ctx, names, addrs, needSave); err != nil {
+		return nil, err
+	}
+	unproven, view, err := l.needProof(ctx, aliases)
+	if err != nil {
+		return nil, err
+	}
+	if err := l.checkInstalled(ctx); err != nil {
+		return nil, err
+	}
+	if len(unproven) == 0 {
+		return nil, nil
+	}
+	pq := &pending{names: names, addrs: addrs, aliases: unproven, problems: view.problems, gen: l.gen}
+	for _, a := range aliases {
+		if !slices.ContainsFunc(unproven, func(u alias) bool { return u.name == a.name }) {
+			pq.proven = append(pq.proven, a)
+		}
+	}
+	for _, a := range unproven {
+		pq.stamps = append(pq.stamps, l.resolver.stamp(a.domain))
+		pq.covers = append(pq.covers, view.cover(a.domain))
+	}
+	return pq, nil
+}
+
+// match returns the policies that match qname, then the configured
+// policies that hold qname as a learned alias.
+func (l *loop) match(qname string) ([]policy.Name, error) {
+	names, err := l.matcher.Match(qname)
+	if err != nil {
+		return nil, fmt.Errorf("classifying qname: %w", err)
+	}
+	// Parse fails only for the root name, and the root name is never an
+	// alias.
+	if n, err := dnsname.Parse(qname); err == nil {
+		for _, p := range l.book.AliasPolicies(n) {
+			if l.configured(p) && !slices.Contains(names, p) {
+				names = append(names, p)
+			}
+		}
+	}
+	return names, nil
+}
+
+// learn records the addresses and the aliases of a report for each
+// policy. It reports whether the book needs a save.
+func (l *loop) learn(names []policy.Name, addrs []netip.Addr, ttl time.Duration, aliases []alias) (needSave bool, err error) {
 	for _, name := range names {
-		ns, err := l.book.Observe(name, addrs, o.TTL)
+		ns, err := l.book.Observe(name, addrs, ttl)
 		if err != nil {
-			return fmt.Errorf("recording addresses: %w", err)
+			return false, fmt.Errorf("recording addresses: %w", err)
 		}
 		needSave = needSave || ns
+		for _, a := range aliases {
+			ns, err := l.book.ObserveAliases(name, []string{a.name.String()}, a.ttl)
+			if err != nil {
+				return false, fmt.Errorf("recording aliases: %w", err)
+			}
+			needSave = needSave || ns
+		}
 	}
+	return needSave, nil
+}
+
+// enforce adds the addresses to the table of each policy, then saves the
+// book when needSave is set.
+func (l *loop) enforce(ctx context.Context, names []policy.Name, addrs []netip.Addr, needSave bool) error {
 	for _, name := range names {
 		if err := l.rec.AddObserved(ctx, name, addrs); err != nil {
 			return err
@@ -212,7 +305,7 @@ func (l *loop) observe(ctx context.Context, o ipc.Observation) error {
 			return fmt.Errorf("saving snapshot: %w", err)
 		}
 	}
-	return l.checkInstalled(ctx)
+	return nil
 }
 
 // checkInstalled confirms that the Backend still has the installed
@@ -243,15 +336,17 @@ func canonical(addrs []netip.Addr) []netip.Addr {
 }
 
 func (l *loop) status() Status {
-	n := 0
+	addrs, aliases := 0, 0
 	for _, name := range l.policyNames() {
-		n += len(l.book.Addrs(name))
+		addrs += len(l.book.Addrs(name))
+		aliases += len(l.book.Aliases(name))
 	}
 	return Status{
 		State:         l.phase.state,
 		Reasons:       slices.Clone(l.phase.reasons),
 		Policies:      len(l.cfg.Policies),
-		Addrs:         n,
+		Addrs:         addrs,
+		Aliases:       aliases,
 		RetainRestart: l.cfg.AddrBook.Retain != l.retain,
 	}
 }

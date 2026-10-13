@@ -16,6 +16,7 @@ import (
 	"maps"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -38,7 +39,10 @@ type World struct {
 	applied map[policy.Domain]netip.AddrPort
 	// pending holds the entries that a Write changed since the system
 	// applied the entries last.
-	pending  map[policy.Domain]struct{}
+	pending map[policy.Domain]struct{}
+	// versions counts the Writes of each domain; Read reports it as the
+	// Version of the entry.
+	versions map[policy.Domain]uint64
 	delay    bool
 	bproblem []reconcile.Problem
 	rproblem []reconcile.Problem
@@ -55,6 +59,7 @@ func NewWorld() *World {
 		resolver: make(map[policy.Domain]netip.AddrPort),
 		applied:  make(map[policy.Domain]netip.AddrPort),
 		pending:  make(map[policy.Domain]struct{}),
+		versions: make(map[policy.Domain]uint64),
 	}
 }
 
@@ -329,7 +334,7 @@ func (r *Resolver) Read(context.Context) (reconcile.ResolverState, error) {
 	out := make([]reconcile.ManagedEntry, len(entries))
 	for i, e := range entries {
 		_, pending := r.w.pending[e.Domain]
-		out[i] = reconcile.ManagedEntry{ResolverEntry: e, Active: !pending}
+		out[i] = reconcile.ManagedEntry{ResolverEntry: e, Active: !pending, Version: strconv.FormatUint(r.w.versions[e.Domain], 10)}
 	}
 	return reconcile.ResolverState{
 		Entries:  out,
@@ -343,6 +348,7 @@ func (r *Resolver) Read(context.Context) (reconcile.ResolverState, error) {
 func (r *Resolver) Write(_ context.Context, e reconcile.ResolverEntry) error {
 	return r.w.write(func() {
 		r.w.resolver[e.Domain] = e.Server
+		r.w.versions[e.Domain]++
 		if r.w.delay {
 			r.w.pending[e.Domain] = struct{}{}
 		} else {
