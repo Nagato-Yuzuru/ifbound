@@ -174,7 +174,7 @@ func TestParseDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Literals, not the constants: the test pins the documented defaults.
-	if cfg.DNS.Listen != netip.MustParseAddrPort("127.0.0.1:53553") {
+	if cfg.DNS.Listen != netip.MustParseAddrPort("127.0.0.1:10053") {
 		t.Errorf("listen = %v", cfg.DNS.Listen)
 	}
 	if cfg.AddrBook.Retain != 168*time.Hour {
