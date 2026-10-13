@@ -47,7 +47,8 @@ func TestVersionStaysWithoutWrite(t *testing.T) {
 }
 
 // Writes in the same clock tick give the same modification time and the
-// same size. The new inode of each write still gives a new version.
+// same size, and ext4 can give the new file the inode of the file that
+// the last write removed. Each write still gives a new version.
 func TestVersionChangesOnWriteInSameTick(t *testing.T) {
 	f := newFixture(t)
 	f.write(t, "example.test", listen)

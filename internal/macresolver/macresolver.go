@@ -85,6 +85,11 @@ type Resolver struct {
 	dir    string
 	now    func() time.Time
 	config ConfigSource
+	// writes counts the Writes that changed the file of each domain. It
+	// is part of the version, because a file system can give a new file
+	// the inode number of a file that was just removed (ext4 does), and
+	// two Writes in one clock tick then give the same file identity.
+	writes map[policy.Domain]uint64
 }
 
 var _ reconcile.SysResolver = (*Resolver)(nil)
@@ -94,7 +99,7 @@ var _ reconcile.SysResolver = (*Resolver)(nil)
 // compares it with that time. Config gives the system resolver
 // configuration (Scutil on macOS).
 func New(dir string, now func() time.Time, config ConfigSource) *Resolver {
-	return &Resolver{dir: dir, now: now, config: config}
+	return &Resolver{dir: dir, now: now, config: config, writes: make(map[policy.Domain]uint64)}
 }
 
 // Read implements reconcile.SysResolver. It reports each file that starts
@@ -181,6 +186,7 @@ func (r *Resolver) Write(_ context.Context, e reconcile.ResolverEntry) error {
 	if err := r.replace(path, data, exists); err != nil {
 		return fmt.Errorf("writing resolver entry %s: %w", e.Domain, err)
 	}
+	r.writes[e.Domain]++
 	return nil
 }
 
@@ -245,25 +251,27 @@ func (r *Resolver) managed() ([]reconcile.ManagedEntry, error) {
 			Domain:  d,
 			Server:  server,
 			Active:  server.IsValid() && !now.Before(fi.ModTime().Add(Settle)),
-			Version: fileVersion(fi),
+			Version: fileVersion(r.writes[d], fi),
 		})
 	}
 	return out, nil
 }
 
-// fileVersion returns the identity of the file content: device, inode,
-// modification time in nanoseconds, and size. A rename of a new file over
-// the name gives a new inode, and a write in place gives a new
-// modification time. So two Writes in the same clock tick give different
-// versions: each Write renames or links a new temporary file. APFS does
-// not reuse an inode number, so a version does not come back. It is ""
-// when the file information has no inode.
-func fileVersion(fi fs.FileInfo) string {
+// fileVersion returns the version of an entry: the number of Writes of
+// this Resolver that changed the file, then the identity of the file
+// content (device, inode, modification time in nanoseconds, and size).
+// The count makes each Write of ifbound give a new version, also when the
+// file system reuses the inode number in the same clock tick. A rename of
+// a new file by another process gives a new inode, and a write in place
+// gives a new modification time. The count starts again in a new
+// process, so a version can come back only across a restart of ifboundd.
+// It is "" when the file information has no inode.
+func fileVersion(writes uint64, fi fs.FileInfo) string {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
 		return ""
 	}
-	return fmt.Sprintf("%d:%d:%d:%d", st.Dev, st.Ino, fi.ModTime().UnixNano(), fi.Size())
+	return fmt.Sprintf("%d:%d:%d:%d:%d", writes, st.Dev, st.Ino, fi.ModTime().UnixNano(), fi.Size())
 }
 
 // managedFile reads the file at path. It returns ok == false when no file
