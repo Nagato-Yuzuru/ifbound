@@ -17,6 +17,41 @@ env:
   MISE_DISABLE_TOOLS: tart
 
 jobs:
+  # The test jobs are required checks, so a path filter on the workflow
+  # would leave them pending. A job that its `if` skips counts as passed.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: filter
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # A push to main tests every merge: a PR is not tested against the
+          # newest main before it merges.
+          if [ "$EVENT" != pull_request ]; then
+            echo code=true >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # When the diff fails, the tests run.
+          if ! git fetch --no-tags --depth=1 origin "$BASE" ||
+            ! changed=$(git diff --name-only "$BASE" HEAD); then
+            echo code=true >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -qE '\.go$|^go\.(mod|sum)$|/testdata/|^mise\.(toml|lock)$|^\.golangci|^\.github/workflows/ci\.yml$' <<<"$changed"; then
+            echo code=true >> "$GITHUB_OUTPUT"
+          else
+            echo code=false >> "$GITHUB_OUTPUT"
+          fi
+
   check:
     name: check (hooks, lint, format)
     runs-on: ubuntu-latest
@@ -30,6 +65,9 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
+    # A failed changes job gives no output, so the tests run.
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -45,6 +83,9 @@ jobs:
 
   test-root:
     name: test (linux, root)
+    # A failed changes job gives no output, so the tests run.
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -62,6 +103,9 @@ jobs:
 
   e2e:
     name: e2e (macOS, root)
+    # A failed changes job gives no output, so the tests run.
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: macos-latest
     timeout-minutes: 20
     env:
