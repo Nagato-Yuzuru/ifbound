@@ -159,25 +159,9 @@ type ResolverEntry struct {
 	Server netip.AddrPort
 }
 
-// ManagedEntry is a resolver entry that ifbound manages, as the
-// SysResolver reads it.
-type ManagedEntry struct {
-	ResolverEntry
-	// Active is true when the system now sends the queries for Domain to
-	// Server. An entry that is not active yet is present, but the system
-	// can still send its queries to another resolver.
-	Active bool
-	// Version changes at each write of the entry, by ifbound or by another
-	// process, also when the content stays the same, and it does not come
-	// back to an earlier value. It is "" when the platform cannot tell.
-	// For example, a platform can derive it from the inode and the
-	// modification time of the entry file.
-	Version string
-}
-
 // ResolverState is the set of resolver entries that ifbound manages now.
 type ResolverState struct {
-	Entries []ManagedEntry // at most one entry per domain
+	Entries []ResolverEntry // at most one entry per domain
 	// Problems are conflicts with entries that ifbound does not manage.
 	Problems []Problem
 	// Shadowed lists the domain of each resolver that ifbound does not
@@ -199,15 +183,13 @@ type ResolverState struct {
 //     applies changes after a delay never applies a Remove before an
 //     earlier Write. So an entry that a Write adds keeps its domain covered
 //     while the system still applies a later Remove of a broader entry.
-//   - Read reports for each entry whether it is active. The platform
-//     decides this by its own rule, and it derives the answer from the
-//     system state, never from a cache. For example, a platform that
-//     applies a new entry after a delay compares the modification time
-//     of the entry with a settle time. A platform that applies an entry
-//     at once reports it as active after a successful Write.
+//   - Read derives the entries from the system state, never from a
+//     cache. An entry that Read reports is present, but a platform can
+//     apply it after a delay; only a probe below its domain shows where
+//     its names go.
 //   - Each Write, also of unchanged content, can make the system flush
-//     its whole DNS cache (macOS does this), and it can make an active
-//     entry not active again until the system applies it.
+//     its whole DNS cache (macOS does this), and it can make the system
+//     apply the entry again after a delay.
 type SysResolver interface {
 	// Read returns the managed entries. It writes nothing.
 	Read(ctx context.Context) (ResolverState, error)

@@ -75,12 +75,8 @@ func TestReportReachesIfboundd(t *testing.T) {
 	}
 	select {
 	case got := <-seen:
-		want := ipc.Observation{
-			QName: "www.example.org.", Addrs: addrs("2001:db8::1"), TTL: 60 * time.Second,
-			Aliases: []ipc.Alias{{Name: "a.example.net.", TTL: 60 * time.Second}},
-		}
-		if got.QName != want.QName || got.TTL != want.TTL || !slices.Equal(got.Addrs, want.Addrs) ||
-			!slices.Equal(got.Aliases, want.Aliases) {
+		want := ipc.Observation{QName: "www.example.org.", Addrs: addrs("2001:db8::1"), TTL: 60 * time.Second}
+		if got.QName != want.QName || got.TTL != want.TTL || !slices.Equal(got.Addrs, want.Addrs) {
 			t.Errorf("ifboundd got %+v, want %+v", got, want)
 		}
 	default:

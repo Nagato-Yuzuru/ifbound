@@ -3,7 +3,6 @@ package dnsplugin
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/netip"
 	"slices"
@@ -120,7 +119,6 @@ func TestServeDNSReportsEveryAddressBeforeTheReply(t *testing.T) {
 			}},
 			want: ipc.Observation{
 				QName: "_dns.example.org.", Addrs: addrs("192.0.2.3", "2001:db8::3"), TTL: 300 * time.Second,
-				Aliases: []ipc.Alias{{Name: "dns.example.org.", TTL: 300 * time.Second}},
 			},
 		},
 		{
@@ -133,7 +131,6 @@ func TestServeDNSReportsEveryAddressBeforeTheReply(t *testing.T) {
 			}},
 			want: ipc.Observation{
 				QName: "www.example.org.", Addrs: addrs("192.0.2.4"), TTL: 120 * time.Second,
-				Aliases: []ipc.Alias{{Name: "a.example.net.", TTL: 600 * time.Second}, {Name: "b.example.com.", TTL: 120 * time.Second}},
 			},
 		},
 		{
@@ -145,8 +142,19 @@ func TestServeDNSReportsEveryAddressBeforeTheReply(t *testing.T) {
 			}},
 			want: ipc.Observation{
 				QName: `WWW.Ex\.ample.org.`, Addrs: addrs("192.0.2.4"), TTL: 30 * time.Second,
-				Aliases: []ipc.Alias{{Name: "b.example.com.", TTL: 30 * time.Second}},
 			},
+		},
+		{
+			name:  "branching CNAMEs: the smallest TTL of every CNAME the client can follow",
+			qname: "www.example.org.",
+			up: upstream{answer: []dns.RR{
+				rr("www.example.org. 300 IN CNAME a.example.net."),
+				rr("WWW.example.org. 30 IN CNAME evil.example."),
+				rr("a.example.net. 60 IN CNAME b.example.net."),
+				rr("evil.example. 90 IN CNAME B.example.net."),
+				rr("b.example.net. 300 IN A 192.0.2.1"),
+			}},
+			want: ipc.Observation{QName: "www.example.org.", Addrs: addrs("192.0.2.1"), TTL: 30 * time.Second},
 		},
 		{
 			name:  "minimum TTL among address records",
@@ -173,7 +181,6 @@ func TestServeDNSReportsEveryAddressBeforeTheReply(t *testing.T) {
 			}},
 			want: ipc.Observation{
 				QName: "www.example.org.", Addrs: addrs("192.0.2.4", "198.51.100.1"), TTL: 50 * time.Second,
-				Aliases: []ipc.Alias{{Name: "a.example.net.", TTL: 300 * time.Second}},
 			},
 		},
 		{
@@ -186,7 +193,6 @@ func TestServeDNSReportsEveryAddressBeforeTheReply(t *testing.T) {
 			}},
 			want: ipc.Observation{
 				QName: "a.example.", Addrs: addrs("192.0.2.5"), TTL: 200 * time.Second,
-				Aliases: []ipc.Alias{{Name: "b.example.", TTL: 300 * time.Second}},
 			},
 		},
 		{
@@ -199,7 +205,6 @@ func TestServeDNSReportsEveryAddressBeforeTheReply(t *testing.T) {
 			},
 			want: ipc.Observation{
 				QName: "example.org.", Addrs: addrs("192.0.2.6", "2001:db8::53"), TTL: 90 * time.Second,
-				Aliases: []ipc.Alias{{Name: "svc.example.org.", TTL: 300 * time.Second}},
 			},
 		},
 		{
@@ -277,248 +282,13 @@ func TestServeDNSReportsEveryAddressBeforeTheReply(t *testing.T) {
 				t.Fatalf("reports = %d, want 1", n)
 			}
 			got := *rep.last.Load()
-			if got.QName != tt.want.QName || got.TTL != tt.want.TTL || !slices.Equal(got.Addrs, tt.want.Addrs) ||
-				!slices.Equal(got.Aliases, tt.want.Aliases) {
+			if got.QName != tt.want.QName || got.TTL != tt.want.TTL || !slices.Equal(got.Addrs, tt.want.Addrs) {
 				t.Errorf("observation = %+v, want %+v", got, tt.want)
 			}
 			if want := onWire(t, tt.up.sent); rec.Msg == nil || rec.Msg.String() != want.String() {
 				t.Errorf("client got\n%v\nwant\n%v", rec.Msg, want)
 			}
 			requireReported(t, rec.Msg, got.Addrs)
-			requireAliasesReported(t, tt.qname, rec.Msg, got.Aliases)
-		})
-	}
-}
-
-func TestServeDNSReportsAliases(t *testing.T) {
-	type alias = ipc.Alias
-	tests := []struct {
-		name  string
-		qname string
-		up    upstream
-		want  []alias
-		ttl   time.Duration // the address TTL
-	}{
-		{
-			name:  "CNAME chain of length 1",
-			qname: "www.example.org.",
-			up: upstream{answer: []dns.RR{
-				rr("www.example.org. 600 IN CNAME a.example.net."),
-				rr("a.example.net. 300 IN A 192.0.2.1"),
-			}},
-			want: []alias{{Name: "a.example.net.", TTL: 600 * time.Second}},
-			ttl:  300 * time.Second,
-		},
-		{
-			name:  "CNAME chain of length 3, each alias with the TTL of its link",
-			qname: "www.example.org.",
-			up: upstream{answer: []dns.RR{
-				rr("b.example.net. 60 IN CNAME c.example.com."),
-				rr("www.example.org. 600 IN CNAME a.example.net."),
-				rr("a.example.net. 120 IN CNAME b.example.net."),
-				rr("c.example.com. 300 IN A 192.0.2.1"),
-			}},
-			want: []alias{
-				{Name: "a.example.net.", TTL: 600 * time.Second},
-				{Name: "b.example.net.", TTL: 120 * time.Second},
-				{Name: "c.example.com.", TTL: 60 * time.Second},
-			},
-			ttl: 60 * time.Second,
-		},
-		{
-			name:  "CNAME TTLs that do not fall along the chain",
-			qname: "www.example.org.",
-			up: upstream{answer: []dns.RR{
-				rr("www.example.org. 10 IN CNAME a.example.net."),
-				rr("a.example.net. 600 IN CNAME b.example.net."),
-				rr("b.example.net. 300 IN A 192.0.2.1"),
-			}},
-			want: []alias{{Name: "a.example.net.", TTL: 10 * time.Second}, {Name: "b.example.net.", TTL: 600 * time.Second}},
-			ttl:  10 * time.Second,
-		},
-		{
-			name:  "branching CNAMEs: every target the client can follow",
-			qname: "www.example.org.",
-			up: upstream{answer: []dns.RR{
-				rr("www.example.org. 300 IN CNAME a.example.net."),
-				rr("WWW.example.org. 30 IN CNAME evil.example."),
-				rr("a.example.net. 60 IN CNAME b.example.net."),
-				rr("evil.example. 90 IN CNAME B.example.net."),
-				rr("b.example.net. 300 IN A 192.0.2.1"),
-			}},
-			want: []alias{
-				{Name: "a.example.net.", TTL: 300 * time.Second},
-				{Name: "evil.example.", TTL: 30 * time.Second},
-				{Name: "b.example.net.", TTL: 90 * time.Second},
-			},
-			ttl: 30 * time.Second,
-		},
-		{
-			name:  "CNAME target root is no alias",
-			qname: "www.example.org.",
-			up: upstream{answer: []dns.RR{
-				rr("www.example.org. 300 IN CNAME a.example.net."),
-				rr("a.example.net. 300 IN CNAME ."),
-			}},
-			want: []alias{{Name: "a.example.net.", TTL: 300 * time.Second}},
-		},
-		{
-			name:  "CNAME loop stops; a CNAME off the chain is no alias",
-			qname: "a.example.",
-			up: upstream{answer: []dns.RR{
-				rr("a.example. 300 IN CNAME b.example."),
-				rr("b.example. 200 IN CNAME c.example."),
-				rr("c.example. 100 IN CNAME B.example."),
-				rr("x.example. 100 IN CNAME y.example."),
-			}},
-			want: []alias{{Name: "b.example.", TTL: 300 * time.Second}, {Name: "c.example.", TTL: 200 * time.Second}},
-		},
-		{
-			name:  "CNAME loop back to the qname",
-			qname: "a.example.",
-			up: upstream{answer: []dns.RR{
-				rr("a.example. 300 IN CNAME b.example."),
-				rr("b.example. 200 IN CNAME A.example."),
-			}},
-			want: []alias{{Name: "b.example.", TTL: 300 * time.Second}},
-		},
-		{
-			name:  "only a CNAME, no address",
-			qname: "example.org.",
-			up: upstream{
-				answer: []dns.RR{rr("example.org. 300 IN CNAME a.example.net.")},
-				ns:     []dns.RR{rr("example.net. 300 IN SOA ns.example.net. host.example.net. 1 7200 3600 1209600 300")},
-			},
-			want: []alias{{Name: "a.example.net.", TTL: 300 * time.Second}},
-		},
-		{
-			name:  "HTTPS ServiceMode target in the answer",
-			qname: "example.org.",
-			up:    upstream{answer: []dns.RR{rr("example.org. 120 IN HTTPS 1 svc.example.net. alpn=h2 ipv4hint=192.0.2.1")}},
-			want:  []alias{{Name: "svc.example.net.", TTL: 120 * time.Second}},
-			ttl:   120 * time.Second,
-		},
-		{
-			name:  "HTTPS AliasMode target in the answer, no address",
-			qname: "example.org.",
-			up:    upstream{answer: []dns.RR{rr("example.org. 120 IN HTTPS 0 pool.example.net.")}},
-			want:  []alias{{Name: "pool.example.net.", TTL: 120 * time.Second}},
-		},
-		{
-			name:  "HTTPS targets in the additional section",
-			qname: "www.example.org.",
-			up: upstream{
-				answer: []dns.RR{rr("www.example.org. 300 IN A 192.0.2.1")},
-				extra: []dns.RR{
-					rr("www.example.org. 90 IN HTTPS 1 svc.example.net."),
-					rr("other.example. 45 IN HTTPS 0 pool.example.net."),
-				},
-			},
-			want: []alias{{Name: "svc.example.net.", TTL: 90 * time.Second}, {Name: "pool.example.net.", TTL: 45 * time.Second}},
-			ttl:  300 * time.Second,
-		},
-		{
-			name:  "HTTPS target in the authority section",
-			qname: "example.org.",
-			up: upstream{
-				answer: []dns.RR{rr("example.org. 300 IN A 192.0.2.1")},
-				ns:     []dns.RR{rr("other.example. 75 IN HTTPS 1 svc.example.net.")},
-			},
-			want: []alias{{Name: "svc.example.net.", TTL: 75 * time.Second}},
-			ttl:  300 * time.Second,
-		},
-		{
-			name:  "SVCB target",
-			qname: "_dns.example.org.",
-			up:    upstream{answer: []dns.RR{rr("_dns.example.org. 60 IN SVCB 0 dns.example.net.")}},
-			want:  []alias{{Name: "dns.example.net.", TTL: 60 * time.Second}},
-		},
-		{
-			name:  "target dot and target equal to the owner are no aliases",
-			qname: "example.org.",
-			up: upstream{answer: []dns.RR{
-				rr("example.org. 300 IN HTTPS 1 . ipv4hint=192.0.2.1"),
-				rr("example.org. 300 IN HTTPS 2 EXAMPLE.org. ipv4hint=192.0.2.2"),
-				rr("_dns.example.org. 300 IN SVCB 1 _dns.example.org. ipv4hint=192.0.2.3"),
-				rr("example.org. 300 IN HTTPS 0 ."),
-			}},
-			ttl: 300 * time.Second,
-		},
-		{
-			name:  "duplicate names collapse to the first form with the largest TTL",
-			qname: "www.example.org.",
-			up: upstream{
-				answer: []dns.RR{
-					rr("www.example.org. 30 IN CNAME cdn.example.net."),
-					rr("cdn.example.net. 60 IN HTTPS 1 svc.example.net."),
-					rr("cdn.example.net. 300 IN HTTPS 2 SVC.example.net."),
-				},
-				extra: []dns.RR{rr("x.example. 600 IN HTTPS 1 CDN.example.net.")},
-			},
-			want: []alias{{Name: "cdn.example.net.", TTL: 600 * time.Second}, {Name: "svc.example.net.", TTL: 300 * time.Second}},
-		},
-		{
-			name:  "the walk goes on through the root",
-			qname: "q.example.",
-			up: upstream{answer: []dns.RR{
-				rr("q.example. 30 IN CNAME ."),
-				rr(". 40 IN CNAME z.example."),
-			}},
-			want: []alias{{Name: "z.example.", TTL: 40 * time.Second}},
-		},
-		{
-			name:  "root query: the root is no alias, its CNAME target is",
-			qname: ".",
-			up:    upstream{answer: []dns.RR{rr(". 60 IN CNAME a.example."), rr("a.example. 70 IN CNAME .")}},
-			want:  []alias{{Name: "a.example.", TTL: 60 * time.Second}},
-		},
-		{
-			name:  "a CNAME and an HTTPS record to one name: the largest TTL",
-			qname: "q.example.",
-			up: upstream{answer: []dns.RR{
-				rr("q.example. 15 IN CNAME w.example."),
-				rr("w.example. 8 IN HTTPS 1 svc.example."),
-				rr("q.example. 99 IN HTTPS 1 W.example."),
-			}},
-			want: []alias{{Name: "w.example.", TTL: 99 * time.Second}, {Name: "svc.example.", TTL: 8 * time.Second}},
-		},
-		{
-			// miekg/dns presents the octet 0x20 as "\ ".
-			name:  "escaped octets keep the presentation form that the client decodes",
-			qname: `q\.x.example.`,
-			up:    upstream{answer: []dns.RR{rr(`Q\.X.example. 60 IN CNAME a\032b.\195\175.example.`)}},
-			want:  []alias{{Name: `a\ b.\195\175.example.`, TTL: 60 * time.Second}},
-		},
-		{
-			name:  "names in the presentation form that the client decodes",
-			qname: "www.example.org.",
-			up: upstream{answer: []dns.RR{
-				rr(`www.example.org. 30 IN CNAME Cdn\.x.Example.NET.`),
-				rr(`Cdn\.x.Example.NET. 30 IN HTTPS 1 \195\175.example.net.`),
-			}},
-			want: []alias{{Name: `Cdn\.x.Example.NET.`, TTL: 30 * time.Second}, {Name: `\195\175.example.net.`, TTL: 30 * time.Second}},
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var rep recorder
-			h := &handler{next: &tt.up, reporter: &rep, timeout: time.Second}
-			rec, rcode, err := serve(t.Context(), h, tt.qname)
-			if err != nil || rcode != dns.RcodeSuccess {
-				t.Fatalf("ServeDNS = %d, %v; want success", rcode, err)
-			}
-			if n := rep.calls.Load(); n != 1 {
-				t.Fatalf("reports = %d, want 1", n)
-			}
-			got := *rep.last.Load()
-			if got.QName != tt.qname || got.TTL != tt.ttl || !slices.Equal(got.Aliases, tt.want) {
-				t.Errorf("observation = %+v, want aliases %+v and TTL %v", got, tt.want, tt.ttl)
-			}
-			if want := onWire(t, tt.up.sent); rec.Msg == nil || rec.Msg.String() != want.String() {
-				t.Errorf("client got\n%v\nwant\n%v", rec.Msg, want)
-			}
-			requireReported(t, rec.Msg, got.Addrs)
-			requireAliasesReported(t, tt.qname, rec.Msg, got.Aliases)
 		})
 	}
 }
@@ -587,6 +357,10 @@ func TestServeDNSPassesThroughWithoutAddress(t *testing.T) {
 	}{
 		{name: "NXDOMAIN", up: upstream{rcode: dns.RcodeNameError, ns: []dns.RR{soa}}},
 		{name: "NODATA", up: upstream{ns: []dns.RR{soa}}},
+		{name: "CNAME without address", up: upstream{
+			answer: []dns.RR{rr("example.org. 300 IN CNAME a.example.net.")},
+			ns:     []dns.RR{soa},
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -635,16 +409,6 @@ func writeA(more func(w dns.ResponseWriter, m *dns.Msg) (int, error)) plugin.Han
 }
 
 func done(dns.ResponseWriter, *dns.Msg) (int, error) { return dns.RcodeSuccess, nil }
-
-// manyHTTPS returns n HTTPS records for example.org., each with its own
-// target.
-func manyHTTPS(n int) []dns.RR {
-	out := make([]dns.RR, n)
-	for i := range out {
-		out[i] = rr(fmt.Sprintf("example.org. 300 IN HTTPS %d t%d.example.net.", i+1, i))
-	}
-	return out
-}
 
 // answerWith returns a next plugin that writes rrs in the answer section.
 func answerWith(rrs ...dns.RR) plugin.Handler { return &upstream{answer: rrs} }
@@ -695,19 +459,6 @@ func TestServeDNSFailsClosed(t *testing.T) {
 			cancel:   true,
 			reported: true,
 			want:     context.Canceled,
-		},
-		{
-			name:     "report of an alias without address rejected",
-			next:     answerWith(rr("example.org. 300 IN CNAME a.example.net.")),
-			reporter: reporterFunc(func(context.Context, ipc.Observation) error { return ipc.ErrRejected }),
-			reported: true,
-			want:     ipc.ErrRejected,
-		},
-		{
-			name:     "more aliases than the report can carry",
-			next:     answerWith(manyHTTPS(ipc.MaxAliases + 1)...),
-			reporter: ack,
-			want:     errTooManyAliases,
 		},
 		{
 			name: "malformed ipv4hint",

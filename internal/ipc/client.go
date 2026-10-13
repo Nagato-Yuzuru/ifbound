@@ -19,24 +19,13 @@ var (
 )
 
 // DefaultTimeout bounds a Report call whose context has no deadline.
-const DefaultTimeout = 5 * time.Second
+const DefaultTimeout = 2 * time.Second
 
 // Observation is one DNS answer.
 type Observation struct {
-	QName   string
-	Addrs   []netip.Addr
-	TTL     time.Duration
-	Aliases []Alias
-}
-
-// Alias is a name that the answer points the client to: a CNAME target or
-// an HTTPS or SVCB TargetName. The client can send a follow-up query for
-// it. Name has the presentation form that the client decodes; the package
-// does not canonicalize it. TTL is the largest TTL among the records that
-// point to the name.
-type Alias struct {
-	Name string
-	TTL  time.Duration
+	QName string
+	Addrs []netip.Addr
+	TTL   time.Duration
 }
 
 // Client reports observations to ifboundd. It is safe for concurrent use.
@@ -57,10 +46,9 @@ const (
 	// and does not overflow the server queue.
 	maxInFlight = 32
 	// maxProbesInFlight bounds the ReportProbe calls that run at once.
-	// Probes have their own slots: while ifboundd waits for a probe, the
-	// Report that waits for its ack holds a report slot, and all report
-	// slots can be held so. A probe that needed one of them would wait for
-	// itself.
+	// Probes have their own slots: a burst of Reports can hold every report
+	// slot, and a probe must not wait behind them, because ifboundd waits
+	// for the probe with a short budget.
 	maxProbesInFlight = 8
 )
 
@@ -157,15 +145,10 @@ func newObserveEnvelope(ctx context.Context, o Observation) envelope {
 	for i, a := range o.Addrs {
 		addrs[i] = a.String()
 	}
-	var aliases []aliasBody
-	for _, a := range o.Aliases {
-		aliases = append(aliases, aliasBody{Name: a.Name, TTLSeconds: ttlSeconds(a.TTL)})
-	}
 	body := observeBody{
 		QName:      o.QName,
 		Addrs:      addrs,
 		TTLSeconds: ttlSeconds(o.TTL),
-		Aliases:    aliases,
 	}
 	// Report sets a deadline, so ctx always has one.
 	dl, _ := ctx.Deadline()

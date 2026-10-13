@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -92,11 +91,8 @@ type harness struct {
 	world    *reconciletest.World
 	inv      *reconciletest.Inventory
 	snapshot string
-	// sys is the system resolver of the daemon, when startWith did not
-	// get another one.
-	sys  *sysNet
-	d    *daemon.Daemon
-	stop func()
+	d        *daemon.Daemon
+	stop     func()
 }
 
 func newHarness(t *testing.T, cfgText string) *harness {
@@ -115,34 +111,19 @@ func start(t *testing.T, world *reconciletest.World, inv *reconciletest.Inventor
 // startOn is start with a Backend that wraps the one of the World.
 func startOn(t *testing.T, world *reconciletest.World, be reconcile.Backend, inv *reconciletest.Inventory, snapshot string, cfg policy.Config) *harness {
 	t.Helper()
-	sys := newSysNet(world, cfg.DNS.Listen)
-	h := startWith(t, world, be, world.Resolver(), inv, snapshot, cfg, sys)
-	h.sys = sys
-	return h
-}
-
-// attacher is a system resolver that needs the daemon: it acts as
-// ifbound-dns too, and reports probes to the daemon.
-type attacher interface{ attach(d *daemon.Daemon) }
-
-// startWith is startOn with a given SysResolver, which wraps the one of
-// the World, and a given system resolver.
-func startWith(t *testing.T, world *reconciletest.World, be reconcile.Backend, rs reconcile.SysResolver, inv *reconciletest.Inventory, snapshot string, cfg policy.Config, lookup daemon.SystemResolver) *harness {
-	t.Helper()
+	sys := &sysNet{world: world, listen: cfg.DNS.Listen}
 	d := daemon.New(daemon.Config{
 		Policy:   cfg,
 		Snapshot: snapshot,
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
 			Backend:   be,
-			Resolver:  rs,
+			Resolver:  world.Resolver(),
 			Inventory: inv,
 		},
-		Lookup: lookup,
+		Lookup: sys,
 	})
-	if a, ok := lookup.(attacher); ok {
-		a.attach(d)
-	}
+	sys.d = d
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
@@ -235,51 +216,19 @@ func (b loadFails) Load(ctx context.Context, rs reconcile.Ruleset) error {
 // sysNet is the system resolver of the tests, together with ifbound-dns.
 // A name goes to the server of the most specific applied resolver entry
 // of the World that covers it, as the system routes a query; when that is
-// the listen address, ifbound-dns reports a probe name to the daemon. The answer is always
-// "no such name". A hook, when set, runs first, and an error from it ends
-// the lookup there.
+// the listen address, ifbound-dns reports a probe name to the daemon. The
+// answer is always "no such name".
 type sysNet struct {
 	world  *reconciletest.World
 	listen netip.AddrPort
 	d      *daemon.Daemon
-
-	mu    sync.Mutex
-	names []string
-	hook  func(ctx context.Context, name string) error
 }
 
-func newSysNet(world *reconciletest.World, listen netip.AddrPort) *sysNet {
-	return &sysNet{world: world, listen: listen}
-}
-
-func (s *sysNet) attach(d *daemon.Daemon) { s.d = d }
-
-func (s *sysNet) setHook(f func(ctx context.Context, name string) error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.hook = f
-}
-
-func (s *sysNet) Resolve(ctx context.Context, name string) ([]netip.Addr, error) {
-	s.mu.Lock()
-	s.names = append(s.names, name)
-	hook := s.hook
-	s.mu.Unlock()
-	if hook != nil {
-		if err := hook(ctx, name); err != nil {
-			return nil, err
-		}
-	}
-	if s.routed(name) && ipc.IsProbe(name) {
+func (s *sysNet) Resolve(_ context.Context, name string) ([]netip.Addr, error) {
+	if ipc.IsProbe(name) && routes(s.world.AppliedResolverEntries(), name, s.listen) {
 		s.d.ProbeSeen(name)
 	}
 	return nil, fmt.Errorf("resolve %s: %w", name, syslookup.ErrNotFound)
-}
-
-// routed reports whether the system sends the queries for name to
-// ifbound-dns now.
-func (s *sysNet) routed(name string) bool {
-	return routes(s.world.AppliedResolverEntries(), name, s.listen)
 }
 
 // routes reports whether the most specific entry that covers name has
@@ -295,36 +244,4 @@ func routes(entries []reconcile.ResolverEntry, name string, server netip.AddrPor
 		}
 	}
 	return found && to == server
-}
-
-// probes returns the probe names that the daemon sent for alias, in
-// order.
-func (s *sysNet) probes(alias string) []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var out []string
-	for _, n := range s.names {
-		if ipc.IsProbe(n) && strings.HasSuffix(n, "."+alias) && strings.Count(n, ".") == strings.Count(alias, ".")+1 {
-			out = append(out, n)
-		}
-	}
-	return out
-}
-
-// writeFails is a SysResolver whose Write fails while fail is set. It
-// counts the Write calls.
-type writeFails struct {
-	*reconciletest.Resolver
-	fail   *atomic.Bool
-	writes *atomic.Int32 // may be nil
-}
-
-func (r writeFails) Write(ctx context.Context, e reconcile.ResolverEntry) error {
-	if r.writes != nil {
-		r.writes.Add(1)
-	}
-	if r.fail.Load() {
-		return reconciletest.ErrInjected
-	}
-	return r.Resolver.Write(ctx, e)
 }

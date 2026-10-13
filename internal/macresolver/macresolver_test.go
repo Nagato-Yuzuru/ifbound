@@ -21,10 +21,6 @@ import (
 
 var listen = netip.MustParseAddrPort("127.0.0.1:10053")
 
-type fakeClock struct{ t time.Time }
-
-func (c *fakeClock) Now() time.Time { return c.t }
-
 type fakeConfig struct {
 	entries []ConfigEntry
 	err     error
@@ -37,21 +33,19 @@ func (f *fakeConfig) Resolvers(context.Context) ([]ConfigEntry, error) {
 }
 
 type fixture struct {
-	r     *Resolver
-	clock *fakeClock
-	conf  *fakeConfig
-	dir   string
+	r    *Resolver
+	conf *fakeConfig
+	dir  string
 }
 
 // newFixture returns a Resolver on a directory that does not exist yet.
 func newFixture(t *testing.T) fixture {
 	t.Helper()
 	f := fixture{
-		clock: &fakeClock{t: time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)},
-		conf:  &fakeConfig{},
-		dir:   filepath.Join(t.TempDir(), "resolver"),
+		conf: &fakeConfig{},
+		dir:  filepath.Join(t.TempDir(), "resolver"),
 	}
-	f.r = New(f.dir, f.clock.Now, f.conf)
+	f.r = New(f.dir, f.conf)
 	return f
 }
 
@@ -124,8 +118,8 @@ func TestWriteRendersTypedEntry(t *testing.T) {
 				t.Errorf("file mode = %v, want 0644", fi.Mode().Perm())
 			}
 			st := f.read(t)
-			want := []reconcile.ManagedEntry{{Domain: domain(t, "example.test"), Server: tt.server}}
-			if !reflect.DeepEqual(noVersion(st.Entries), want) {
+			want := []reconcile.ResolverEntry{{Domain: domain(t, "example.test"), Server: tt.server}}
+			if !reflect.DeepEqual(st.Entries, want) {
 				t.Errorf("Read entries = %+v, want %+v", st.Entries, want)
 			}
 		})
@@ -175,8 +169,8 @@ func TestReadReportsOnlyMarkedFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	st := f.read(t)
-	want := []reconcile.ManagedEntry{{Domain: domain(t, "example.test"), Server: listen}}
-	if !reflect.DeepEqual(noVersion(st.Entries), want) {
+	want := []reconcile.ResolverEntry{{Domain: domain(t, "example.test"), Server: listen}}
+	if !reflect.DeepEqual(st.Entries, want) {
 		t.Errorf("Read entries = %+v, want %+v", st.Entries, want)
 	}
 }
@@ -189,8 +183,8 @@ func TestReadWithoutDirectory(t *testing.T) {
 	}
 }
 
-// A marked file with changed content is an ifbound file that is not
-// active, also after Settle: its server is not the one that Write gave.
+// A marked file with changed content is an ifbound file with a zero
+// server: its server is not the one that Write gave.
 func TestReadReportsChangedFileWithoutServer(t *testing.T) {
 	tests := map[string]string{
 		"extra line":  Marker + "\nnameserver 127.0.0.1\nport 10053\nnameserver 192.0.2.1\n",
@@ -201,14 +195,10 @@ func TestReadReportsChangedFileWithoutServer(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t)
 			f.put(t, "example.test", content)
-			settled := f.clock.t.Add(-time.Hour)
-			if err := os.Chtimes(filepath.Join(f.dir, "example.test"), settled, settled); err != nil {
-				t.Fatal(err)
-			}
 			st := f.read(t)
-			want := []reconcile.ManagedEntry{{Domain: domain(t, "example.test")}}
-			if !reflect.DeepEqual(noVersion(st.Entries), want) {
-				t.Fatalf("Read entries = %+v, want %+v (zero server, not active)", st.Entries, want)
+			want := []reconcile.ResolverEntry{{Domain: domain(t, "example.test")}}
+			if !reflect.DeepEqual(st.Entries, want) {
+				t.Fatalf("Read entries = %+v, want %+v (zero server)", st.Entries, want)
 			}
 			// The marker makes the file an ifbound file, so Write repairs it.
 			f.write(t, "example.test", listen)
@@ -334,8 +324,8 @@ func TestRemoveTwice(t *testing.T) {
 			t.Fatalf("Remove %d = %v, want nil", i+1, err)
 		}
 	}
-	want := []reconcile.ManagedEntry{{Domain: domain(t, "www.example.test"), Server: listen}}
-	if st := f.read(t); !reflect.DeepEqual(noVersion(st.Entries), want) {
+	want := []reconcile.ResolverEntry{{Domain: domain(t, "www.example.test"), Server: listen}}
+	if st := f.read(t); !reflect.DeepEqual(st.Entries, want) {
 		t.Errorf("Read entries = %+v, want %+v", st.Entries, want)
 	}
 }
@@ -347,81 +337,39 @@ func TestRemoveWithoutDirectory(t *testing.T) {
 	}
 }
 
-func TestActiveAfterSettle(t *testing.T) {
-	f := newFixture(t)
-	t0 := f.clock.t
-	f.write(t, "example.test", listen)
-	f.conf.entries = scutilConf(t, defaultBlock, ifboundFile)
-	tests := []struct {
-		at   time.Duration
-		want bool
-	}{
-		{0, false},
-		{Settle - time.Nanosecond, false},
-		{Settle, true},
-		{time.Hour, true},
-	}
-	for _, tt := range tests {
-		f.clock.t = t0.Add(tt.at)
-		st := f.read(t)
-		if len(st.Entries) != 1 || st.Entries[0].Active != tt.want {
-			t.Errorf("at write + %v: entries = %+v, want Active %v", tt.at, st.Entries, tt.want)
-		}
-	}
-}
-
-// A new Resolver on the same directory stands for a restarted daemon. It
-// must not report an entry that is still settling as active.
-func TestActiveAfterRestartFollowsFileTime(t *testing.T) {
-	f := newFixture(t)
-	t0 := f.clock.t
-	f.write(t, "example.test", listen)
-
-	clock := &fakeClock{t: t0.Add(Settle / 2)}
-	restarted := New(f.dir, clock.Now, &fakeConfig{entries: scutilConf(t, ifboundFile)})
-	st, err := restarted.Read(t.Context())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(st.Entries) != 1 || st.Entries[0].Active {
-		t.Errorf("after restart, before Settle: entries = %+v, want one entry, not active", st.Entries)
-	}
-	clock.t = t0.Add(Settle)
-	if st, err = restarted.Read(t.Context()); err != nil || len(st.Entries) != 1 || !st.Entries[0].Active {
-		t.Errorf("after restart, at Settle: entries = %+v, %v; want one active entry", st.Entries, err)
-	}
-}
-
+// An identical Write does not touch the file: each change can make macOS
+// flush its DNS cache.
 func TestWriteSameEntryTwiceChangesNothing(t *testing.T) {
 	f := newFixture(t)
-	t0 := f.clock.t
 	f.write(t, "example.test", listen)
-	f.conf.entries = scutilConf(t, ifboundFile)
-	f.clock.t = t0.Add(Settle)
-	f.write(t, "example.test", listen)
-	st := f.read(t)
-	if len(st.Entries) != 1 || !st.Entries[0].Active {
-		t.Errorf("entries after an identical write = %+v, want one active entry", st.Entries)
+	path := filepath.Join(f.dir, "example.test")
+	old := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
 	}
-	fi, err := os.Stat(filepath.Join(f.dir, "example.test"))
+	before, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fi.ModTime().Equal(t0) {
-		t.Errorf("modification time = %v, want %v (unchanged)", fi.ModTime(), t0)
+	f.write(t, "example.test", listen)
+	after, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.ModTime().Equal(old) || !os.SameFile(before, after) {
+		t.Errorf("an identical write changed the file: modification time %v, want %v", after.ModTime(), old)
 	}
 }
 
-func TestWriteNewServerRestartsSettle(t *testing.T) {
+func TestWriteNewServerReplacesEntry(t *testing.T) {
 	f := newFixture(t)
 	f.write(t, "example.test", listen)
-	f.clock.t = f.clock.t.Add(Settle)
 	other := netip.MustParseAddrPort("127.0.0.1:10054")
 	f.write(t, "example.test", other)
 	st := f.read(t)
-	want := []reconcile.ManagedEntry{{Domain: domain(t, "example.test"), Server: other}}
-	if !reflect.DeepEqual(noVersion(st.Entries), want) {
-		t.Errorf("Read entries = %+v, want %+v (new server, not active)", st.Entries, want)
+	want := []reconcile.ResolverEntry{{Domain: domain(t, "example.test"), Server: other}}
+	if !reflect.DeepEqual(st.Entries, want) {
+		t.Errorf("Read entries = %+v, want %+v (new server)", st.Entries, want)
 	}
 }
 
@@ -474,8 +422,7 @@ func TestRemoveErrorWhenDirectoryNotWritable(t *testing.T) {
 }
 
 func TestWriteErrorWhenParentMissing(t *testing.T) {
-	clock := &fakeClock{}
-	r := New(filepath.Join(t.TempDir(), "missing", "resolver"), clock.Now, &fakeConfig{})
+	r := New(filepath.Join(t.TempDir(), "missing", "resolver"), &fakeConfig{})
 	err := r.Write(t.Context(), reconcile.ResolverEntry{Domain: domain(t, "example.test"), Server: listen})
 	if !errors.Is(err, ErrCannotWrite) {
 		t.Errorf("Write = %v, want an error that wraps ErrCannotWrite", err)
@@ -541,7 +488,6 @@ func TestReadReportsResolversAtOrBelowEntries(t *testing.T) {
 	f := newFixture(t)
 	f.write(t, "example.test", listen)
 	f.write(t, "cdn.example.net", listen)
-	f.clock.t = f.clock.t.Add(Settle)
 	f.conf.entries = scutilConf(t,
 		defaultBlock,
 		ifboundFile,
@@ -567,57 +513,46 @@ func TestReadReportsResolversAtOrBelowEntries(t *testing.T) {
 			t.Errorf("problem %d = %+v, want text with %q that does not void enforcement", i, st.Problems[i], sub)
 		}
 	}
-	for _, e := range st.Entries {
-		if !e.Active {
-			t.Errorf("entry %s is not active; a more specific resolver must not change Active", e.Domain)
-		}
-	}
 }
 
-// Another resolver for the same domain as an entry is a problem. It makes
-// the entry not active when it can win: its order is not higher than the
-// order of the ifbound file, or the configuration does not list the file.
-// Equal orders are common: every file has order 0, and the first one
-// listed wins. An entry is also not active when the configuration does not
-// list its file with its server.
+// Another resolver for the same domain as an entry is a problem: macOS can
+// send the queries for the domain to it, whatever its order.
 func TestReadReportsSameDomainResolver(t *testing.T) {
 	const foreignFile = "  domain   : example.test\n  nameserver[0] : 127.0.0.1\n  port     : 10054\n"
 	tests := []struct {
 		name    string
 		blocks  []string
-		active  bool
 		problem bool
 	}{
-		{"only the ifbound file", []string{defaultBlock, ifboundFile}, true, false},
-		{"foreign file listed first", []string{foreignFile, ifboundFile}, false, true},
-		{"foreign file listed after", []string{ifboundFile, foreignFile}, false, true},
-		{"ifbound file not listed", []string{defaultBlock, foreignFile}, false, true},
-		{"ifbound file not listed, no other resolver", []string{defaultBlock}, false, false},
-		{"same address, other port", []string{ifboundFile, "  domain   : example.test\n  nameserver[0] : 127.0.0.1\n"}, false, true},
+		{"only the ifbound file", []string{defaultBlock, ifboundFile}, false},
+		{"foreign file listed first", []string{foreignFile, ifboundFile}, true},
+		{"foreign file listed after", []string{ifboundFile, foreignFile}, true},
+		{"ifbound file not listed", []string{defaultBlock, foreignFile}, true},
+		{"ifbound file not listed, no other resolver", []string{defaultBlock}, false},
+		{"same address, other port", []string{ifboundFile, "  domain   : example.test\n  nameserver[0] : 127.0.0.1\n"}, true},
 		{"ifbound server and one more", []string{
 			ifboundFile,
 			"  domain   : example.test\n  nameserver[0] : 127.0.0.1\n  nameserver[1] : 192.0.2.1\n  port     : 10053\n",
-		}, false, true},
-		{"unreadable server", []string{ifboundFile, "  domain   : example.test\n  nameserver[0] : fe80::1%\n  port     : 10053\n"}, false, true},
-		{"case and final dot", []string{ifboundFile, "  domain   : Example.Test.\n  nameserver[0] : 192.0.2.1\n"}, false, true},
+		}, true},
+		{"unreadable server", []string{ifboundFile, "  domain   : example.test\n  nameserver[0] : fe80::1%\n  port     : 10053\n"}, true},
+		{"case and final dot", []string{ifboundFile, "  domain   : Example.Test.\n  nameserver[0] : 192.0.2.1\n"}, true},
 		{"supplemental with a higher order", []string{
 			ifboundFile,
 			"  domain   : example.test\n  nameserver[0] : 10.0.0.53\n  flags    : Supplemental, Request A records\n  order    : 102200\n",
-		}, true, true},
+		}, true},
 		{"supplemental with the same order", []string{
 			ifboundFile,
 			"  domain   : example.test\n  nameserver[0] : 127.0.0.1\n  port     : 10053\n  flags    : Supplemental, Request A records\n",
-		}, false, true},
+		}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newFixture(t)
 			f.write(t, "example.test", listen)
-			f.clock.t = f.clock.t.Add(Settle)
 			f.conf.entries = scutilConf(t, tt.blocks...)
 			st := f.read(t)
-			if len(st.Entries) != 1 || st.Entries[0].Active != tt.active {
-				t.Errorf("entries = %+v, want example.test with Active %v", st.Entries, tt.active)
+			if len(st.Entries) != 1 {
+				t.Errorf("entries = %+v, want example.test", st.Entries)
 			}
 			wantShadowed := []string{}
 			if tt.problem {
@@ -633,23 +568,17 @@ func TestReadReportsSameDomainResolver(t *testing.T) {
 	}
 }
 
-// The file of an alias entry below an apex entry is an ifbound file, not a
-// resolver that shadows the apex entry.
+// The file of an entry below another entry is an ifbound file, not a
+// resolver that shadows the other entry.
 func TestReadOwnEntryBelowEntryIsNotForeign(t *testing.T) {
 	f := newFixture(t)
 	f.write(t, "example.test", listen)
 	f.write(t, "cdn.www.example.test", listen)
-	f.clock.t = f.clock.t.Add(Settle)
 	f.conf.entries = scutilConf(t, ifboundFile,
 		"  domain   : cdn.www.example.test\n  nameserver[0] : 127.0.0.1\n  port     : 10053\n")
 	st := f.read(t)
 	if len(st.Problems) != 0 || len(st.Shadowed) != 0 {
 		t.Errorf("problems = %+v, Shadowed = %v; want none", st.Problems, st.Shadowed)
-	}
-	for _, e := range st.Entries {
-		if !e.Active {
-			t.Errorf("entry %s is not active", e.Domain)
-		}
 	}
 }
 
@@ -663,17 +592,16 @@ func TestReadWithoutEntriesSkipsConfiguration(t *testing.T) {
 	}
 }
 
-// Without the configuration, Read cannot see that the system lists the
-// entry, so the entry is not active.
+// Without the configuration, Read still returns the entries and reports
+// the cause as a problem.
 func TestReadReportsConfigurationErrorAsProblem(t *testing.T) {
 	f := newFixture(t)
 	f.write(t, "example.test", listen)
-	f.clock.t = f.clock.t.Add(Settle)
 	f.conf.err = errConfig
 	st := f.read(t)
-	want := []reconcile.ManagedEntry{{Domain: domain(t, "example.test"), Server: listen}}
-	if !reflect.DeepEqual(noVersion(st.Entries), want) {
-		t.Errorf("entries = %+v, want %+v (not active)", st.Entries, want)
+	want := []reconcile.ResolverEntry{{Domain: domain(t, "example.test"), Server: listen}}
+	if !reflect.DeepEqual(st.Entries, want) {
+		t.Errorf("entries = %+v, want %+v ", st.Entries, want)
 	}
 	if len(st.Problems) != 1 || st.Problems[0].Voids || !strings.Contains(st.Problems[0].Text, errConfig.Error()) {
 		t.Errorf("problems = %+v, want one problem that does not void enforcement and names the cause", st.Problems)

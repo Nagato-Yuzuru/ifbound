@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,7 +13,15 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
-// probeWait is one probe of one alias: the probe names that it sent, and
+// ProbeInterval is the time between two probe names of one probe.
+const ProbeInterval = 50 * time.Millisecond
+
+// errProbe means that ifbound-dns reported no probe name below the domain
+// in the time budget of the probe: the queries for the domain do not go
+// to ifbound-dns, or not yet.
+var errProbe = errors.New("daemon: probe not seen by ifbound-dns")
+
+// probeWait is one probe of one domain: the probe names that it sent, and
 // a channel that closes when ifbound-dns reports one of them.
 type probeWait struct {
 	seen   chan struct{}
@@ -20,35 +29,22 @@ type probeWait struct {
 	names  []string
 }
 
-// prove probes the entry of each alias in turn, on the goroutine of the
-// caller. The probes share the budget of ctx less AckReserve. The entries
-// were written together, so the system applies them together, and the
-// probes after the first one usually succeed at once.
-func (d *Daemon) prove(ctx context.Context, aliases []alias) error {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(ipc.DefaultTimeout)
-	}
-	ctx, cancel := context.WithDeadline(ctx, deadline.Add(-AckReserve))
-	defer cancel()
-	for _, a := range aliases {
-		if err := d.probe(ctx, a.domain); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // probe resolves a new probe name below domain every ProbeInterval until
 // ifbound-dns reports one of the names, or ctx ends. A report of an
-// earlier name of the same probe also counts: it can arrive late.
+// earlier name of the same probe also counts: it can arrive late. It runs
+// on the goroutine of the caller. The caller sets the budget: a ctx
+// without a deadline is an error at once, so that no probe runs without
+// a bound.
 func (d *Daemon) probe(ctx context.Context, domain policy.Domain) error {
+	if _, ok := ctx.Deadline(); !ok {
+		return fmt.Errorf("%w: %s: ctx has no deadline", errProbe, domain)
+	}
 	w := &probeWait{seen: make(chan struct{})}
 	defer d.dropProbe(w)
 	for {
 		name, err := probeName(domain)
 		if err != nil {
-			return fmt.Errorf("%w: %s: %v", ErrAliasProbe, domain, err)
+			return fmt.Errorf("%w: %s: %v", errProbe, domain, err)
 		}
 		d.addProbe(w, name)
 		// Only the report of ifbound-dns counts, so the answer and the
@@ -63,7 +59,7 @@ func (d *Daemon) probe(ctx context.Context, domain policy.Domain) error {
 		case <-w.seen:
 			return nil
 		case <-ctx.Done():
-			return fmt.Errorf("%w: %s: %v", ErrAliasProbe, domain, ctx.Err())
+			return fmt.Errorf("%w: %s: %v", errProbe, domain, ctx.Err())
 		case <-time.After(ProbeInterval):
 		}
 	}

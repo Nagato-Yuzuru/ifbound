@@ -11,8 +11,8 @@ import (
 )
 
 // probeBoard is a Handler and a ProbeHandler. Each report waits until
-// the probe "ifbound-probe-x.<qname>" is seen, as ifboundd waits for the
-// probe of an alias before it acks.
+// the probe "ifbound-probe-x.<qname>" is seen, so each report holds its
+// slot while its probe needs a slot.
 type probeBoard struct {
 	mu   sync.Mutex
 	seen map[string]chan struct{}

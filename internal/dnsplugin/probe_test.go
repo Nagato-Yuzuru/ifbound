@@ -95,8 +95,8 @@ func TestProbeReportWaitsAtMostTheTimeout(t *testing.T) {
 }
 
 // probeGate is ifboundd for the deadlock test: each report waits until
-// the probe of its qname arrives, as the ack of a new alias waits for the
-// probe of the alias entry.
+// the probe of its qname arrives, so each report holds its slot while its
+// probe needs a slot.
 type probeGate struct {
 	mu   sync.Mutex
 	seen map[string]chan struct{}

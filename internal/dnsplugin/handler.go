@@ -38,7 +38,7 @@ type prober interface {
 }
 
 // handler holds back the reply of the next plugin until ifboundd has the
-// addresses and alias names in it.
+// addresses in it.
 type handler struct {
 	next     plugin.Handler
 	reporter reporter
@@ -51,22 +51,21 @@ func (h *handler) Name() string { return name }
 
 // ServeDNS implements plugin.Handler. The rule is: every A, AAAA, and SVCB or
 // HTTPS hint address that the client gets, in any section, is reported first
-// under the qname, together with every alias name in the reply (see
-// observation). Otherwise the client gets SERVFAIL. A reply without an
-// address and without an alias goes out without a report.
+// under the qname (see observation). Otherwise the client gets SERVFAIL. A
+// reply without an address goes out without a report.
 //
 // The handler answers the resolver.arpa zone of the DDR probe and the
 // Firefox canary domain itself (see localRcode). Those queries do not go to the next plugin.
 //
 // A probe name of ifboundd (see ipc.IsProbe) also stays here: the handler
 // sends it to ifboundd and then answers NXDOMAIN. The probe proves to
-// ifboundd that the system resolver sends the queries for the alias to
+// ifboundd that the system resolver sends the queries for its domain to
 // ifbound-dns, so it must not go upstream, and the report comes before
 // the reply: ifboundd has it when the system resolver returns.
 //
 // The handler inspects the reply as the client will decode it: it packs the
 // reply when the next plugin writes it, unpacks those bytes, reports the
-// addresses and aliases in the result, and sends that result. Thus a Go
+// addresses in the result, and sends that result. Thus a Go
 // value that packs to a different record type cannot carry an address past
 // the report, and a change to the message after the write has no effect.
 //
@@ -82,8 +81,8 @@ func (h *handler) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 	}
 	if rcode, ok := localRcode(qname); ok {
 		// No plugin below sees the query, so no upstream answer can tell
-		// the client to go around ifbound-dns. The reply has no address
-		// and no alias, so it needs no report.
+		// the client to go around ifbound-dns. The reply has no address,
+		// so it needs no report.
 		if err := w.WriteMsg(localReply(r, rcode)); err != nil {
 			return dns.RcodeServerFailure, plugin.Error(name, err)
 		}

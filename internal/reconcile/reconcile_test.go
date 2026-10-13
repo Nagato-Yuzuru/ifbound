@@ -119,14 +119,6 @@ func (f *fixture) observe(t *testing.T, name policy.Name, addrs ...string) {
 	}
 }
 
-// learn records aliases of a policy, as a DNS report does.
-func (f *fixture) learn(t *testing.T, name policy.Name, aliases ...string) {
-	t.Helper()
-	if _, err := f.book.ObserveAliases(name, aliases, time.Minute); err != nil {
-		t.Fatalf("ObserveAliases: %v", err)
-	}
-}
-
 func (f *fixture) reconfigure(t *testing.T, cfgText string) {
 	t.Helper()
 	f.cfg = parse(t, cfgText)

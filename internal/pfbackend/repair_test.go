@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Nagato-Yuzuru/ifbound/internal/dnsname"
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfbackend"
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfrules"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
@@ -21,8 +20,7 @@ import (
 
 type emptyBook struct{}
 
-func (emptyBook) Addrs(policy.Name) []netip.Addr     { return nil }
-func (emptyBook) Aliases(policy.Name) []dnsname.Name { return nil }
+func (emptyBook) Addrs(policy.Name) []netip.Addr { return nil }
 
 // converge runs one convergence of the real Reconciler with this Backend.
 func converge(t *testing.T, r *rig) reconcile.Report {

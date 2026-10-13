@@ -16,7 +16,6 @@ import (
 	"maps"
 	"net/netip"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 
@@ -36,13 +35,7 @@ type World struct {
 	tables   map[policy.Name]map[netip.Prefix]struct{}
 	resolver map[policy.Domain]netip.AddrPort
 	// applied are the resolver entries that the fake system uses now.
-	applied map[policy.Domain]netip.AddrPort
-	// pending holds the entries that a Write changed since the system
-	// applied the entries last.
-	pending map[policy.Domain]struct{}
-	// versions counts the Writes of each domain; Read reports it as the
-	// Version of the entry.
-	versions map[policy.Domain]uint64
+	applied  map[policy.Domain]netip.AddrPort
 	delay    bool
 	bproblem []reconcile.Problem
 	rproblem []reconcile.Problem
@@ -58,8 +51,6 @@ func NewWorld() *World {
 		tables:   make(map[policy.Name]map[netip.Prefix]struct{}),
 		resolver: make(map[policy.Domain]netip.AddrPort),
 		applied:  make(map[policy.Domain]netip.AddrPort),
-		pending:  make(map[policy.Domain]struct{}),
-		versions: make(map[policy.Domain]uint64),
 	}
 }
 
@@ -99,7 +90,7 @@ func (w *World) SetProblems(backend, resolver []reconcile.Problem) {
 // When on is false (the default), the system applies each Write and
 // Remove at once. When on is true, it applies them only at
 // SettleResolver, all together, as a platform that applies changes after
-// a delay does. An entry that a Write changed is not active until then.
+// a delay does.
 func (w *World) SetResolverDelay(on bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -116,7 +107,6 @@ func (w *World) SettleResolver() {
 
 func (w *World) settleLocked() {
 	w.applied = maps.Clone(w.resolver)
-	clear(w.pending)
 }
 
 // AppliedResolverEntries returns the resolver entries that the fake
@@ -231,7 +221,6 @@ func (w *World) RemoveResolverEntry(d policy.Domain) {
 
 func (w *World) removeLocked(d policy.Domain) {
 	delete(w.resolver, d)
-	delete(w.pending, d)
 	if !w.delay {
 		delete(w.applied, d)
 	}
@@ -330,28 +319,18 @@ var _ reconcile.SysResolver = (*Resolver)(nil)
 func (r *Resolver) Read(context.Context) (reconcile.ResolverState, error) {
 	r.w.mu.Lock()
 	defer r.w.mu.Unlock()
-	entries := r.w.resolverLocked()
-	out := make([]reconcile.ManagedEntry, len(entries))
-	for i, e := range entries {
-		_, pending := r.w.pending[e.Domain]
-		out[i] = reconcile.ManagedEntry{ResolverEntry: e, Active: !pending, Version: strconv.FormatUint(r.w.versions[e.Domain], 10)}
-	}
 	return reconcile.ResolverState{
-		Entries:  out,
+		Entries:  r.w.resolverLocked(),
 		Problems: slices.Clone(r.w.rproblem),
 	}, nil
 }
 
-// Write implements reconcile.SysResolver. With a delay, each Write makes
-// the entry not active until SettleResolver, also when its content does
-// not change.
+// Write implements reconcile.SysResolver. With a delay, the fake system
+// uses the entry only after SettleResolver.
 func (r *Resolver) Write(_ context.Context, e reconcile.ResolverEntry) error {
 	return r.w.write(func() {
 		r.w.resolver[e.Domain] = e.Server
-		r.w.versions[e.Domain]++
-		if r.w.delay {
-			r.w.pending[e.Domain] = struct{}{}
-		} else {
+		if !r.w.delay {
 			r.w.applied[e.Domain] = e.Server
 		}
 	})

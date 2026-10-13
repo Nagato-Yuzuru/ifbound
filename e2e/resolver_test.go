@@ -5,6 +5,7 @@ package e2e
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -36,38 +37,26 @@ func requireResolverE2E(t *testing.T) {
 	testenv.RequireCommand(t, "scutil")
 }
 
-// TestResolverEntryRoutesAfterActive checks the meaning of Active: when
-// Read reports an entry as active, the first lookup of a new name below
-// its domain goes to the server of the entry.
-func TestResolverEntryRoutesAfterActive(t *testing.T) {
+// TestResolverEntryRoutesLookups checks that an entry that Write adds
+// routes the lookups of new names below its domain to its server within
+// a few seconds. The slowest measured application of a new file took
+// 1.55 s.
+func TestResolverEntryRoutesLookups(t *testing.T) {
 	requireResolverE2E(t)
 	// 198.18.0.0/15 is reserved for benchmark tests (RFC 2544): no real
 	// resolver gives this answer.
 	answer := netip.MustParseAddr("198.18.0.53")
 	srv := startDNS(t, answer)
-	r := macresolver.New(macresolver.Dir, time.Now, macresolver.Scutil{})
+	r := macresolver.New(macresolver.Dir, macresolver.Scutil{})
 	apex := writeEntry(t, r, srv.addr)
 
-	waitFor(t, macresolver.Settle+3*time.Second, func() (bool, string) {
-		st, err := r.Read(t.Context())
-		if err != nil {
-			t.Fatalf("Read: %v", err)
-		}
-		i := slices.IndexFunc(st.Entries, func(e reconcile.ManagedEntry) bool { return e.Domain == apex })
-		return i >= 0 && st.Entries[i].Active, "entries " + entriesText(st)
+	waitFor(t, 5*time.Second, func() (bool, string) {
+		// A new name each time, so no cached negative answer can count.
+		name := "ifbound-probe-" + nonce(t) + "." + apex.String()
+		addrs, err := syslookup.Resolver{}.Resolve(t.Context(), name)
+		return err == nil && slices.Equal(addrs, []netip.Addr{answer}) && srv.saw(name),
+			fmt.Sprintf("resolve %s = %v, %v", name, addrs, err)
 	})
-
-	name := "ifbound-probe-" + nonce(t) + "." + apex.String()
-	addrs, err := syslookup.Resolver{}.Resolve(t.Context(), name)
-	if err != nil {
-		t.Fatalf("resolve %s after Active: %v", name, err)
-	}
-	if !slices.Equal(addrs, []netip.Addr{answer}) {
-		t.Errorf("resolve %s after Active = %v, want %v from the test server", name, addrs, answer)
-	}
-	if !srv.saw(name) {
-		t.Errorf("the test server did not receive %s", name)
-	}
 }
 
 // TestResolverReportsMoreSpecificFile checks that Read reports a file
@@ -75,7 +64,7 @@ func TestResolverEntryRoutesAfterActive(t *testing.T) {
 // specific file takes those names from the ifbound entry.
 func TestResolverReportsMoreSpecificFile(t *testing.T) {
 	requireResolverE2E(t)
-	r := macresolver.New(macresolver.Dir, time.Now, macresolver.Scutil{})
+	r := macresolver.New(macresolver.Dir, macresolver.Scutil{})
 	apex := writeEntry(t, r, netip.MustParseAddrPort("127.0.0.1:10053"))
 
 	sub := "www." + apex.String()
@@ -137,19 +126,6 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() (bool, string)) {
 		}
 		time.Sleep(100 * time.Millisecond) // polls system state; no event exists to wait on
 	}
-}
-
-func entriesText(st reconcile.ResolverState) string {
-	var b strings.Builder
-	for _, e := range st.Entries {
-		b.WriteString(e.Domain.String())
-		if e.Active {
-			b.WriteString("(active) ")
-		} else {
-			b.WriteString("(settling) ")
-		}
-	}
-	return b.String()
 }
 
 func nonce(t *testing.T) string {
