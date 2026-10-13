@@ -21,7 +21,7 @@ func TestParse(t *testing.T) {
 		wantMsg string
 	}{
 		{name: "default timeout", input: "ifbound /run/ifbound.sock",
-			want: directive{socket: "/run/ifbound.sock", timeout: 2 * time.Second}},
+			want: directive{socket: "/run/ifbound.sock", timeout: 5 * time.Second}},
 		{name: "timeout", input: "ifbound /run/ifbound.sock 500ms",
 			want: directive{socket: "/run/ifbound.sock", timeout: 500 * time.Millisecond}},
 		{name: "largest timeout", input: "ifbound /run/ifbound.sock 30s",

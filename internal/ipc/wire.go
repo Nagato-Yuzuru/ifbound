@@ -48,6 +48,7 @@ const (
 	protocolVersion = 2
 
 	typeObserve = "observe"
+	typeProbe   = "probe"
 	typeAck     = "ack"
 	typeReject  = "reject"
 )
@@ -78,6 +79,12 @@ type observeBody struct {
 type aliasBody struct {
 	Name       string `json:"name"`
 	TTLSeconds uint32 `json:"ttl_s"`
+}
+
+// probeBody carries a probe name that reached ifbound-dns. See
+// ProbePrefix.
+type probeBody struct {
+	QName string `json:"qname"`
 }
 
 type rejectBody struct {

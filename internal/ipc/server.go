@@ -19,7 +19,10 @@ import (
 const (
 	socketMode = 0o660
 	// maxConns bounds the connections served at once. The server takes a
-	// slot before Accept, so excess clients wait in the kernel backlog.
+	// slot before Accept, so excess clients wait in the kernel backlog. It
+	// is larger than maxInFlight + maxProbesInFlight: while the reports of
+	// one Client fill their slots and wait, its probes still get a
+	// connection.
 	maxConns = 64
 	// connTimeout is the one deadline for a whole connection: read, handler,
 	// and write. It leaves room for the longest client wait.
@@ -43,6 +46,7 @@ var (
 	errInvalidAlias   = errors.New("invalid alias")
 	errTooManyAliases = errors.New("too many aliases")
 	errInvalidTimeout = errors.New("invalid timeout_ms")
+	errNoProbes       = errors.New("probes are not served")
 )
 
 // Handler decides what to do with an observation. The server parses and
@@ -55,12 +59,23 @@ type Handler interface {
 	Observe(ctx context.Context, o Observation) error
 }
 
+// ProbeHandler receives the probe names that ifbound-dns saw (see
+// ProbePrefix). The server calls ProbeSeen on the connection goroutine and
+// acks after it returns. ProbeSeen must not wait for a report: a report
+// that waits for this probe can hold the other slots.
+type ProbeHandler interface {
+	ProbeSeen(qname string)
+}
+
 // ServerConfig configures Listen.
 type ServerConfig struct {
 	// Path is the socket path. The caller sets the owner and group.
 	Path string
 	// Handler receives each valid observation. It must not be nil.
 	Handler Handler
+	// Probes receives each valid probe name. When it is nil, the server
+	// rejects probes.
+	Probes ProbeHandler
 	// AllowedUIDs lists the peer uids the server serves. The server closes
 	// every other connection without a reply.
 	AllowedUIDs []uint32
@@ -74,6 +89,7 @@ type ServerConfig struct {
 type Server struct {
 	ln      net.Listener
 	handler Handler
+	probes  ProbeHandler
 	allowed map[uint32]struct{}
 	log     *slog.Logger
 	slots   chan struct{}
@@ -188,6 +204,7 @@ func newServer(ln net.Listener, cfg ServerConfig) *Server {
 	return &Server{
 		ln:      ln,
 		handler: cfg.Handler,
+		probes:  cfg.Probes,
 		allowed: allowed,
 		log:     logger,
 		slots:   make(chan struct{}, maxConns),
@@ -357,6 +374,8 @@ func (s *Server) dispatch(ctx context.Context, req envelope) envelope {
 	switch req.Type {
 	case typeObserve:
 		return s.observe(ctx, req)
+	case typeProbe:
+		return s.probe(req)
 	default:
 		return rejectEnvelope(fmt.Sprintf("unknown message type %q", req.Type))
 	}
@@ -372,6 +391,21 @@ func (s *Server) observe(ctx context.Context, req envelope) envelope {
 	if err := s.handler.Observe(ctx, obs); err != nil {
 		return rejectEnvelope(err.Error())
 	}
+	return envelopeOf(typeAck, nil)
+}
+
+func (s *Server) probe(req envelope) envelope {
+	if s.probes == nil {
+		return rejectEnvelope(errNoProbes.Error())
+	}
+	var b probeBody
+	if err := json.Unmarshal(req.Body, &b); err != nil {
+		return rejectEnvelope(fmt.Sprintf("malformed probe body: %v", err))
+	}
+	if b.QName == "" || len(b.QName) > MaxQNameLen {
+		return rejectEnvelope(fmt.Errorf("%w: length %d", errInvalidQName, len(b.QName)).Error())
+	}
+	s.probes.ProbeSeen(b.QName)
 	return envelopeOf(typeAck, nil)
 }
 

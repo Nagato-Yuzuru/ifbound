@@ -31,10 +31,11 @@ const (
 	// follow. withDirective checks that no directive above it can answer.
 	directiveAnchor = "local"
 
-	// defaultTimeout is the default wait for the ack. The socket is local,
-	// so an ack takes milliseconds. The wait stays well below the usual
-	// 5-second stub resolver timeout.
-	defaultTimeout = 2 * time.Second
+	// defaultTimeout is the default wait for the ack. It is the ack budget
+	// of ifboundd: an ack usually takes milliseconds, but the first report
+	// of a new alias waits until the system applies the resolver entry of
+	// the alias (up to about 1.5 s measured).
+	defaultTimeout = 5 * time.Second
 )
 
 var (
@@ -128,7 +129,7 @@ func (cs *clients) setup(c *caddy.Controller) error {
 	}
 	rep := cs.get(d.socket)
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
-		return &handler{next: next, reporter: rep, timeout: d.timeout}
+		return &handler{next: next, reporter: rep, probes: rep, timeout: d.timeout}
 	})
 	return nil
 }
