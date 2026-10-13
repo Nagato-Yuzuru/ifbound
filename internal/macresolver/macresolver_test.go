@@ -125,7 +125,7 @@ func TestWriteRendersTypedEntry(t *testing.T) {
 			}
 			st := f.read(t)
 			want := []reconcile.ManagedEntry{{Domain: domain(t, "example.test"), Server: tt.server}}
-			if !reflect.DeepEqual(st.Entries, want) {
+			if !reflect.DeepEqual(noVersion(st.Entries), want) {
 				t.Errorf("Read entries = %+v, want %+v", st.Entries, want)
 			}
 		})
@@ -176,7 +176,7 @@ func TestReadReportsOnlyMarkedFiles(t *testing.T) {
 	}
 	st := f.read(t)
 	want := []reconcile.ManagedEntry{{Domain: domain(t, "example.test"), Server: listen}}
-	if !reflect.DeepEqual(st.Entries, want) {
+	if !reflect.DeepEqual(noVersion(st.Entries), want) {
 		t.Errorf("Read entries = %+v, want %+v", st.Entries, want)
 	}
 }
@@ -207,7 +207,7 @@ func TestReadReportsChangedFileWithoutServer(t *testing.T) {
 			}
 			st := f.read(t)
 			want := []reconcile.ManagedEntry{{Domain: domain(t, "example.test")}}
-			if !reflect.DeepEqual(st.Entries, want) {
+			if !reflect.DeepEqual(noVersion(st.Entries), want) {
 				t.Fatalf("Read entries = %+v, want %+v (zero server, not active)", st.Entries, want)
 			}
 			// The marker makes the file an ifbound file, so Write repairs it.
@@ -335,7 +335,7 @@ func TestRemoveTwice(t *testing.T) {
 		}
 	}
 	want := []reconcile.ManagedEntry{{Domain: domain(t, "www.example.test"), Server: listen}}
-	if st := f.read(t); !reflect.DeepEqual(st.Entries, want) {
+	if st := f.read(t); !reflect.DeepEqual(noVersion(st.Entries), want) {
 		t.Errorf("Read entries = %+v, want %+v", st.Entries, want)
 	}
 }
@@ -420,7 +420,7 @@ func TestWriteNewServerRestartsSettle(t *testing.T) {
 	f.write(t, "example.test", other)
 	st := f.read(t)
 	want := []reconcile.ManagedEntry{{Domain: domain(t, "example.test"), Server: other}}
-	if !reflect.DeepEqual(st.Entries, want) {
+	if !reflect.DeepEqual(noVersion(st.Entries), want) {
 		t.Errorf("Read entries = %+v, want %+v (new server, not active)", st.Entries, want)
 	}
 }
@@ -672,7 +672,7 @@ func TestReadReportsConfigurationErrorAsProblem(t *testing.T) {
 	f.conf.err = errConfig
 	st := f.read(t)
 	want := []reconcile.ManagedEntry{{Domain: domain(t, "example.test"), Server: listen}}
-	if !reflect.DeepEqual(st.Entries, want) {
+	if !reflect.DeepEqual(noVersion(st.Entries), want) {
 		t.Errorf("entries = %+v, want %+v (not active)", st.Entries, want)
 	}
 	if len(st.Problems) != 1 || st.Problems[0].Voids || !strings.Contains(st.Problems[0].Text, errConfig.Error()) {

@@ -242,12 +242,28 @@ func (r *Resolver) managed() ([]reconcile.ManagedEntry, error) {
 		}
 		server := parseServer(d, data)
 		out = append(out, reconcile.ManagedEntry{
-			Domain: d,
-			Server: server,
-			Active: server.IsValid() && !now.Before(fi.ModTime().Add(Settle)),
+			Domain:  d,
+			Server:  server,
+			Active:  server.IsValid() && !now.Before(fi.ModTime().Add(Settle)),
+			Version: fileVersion(fi),
 		})
 	}
 	return out, nil
+}
+
+// fileVersion returns the identity of the file content: device, inode,
+// modification time in nanoseconds, and size. A rename of a new file over
+// the name gives a new inode, and a write in place gives a new
+// modification time. So two Writes in the same clock tick give different
+// versions: each Write renames or links a new temporary file. APFS does
+// not reuse an inode number, so a version does not come back. It is ""
+// when the file information has no inode.
+func fileVersion(fi fs.FileInfo) string {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%d:%d:%d:%d", st.Dev, st.Ino, fi.ModTime().UnixNano(), fi.Size())
 }
 
 // managedFile reads the file at path. It returns ok == false when no file

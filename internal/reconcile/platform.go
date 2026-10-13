@@ -162,6 +162,12 @@ type ManagedEntry struct {
 	// Server. An entry that is not active yet is present, but the system
 	// can still send its queries to another resolver.
 	Active bool
+	// Version changes at each write of the entry, by ifbound or by another
+	// process, also when the content stays the same, and it does not come
+	// back to an earlier value. It is "" when the platform cannot tell.
+	// For example, a platform can derive it from the inode and the
+	// modification time of the entry file.
+	Version string
 }
 
 // ResolverState is the set of resolver entries that ifbound manages now.
