@@ -53,7 +53,10 @@ only_via = ["en0"]
 
 // pvMDNS is the system resolver: it sends a probe name to the plugin when
 // an applied resolver entry with the address of ifbound-dns covers it. It
-// holds the probes until every report waits for its probe.
+// holds the probes of the aliases until every report waits for its probe.
+// The daemon also resolves its warm-up names, and probes below them first.
+// A warm-up name gets "no such name" at once, and its probe goes to the
+// plugin at once, so that neither holds a gate place.
 type pvMDNS struct {
 	world  *reconciletest.World
 	plugin *handler
@@ -63,12 +66,37 @@ type pvMDNS struct {
 	waiting map[string]bool
 	gate    chan struct{}
 	want    int
-	reached int // probes that reached the plugin
+	reached int // probes of aliases that reached the plugin
 }
 
 func (m *pvMDNS) Resolve(ctx context.Context, name string) ([]netip.Addr, error) {
 	n := strings.ToLower(strings.TrimSuffix(name, "."))
-	_, alias, _ := strings.Cut(n, ".")
+	if !ipc.IsProbe(n) {
+		return nil, fmt.Errorf("resolve %s: %w", n, syslookup.ErrNotFound)
+	}
+	_, parent, _ := strings.Cut(n, ".")
+	alias := strings.HasSuffix(parent, ".cdn.test") // see pvCNAME
+	if alias {
+		if err := m.hold(ctx, parent); err != nil {
+			return nil, fmt.Errorf("resolve %s: %w", n, err)
+		}
+	}
+	if !m.routed(n) {
+		return nil, fmt.Errorf("resolve %s: %w", n, syslookup.ErrNotFound)
+	}
+	if alias {
+		m.mu.Lock()
+		m.reached++
+		m.mu.Unlock()
+	}
+	rec := dnstest.NewRecorder(&test.ResponseWriter{})
+	_, _ = m.plugin.ServeDNS(ctx, rec, new(dns.Msg).SetQuestion(dns.Fqdn(n), dns.TypeA))
+	return nil, fmt.Errorf("resolve %s: %w", n, syslookup.ErrNotFound)
+}
+
+// hold marks alias as waiting, and waits until every alias waits or ctx
+// ends.
+func (m *pvMDNS) hold(ctx context.Context, alias string) error {
 	m.mu.Lock()
 	if !m.waiting[alias] {
 		m.waiting[alias] = true
@@ -79,18 +107,10 @@ func (m *pvMDNS) Resolve(ctx context.Context, name string) ([]netip.Addr, error)
 	m.mu.Unlock()
 	select {
 	case <-m.gate:
+		return nil
 	case <-ctx.Done():
-		return nil, fmt.Errorf("resolve %s: %w", n, ctx.Err())
+		return ctx.Err()
 	}
-	if !m.routed(n) {
-		return nil, fmt.Errorf("resolve %s: %w", n, syslookup.ErrNotFound)
-	}
-	m.mu.Lock()
-	m.reached++
-	m.mu.Unlock()
-	rec := dnstest.NewRecorder(&test.ResponseWriter{})
-	_, _ = m.plugin.ServeDNS(ctx, rec, new(dns.Msg).SetQuestion(dns.Fqdn(n), dns.TypeA))
-	return nil, fmt.Errorf("resolve %s: %w", n, syslookup.ErrNotFound)
 }
 
 func (m *pvMDNS) routed(name string) bool {
@@ -177,7 +197,6 @@ func pvStack(t *testing.T, want int) (*handler, *pvMDNS) {
 		},
 		Lookup: mdns,
 	})
-	go func() { _ = d.Run(ctx) }() // ends with ctx
 	path := pvSocket(t)
 	srv := pvListen(t, path, d)
 	served := make(chan error, 1)
@@ -189,6 +208,9 @@ func pvStack(t *testing.T, want int) (*handler, *pvMDNS) {
 	client := ipc.NewClient(path, pvUID())
 	h := &handler{next: pvCNAME(), reporter: client, probes: client, timeout: ipc.DefaultTimeout}
 	mdns.plugin = h
+	// The warm-up of the daemon sends probes to the plugin, so Run starts
+	// after the plugin is set.
+	go func() { _ = d.Run(ctx) }() // ends with ctx
 	for {
 		st, err := d.Status(ctx)
 		if err == nil && st.State == daemon.StateReady {
