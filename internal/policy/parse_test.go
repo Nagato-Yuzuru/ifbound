@@ -45,9 +45,7 @@ func mustDomain(t *testing.T, s string) Domain {
 	return d
 }
 
-// TestParseExample parses the RFC example without its third policy's
-// scope key. Scope is out of scope for this ticket: see
-// TestParseRejectsRFCScope. The third policy keeps its deny_via.
+// TestParseExample parses the RFC example verbatim.
 func TestParseExample(t *testing.T) {
 	const doc = `
 [dns]
@@ -71,6 +69,7 @@ only_via = []            # no allowed interface: always blocked
 name     = "build-bot"
 to       = ["*.example.com"]
 deny_via = ["@hardware"]
+scope    = { users = ["_buildbot"] }
 `
 	got, err := ParseBytes([]byte(doc))
 	if err != nil {
@@ -110,6 +109,7 @@ deny_via = ["@hardware"]
 				Name:       "build-bot",
 				To:         []Destination{DomainSuffix{domain: Domain{s: "example.com"}}},
 				Constraint: DenyVia{selectors: []InterfaceSelector{hw}},
+				Scope:      Scope{users: []Account{{s: "_buildbot"}}},
 			},
 		},
 	}
@@ -121,16 +121,51 @@ deny_via = ["@hardware"]
 	}
 }
 
-// TestParseRejectsRFCScope uses the RFC example verbatim, with scope.
-func TestParseRejectsRFCScope(t *testing.T) {
-	const doc = dnsTable + `
-[[policy]]
-name     = "build-bot"
-to       = ["*.example.com"]
-deny_via = ["@hardware"]
-scope    = { users = ["_buildbot"] }
-`
-	assertFieldErr(t, doc, "policy[0].scope", errUnknownKey)
+func TestParseScope(t *testing.T) {
+	long := strings.Repeat("u", 32)
+	tests := []struct {
+		name  string
+		extra string
+		want  Scope
+	}{
+		{"no scope", ``, Scope{}},
+		{"users only", `scope = { users = ["_buildbot", "Alice.B-2"] }`, Scope{users: []Account{{s: "_buildbot"}, {s: "Alice.B-2"}}}},
+		{"groups only", `scope = { groups = ["staff"] }`, Scope{groups: []Account{{s: "staff"}}}},
+		{"subtable, duplicates drop out", "[policy.scope]\nusers = [\"a\", \"a\"]\ngroups = [\"g\", \"h\", \"g\"]", Scope{users: []Account{{s: "a"}}, groups: []Account{{s: "g"}, {s: "h"}}}},
+		{"empty users, one group", `scope = { users = [], groups = ["g"] }`, Scope{groups: []Account{{s: "g"}}}},
+		{"32-byte name", `scope = { users = ["` + long + `"] }`, Scope{users: []Account{{s: long}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg, err := ParseBytes([]byte(policyDoc(`"a.com"`, "only_via = []\n"+tt.extra+"\n")))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := cfg.Policies[0].Scope
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("scope\nwant %#v\n got %#v", tt.want, got)
+			}
+			if got.Limited() != (tt.extra != "") {
+				t.Errorf("Limited() = %v", got.Limited())
+			}
+		})
+	}
+}
+
+func TestScopeAliasing(t *testing.T) {
+	in := []Account{{s: "a"}}
+	s, err := NewScope(in, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in[0] = Account{s: "b"}
+	s.Users()[0] = Account{s: "c"}
+	if got := s.Users(); !reflect.DeepEqual(got, []Account{{s: "a"}}) {
+		t.Errorf("a caller changed the scope through a slice: %v", got)
+	}
+	if _, err := NewScope(nil, []Account{}); !errors.Is(err, errScopeEmpty) {
+		t.Errorf("NewScope(nil, []) error = %v", err)
+	}
 }
 
 func TestParseDefaults(t *testing.T) {
@@ -242,8 +277,9 @@ func TestParseRejects(t *testing.T) {
 		{"unknown key in policy", pol(`"a.com"`, viaOK+"bogus = 1\n"), "policy[0].bogus", errUnknownKey},
 		{"unknown top-level table", dnsTable + "[foo]\nx = 1\n", "foo", errUnknownKey},
 		{"unknown dns subtable", dnsTable + "[dns.extra]\nx = 1\n", "dns.extra", errUnknownKey},
-		{"scope subtable", pol(`"a.com"`, viaOK+"[policy.scope]\nusers = [\"x\"]\n"), "policy[0].scope", errUnknownKey},
-		{"quoted spelling of scope", pol(`"a.com"`, viaOK+"\"sc\\u006fpe\" = 1\n"), "policy[0].scope", errUnknownKey},
+		{"unknown key in scope", pol(`"a.com"`, viaOK+`scope = { users = ["x"], cgroups = ["y"] }`+"\n"), "policy[0].scope.cgroups", errUnknownKey},
+		{"case-variant scope key", pol(`"a.com"`, viaOK+"[policy.scope]\nUsers = [\"x\"]\n"), "policy[0].scope.Users", errUnknownKey},
+		{"quoted spelling of scope", pol(`"a.com"`, viaOK+"\"sc\\u006fpe\" = 1\n"), "policy[0].scope", errSyntax},
 		{"upper-case table", "[DNS]\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "DNS", errUnknownKey},
 		{"upper-case dns key", "[dns]\nUPSTREAM = [\"tls://1.1.1.1@a.b\"]\n", "dns.UPSTREAM", errUnknownKey},
 		{"second dns table by case", dnsTable + "[DNS]\nupstream = [\"tls://9.9.9.9@evil.example\"]\n", "DNS", errUnknownKey},
@@ -253,7 +289,8 @@ func TestParseRejects(t *testing.T) {
 		{"case-variant deny_via key", pol(`"a.com"`, "deny_via = [\"en0\"]\nDeny_Via = [\"en1\"]\n"), "policy[0].Deny_Via", errUnknownKey},
 		{"single policy table", dnsTable + "[policy]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = []\n", "policy", errPolicyShape},
 		{"policy is a string", "policy = \"x\"\n" + dnsTable, "policy", errPolicyShape},
-		{"inline unknown key", "policy = [{name=\"p\", to=[\"a.com\"], only_via=[], scope=1}]\n" + dnsTable, "policy[0].scope", errUnknownKey},
+		{"inline unknown key", "policy = [{name=\"p\", to=[\"a.com\"], only_via=[], scop=1}]\n" + dnsTable, "policy[0].scop", errUnknownKey},
+		{"inline scope is an int", "policy = [{name=\"p\", to=[\"a.com\"], only_via=[], scope=1}]\n" + dnsTable, "policy[0].scope", errSyntax},
 		// Types and syntax.
 		{"wrong type", dnsTable + "[addrbook]\nretain = 5\n", "addrbook.retain", errSyntax},
 		{"syntax error", "[dns\n", "", errSyntax},
@@ -275,6 +312,18 @@ func TestParseRejects(t *testing.T) {
 		{"bad listen", "[dns]\nlisten = \"nope\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errBadAddress},
 		{"listen port zero", "[dns]\nlisten = \"127.0.0.1:0\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errPortZero},
 		{"listen zoned", "[dns]\nlisten = \"[fe80::1%en0]:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errZoned},
+		{"listen 0.0.0.0", "[dns]\nlisten = \"0.0.0.0:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen ::", "[dns]\nlisten = \"[::]:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen mapped 0.0.0.0", "[dns]\nlisten = \"[::ffff:0.0.0.0]:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen IPv4 multicast", "[dns]\nlisten = \"224.0.0.251:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen IPv6 multicast", "[dns]\nlisten = \"[ff02::fb]:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen broadcast", "[dns]\nlisten = \"255.255.255.255:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen global unicast", "[dns]\nlisten = \"8.8.8.8:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen private", "[dns]\nlisten = \"192.168.1.2:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen IPv6 global", "[dns]\nlisten = \"[2001:db8::1]:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen IPv4 link-local", "[dns]\nlisten = \"169.254.1.1:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen mapped global", "[dns]\nlisten = \"[::ffff:8.8.8.8]:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
+		{"listen IPv4-compatible loopback", "[dns]\nlisten = \"[::127.0.0.1]:53\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n", "dns.listen", errNotLoopback},
 		// [addrbook].
 		{"bad retain", dnsTable + "[addrbook]\nretain = \"soon\"\n", "addrbook.retain", errBadDuration},
 		{"zero retain", dnsTable + "[addrbook]\nretain = \"0s\"\n", "addrbook.retain", errNotPositive},
@@ -367,9 +416,37 @@ func TestParseRejects(t *testing.T) {
 		{"leading dash name", pol(`"a.com"`, "only_via = [\"-en0\"]\n"), "policy[0].only_via[0]", errBadSelector},
 		{"long name", pol(`"a.com"`, "only_via = [\""+strings.Repeat("e", 16)+"\"]\n"), "policy[0].only_via[0]", errBadSelector},
 		{"glob with brace", pol(`"a.com"`, "only_via = [\"{en0}*\"]\n"), "policy[0].only_via[0]", errBadSelector},
+		// Scope.
+		{"empty scope", pol(`"a.com"`, viaOK+"scope = {}\n"), "policy[0].scope", errScopeEmpty},
+		{"empty scope lists", pol(`"a.com"`, viaOK+"scope = { users = [], groups = [] }\n"), "policy[0].scope", errScopeEmpty},
+		{"scope users is a string", pol(`"a.com"`, viaOK+`scope = { users = "a" }`+"\n"), "policy[0].scope.users", errSyntax},
+		{"scope user is an int", pol(`"a.com"`, viaOK+`scope = { users = ["a", 501] }`+"\n"), "policy[0].scope.users[1]", errSyntax},
+		{"numeric user", pol(`"a.com"`, viaOK+`scope = { users = ["501"] }`+"\n"), "policy[0].scope.users[0]", errBadAccount},
+		{"empty user", pol(`"a.com"`, viaOK+`scope = { users = [""] }`+"\n"), "policy[0].scope.users[0]", errBadAccount},
+		{"user with quote", pol(`"a.com"`, viaOK+`scope = { users = ["a\" }"] }`+"\n"), "policy[0].scope.users[0]", errBadAccount},
+		{"user with space", pol(`"a.com"`, viaOK+`scope = { users = ["a b"] }`+"\n"), "policy[0].scope.users[0]", errBadAccount},
+		{"user leading dash", pol(`"a.com"`, viaOK+`scope = { users = ["-a"] }`+"\n"), "policy[0].scope.users[0]", errBadAccount},
+		{"user leading dot", pol(`"a.com"`, viaOK+`scope = { users = [".a"] }`+"\n"), "policy[0].scope.users[0]", errBadAccount},
+		{"user too long", pol(`"a.com"`, viaOK+`scope = { users = ["`+strings.Repeat("u", 33)+`"] }`+"\n"), "policy[0].scope.users[0]", errBadAccount},
+		{"second group bad", pol(`"a.com"`, viaOK+`scope = { groups = ["g", "g/h"] }`+"\n"), "policy[0].scope.groups[1]", errBadAccount},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) { assertFieldErr(t, tt.input, tt.field, tt.reason) })
+	}
+}
+
+// TestParseAcceptsLoopbackListen also accepts the IPv4-mapped form of a
+// loopback address: the parser unmaps it to the IPv4 address.
+func TestParseAcceptsLoopbackListen(t *testing.T) {
+	for _, l := range []string{"127.0.0.1:10053", "127.0.0.53:53", "127.255.255.254:53", "[::1]:53", "[::ffff:127.0.0.1]:53"} {
+		cfg, err := ParseBytes([]byte("[dns]\nlisten = \"" + l + "\"\nupstream = [\"tls://1.1.1.1@a.b\"]\n"))
+		if err != nil {
+			t.Errorf("listen %s: %v", l, err)
+			continue
+		}
+		if want := netip.MustParseAddrPort(l); cfg.DNS.Listen.Addr() != want.Addr().Unmap() {
+			t.Errorf("listen %s parsed as %v", l, cfg.DNS.Listen)
+		}
 	}
 }
 
