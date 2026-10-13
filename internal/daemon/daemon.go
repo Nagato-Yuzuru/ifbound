@@ -26,7 +26,7 @@
 //
 // When the daemon starts to ack reports, and after each configuration
 // change, it warms up: it resolves the listed names through the system
-// resolver, so that their addresses and aliases are blocked before an
+// resolver, so that their addresses are blocked before an
 // application asks. A probe first proves that the lookups go to
 // ifbound-dns, and their reports take the normal path. See Daemon.Run.
 package daemon

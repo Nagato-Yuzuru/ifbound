@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/syslookup"
 )
@@ -23,13 +22,13 @@ const (
 	// times the longest apply time of a new resolver entry measured on
 	// macOS (1.55 s). The report of a lookup does not depend on the lookup
 	// budget: ifbound-dns reports with its own budget, also after the
-	// lookup returned.
-	WarmUpTimeout = ipc.DefaultTimeout
+	// lookup returned. It does not follow the ack timeout.
+	WarmUpTimeout = 5 * time.Second
 )
 
 // warmUp resolves the names of the configuration through the system
 // resolver. The lookups go to ifbound-dns, and their reports learn the
-// addresses and the aliases of the names before an application asks.
+// addresses of the names before an application asks.
 // The warm-up itself writes nothing.
 //
 // A lookup is useful only when it goes to ifbound-dns. The system applies
