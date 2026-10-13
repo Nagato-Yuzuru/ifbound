@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/netip"
+	"slices"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
@@ -25,21 +26,30 @@ type Interface struct {
 	Class policy.Class
 }
 
+// Accounts is a snapshot of the user and group accounts of the host. A
+// platform reader fills it. The zero Accounts knows no account.
+type Accounts struct {
+	Users  map[string]uint32 // user name to uid
+	Groups map[string]uint32 // group name to gid
+}
+
 // Ruleset is a compiled ruleset. Its body is in the format of one Backend,
 // and the Reconciler never reads it. The Reconciler compares rulesets by
 // ID only. Build one with NewRuleset.
 type Ruleset struct {
-	id   string
-	body []byte
+	id       string
+	body     []byte
+	problems []Problem
 }
 
 // NewRuleset returns a ruleset with an ID that is a digest of body. Equal
 // bodies get equal IDs, so a Backend can derive the ID of the loaded
 // ruleset from the kernel and the Reconciler can skip a load that changes
-// nothing.
-func NewRuleset(body []byte) Ruleset {
+// nothing. problems are the faults that the Compiler worked around; they
+// do not change the ID.
+func NewRuleset(body []byte, problems ...Problem) Ruleset {
 	sum := sha256.Sum256(body)
-	return Ruleset{id: hex.EncodeToString(sum[:]), body: bytes.Clone(body)}
+	return Ruleset{id: hex.EncodeToString(sum[:]), body: bytes.Clone(body), problems: slices.Clone(problems)}
 }
 
 // ID identifies the ruleset. The zero Ruleset has the empty ID, which is
@@ -49,20 +59,28 @@ func (r Ruleset) ID() string { return r.id }
 // Body returns a copy of the ruleset text.
 func (r Ruleset) Body() []byte { return bytes.Clone(r.body) }
 
-// Compiler turns policies and interfaces into a ruleset.
+// Problems returns a copy of the faults that the Compiler worked around,
+// for example a scope that it dropped because an account is unknown.
+func (r Ruleset) Problems() []Problem { return slices.Clone(r.problems) }
+
+// Compiler turns policies, interfaces, and accounts into a ruleset.
 //
 // Contract:
 //   - Compile is a pure function: equal inputs give equal rulesets. If
 //     the result depends on the order of ifaces, Compile sorts them first.
+//     It does not change accounts.
 //   - The ruleset refers to exactly one table per policy, through the
 //     table-name mapping that the paired Backend uses.
-//   - A selector that depends on the inventory (a glob or a class) fails
-//     closed for an interface that is not in ifaces, where the platform
-//     can express it. Where it cannot, a deny_via constraint does not
-//     apply to such an interface until the next convergence. That window
-//     is accepted.
+//   - A selector that depends on the inventory (a glob or a class) does
+//     not select an interface that is not in ifaces. So only_via fails
+//     closed for a new interface, and deny_via fails open for it until
+//     the next convergence compiles it in. That window is accepted.
+//   - When the Compiler cannot make a part of a policy hold as written,
+//     it either fails, or it writes a stricter rule and reports the fault
+//     in Ruleset.Problems. It never writes a weaker rule.
 type Compiler interface {
-	Compile(policies []policy.Policy, ifaces []Interface) (Ruleset, error)
+	// Compile uses accounts for the account names in a scope.
+	Compile(policies []policy.Policy, ifaces []Interface, accounts Accounts) (Ruleset, error)
 }
 
 // Problem is an external fault that ifbound cannot repair.
@@ -89,8 +107,9 @@ type BackendState struct {
 // Backend installs enforcement in the kernel.
 //
 // Contract:
-//   - Load replaces the ruleset atomically. It never creates, drops, or
-//     fills a table, and never changes the content of one.
+//   - Load replaces the ruleset atomically. It creates each table that the
+//     ruleset declares and that is missing, empty. It never drops or fills
+//     a table, and never changes the content of one.
 //   - Tables persist: they stay when no loaded rule refers to them, and
 //     only DropTable removes one.
 //   - A rule that refers to a table that does not exist yet blocks
@@ -143,6 +162,12 @@ type ManagedEntry struct {
 	// Server. An entry that is not active yet is present, but the system
 	// can still send its queries to another resolver.
 	Active bool
+	// Version changes at each write of the entry, by ifbound or by another
+	// process, also when the content stays the same, and it does not come
+	// back to an earlier value. It is "" when the platform cannot tell.
+	// For example, a platform can derive it from the inode and the
+	// modification time of the entry file.
+	Version string
 }
 
 // ResolverState is the set of resolver entries that ifbound manages now.
@@ -150,6 +175,13 @@ type ResolverState struct {
 	Entries []ManagedEntry // at most one entry per domain
 	// Problems are conflicts with entries that ifbound does not manage.
 	Problems []Problem
+	// Shadowed lists the domain of each resolver that ifbound does not
+	// manage and that is at or below the domain of an entry, most
+	// specific first (most labels first, then by name), without
+	// duplicates. Such a resolver can take the names of the entry, and
+	// only a probe below its domain can show where those names go. Each
+	// one also has a Problem.
+	Shadowed []policy.Domain
 }
 
 // SysResolver manages the system resolver entries of ifbound. It never

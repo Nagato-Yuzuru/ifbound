@@ -1,10 +1,13 @@
 package daemon_test
 
 // A model-based test of the acknowledgement contract of the daemon. It
-// runs random operations (reports, configuration changes, interface
-// changes, write and save faults, problems, external flushes and loads,
-// time, crashes, restarts, lost snapshots) against a model written from
-// the spec. It uses only the public API of the daemon and the
+// runs random operations (reports, reports with aliases, reports for
+// learned aliases, configuration changes, interface changes, write and
+// save faults, system resolver faults, delayed resolver entries,
+// problems, external flushes and loads, time, crashes, restarts, lost
+// snapshots) against a model written from the spec. The system resolver
+// of the model sends a probe name to ifbound-dns only when an applied
+// resolver entry covers it, and ifbound-dns then reports the probe. It uses only the public API of the daemon and the
 // reconciletest fakes as the platform, and none of the helpers or
 // checkers of the other test files, so it checks them independently.
 //
@@ -36,6 +39,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
+	"github.com/Nagato-Yuzuru/ifbound/internal/syslookup"
 )
 
 var (
@@ -79,11 +83,21 @@ var (
 		"w.t.example", "c.example", "X.S.Example.", "nomatch.example"}
 	omMalformed = []string{"", "a..b", strings.Repeat("a", 64) + ".example"}
 
+	// omAliases are the aliases that reports carry. A probe below one
+	// reaches ifbound-dns when the system applies a covering entry,
+	// unless a lookup fault is set. omBadAlias can get no resolver entry.
+	omAliases  = []string{"e1.cdn.test", "e2.cdn.test", "e3.cdn.test"}
+	omBadAlias = "github.io"
+
 	omEn0   = reconcile.Interface{Name: "en0", Class: policy.ClassHardware}
 	omEn1   = reconcile.Interface{Name: "en1", Class: policy.ClassHardware}
 	omUtun0 = reconcile.Interface{Name: "utun0", Class: policy.ClassTunnel}
 	omIfs   = [][]reconcile.Interface{{omEn0}, {omEn0, omUtun0}, {omEn0, omEn1}, {omUtun0}}
 )
+
+// omCanon is the canonical form of a name of the pools: lower case, no
+// final dot.
+func omCanon(name string) string { return strings.ToLower(strings.TrimSuffix(name, ".")) }
 
 func (c omCfg) clone() omCfg {
 	out := make(omCfg, len(c))
@@ -167,12 +181,19 @@ type omOp struct {
 	DelSnap bool
 	On      bool
 	Sub     *omOp
+	Aliases []string
 }
 
 func (o omOp) String() string {
 	switch o.Kind {
-	case "observe", "unmatched", "malformed", "observeCancelled", "observeCancelMidway":
+	case "observe", "unmatched", "malformed", "observeCancelled", "observeCancelMidway", "observeViaAlias":
 		return fmt.Sprintf("%s(%q, %v, ttl=%v)", o.Kind, o.Q, o.Addrs, o.TTL)
+	case "observeAlias":
+		return fmt.Sprintf("%s(%q, %v, ttl=%v, aliases=%q)", o.Kind, o.Q, o.Addrs, o.TTL, o.Aliases)
+	case "resolverDelay":
+		return fmt.Sprintf("resolverDelay(%v)", o.On)
+	case "lookupFault":
+		return fmt.Sprintf("lookupFault(%s, %v)", omAliases[o.Idx], o.On)
 	case "reconfigure":
 		return fmt.Sprintf("reconfigure(%v)", o.Cfg)
 	case "ifaces":
@@ -315,6 +336,9 @@ func (g *omGen) ttl() time.Duration {
 }
 
 func (g *omGen) op(allowCrash bool) omOp {
+	if g.rng.IntN(5) == 0 {
+		return g.aliasOp()
+	}
 	r := g.rng.IntN(100)
 	switch {
 	case r < 30:
@@ -355,6 +379,32 @@ func (g *omGen) op(allowCrash bool) omOp {
 	}
 }
 
+func (g *omGen) aliasOp() omOp {
+	switch r := g.rng.IntN(10); {
+	case r < 5:
+		var aliases []string
+		for _, i := range g.rng.Perm(len(omAliases))[:1+g.rng.IntN(2)] {
+			aliases = append(aliases, omAliases[i])
+		}
+		if g.rng.IntN(8) == 0 {
+			aliases = append(aliases, omBadAlias)
+		}
+		return omOp{Kind: "observeAlias", Q: g.qname(), Addrs: g.poolAddrs(), TTL: g.ttl(), Aliases: aliases}
+	case r < 7:
+		q := omAliases[g.rng.IntN(len(omAliases))]
+		if g.rng.IntN(4) == 0 {
+			q = strings.ToUpper(q) + "."
+		}
+		return omOp{Kind: "observeViaAlias", Q: q, Addrs: g.poolAddrs(), TTL: g.ttl()}
+	case r < 8:
+		return omOp{Kind: "resolverDelay", On: g.rng.IntN(3) > 0}
+	case r < 9:
+		return omOp{Kind: "settle"}
+	default:
+		return omOp{Kind: "lookupFault", Idx: g.rng.IntN(len(omAliases)), On: g.rng.IntN(2) == 0}
+	}
+}
+
 func omGenerate(seed uint64, steps int) (omCfg, []omOp) {
 	g := &omGen{rng: rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))}
 	g.cfg = g.randomCfg()
@@ -385,6 +435,9 @@ type omKey struct {
 	A netip.Addr
 }
 
+// omAliasKey is a learned alias of a policy, in canonical form.
+type omAliasKey struct{ P, Name string }
+
 type omEntry struct {
 	mem, disk time.Time // the guaranteed expiry in this process, and after a restart
 	taint     bool      // known unprotected through an external event or a config change
@@ -413,6 +466,19 @@ type omRun struct {
 	pcfg    policy.Config
 	tracked map[omKey]*omEntry
 	pending map[omKey]*omEntry // entries of removed policies, kept for a revert until a prune is due
+	// aliases are the acked aliases that the daemon must still hold: a
+	// report for one must match its policy. Taint is not used.
+	aliases map[omAliasKey]*omEntry
+
+	failingLookups map[string]bool
+	// writeFailed holds the resolver entries whose last write failed.
+	// Until a write succeeds, a report with such an alias fails at once
+	// (owner decision 3).
+	writeFailed map[string]bool
+	// unsettled is true while a resolver entry can be written but not
+	// applied: the delay is on, or it was on since the last settle.
+	unsettled, delayOn bool
+	probed             []string // the aliases whose probe reached ifbound-dns in the current report
 
 	readSeq                 int
 	voidOn, nonvoidOn       bool
@@ -455,7 +521,7 @@ func (r *omRun) pol(name string) (policy.Policy, bool) {
 // line is the ruleset line that refers to the table of p with its
 // constraint, as the platform compiler writes it.
 func omLine(p policy.Policy) []byte {
-	rs, _ := reconciletest.Compiler{}.Compile([]policy.Policy{p}, nil)
+	rs, _ := reconciletest.Compiler{}.Compile([]policy.Policy{p}, nil, reconcile.Accounts{})
 	return rs.Body()
 }
 
@@ -505,6 +571,11 @@ func (r *omRun) checkLocked(where string) {
 	for k, e := range r.pending {
 		if !now.Before(e.mem) {
 			delete(r.pending, k)
+		}
+	}
+	for k, e := range r.aliases {
+		if !now.Before(e.mem) {
+			delete(r.aliases, k)
 		}
 	}
 	for k, e := range r.tracked {
@@ -601,7 +672,7 @@ func (b *omBackend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 	b.pre(kLoad)
 	ifs, _ := b.r.inv.Interfaces(ctx)
 	b.r.mu.Lock()
-	want, _ := reconciletest.Compiler{}.Compile(b.r.pcfg.Policies, ifs)
+	want, _ := reconciletest.Compiler{}.Compile(b.r.pcfg.Policies, ifs, reconcile.Accounts{})
 	if rs.ID() != want.ID() {
 		b.r.violate("spec3: Load of a ruleset that is not the one for the current config and interfaces")
 	}
@@ -646,8 +717,14 @@ func (s *omResolver) Read(ctx context.Context) (reconcile.ResolverState, error) 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.seg != segBackend {
-		r.violate("spec3: resolver part without a backend part before it")
-	} else if !r.segFailed {
+		// A report reads the entries of its aliases outside a
+		// convergence. A resolver write must not follow before the next
+		// convergence.
+		omStats["report reads resolver entries"]++
+		r.seg = segNone
+		return st, err
+	}
+	if !r.segFailed {
 		// The backend part succeeded for a config without the pending
 		// policies: from here on a prune of them is due (spec 4).
 		omStats["prune due with pending entries"] += min(len(r.pending), 1)
@@ -676,10 +753,13 @@ func (s *omResolver) write(kind int, name string, d policy.Domain, f func() erro
 	r.phase = kind
 	r.mu.Unlock()
 	err := f()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if err != nil && kind == 1 {
-		r.mu.Lock()
 		r.resolverFailed = append(r.resolverFailed, d.String())
-		r.mu.Unlock()
+		r.writeFailed[d.String()] = true
+	} else {
+		delete(r.writeFailed, d.String())
 	}
 	return err
 }
@@ -690,6 +770,46 @@ func (s *omResolver) Write(ctx context.Context, e reconcile.ResolverEntry) error
 
 func (s *omResolver) Remove(ctx context.Context, d policy.Domain) error {
 	return s.write(2, "Remove", d, func() error { return s.in.Remove(ctx, d) })
+}
+
+// omLookup is the system resolver with ifbound-dns: a probe name goes to
+// ifbound-dns when an applied entry covers it, and ifbound-dns reports
+// it. A lookup fault of the alias stops the probe before that.
+type omLookup struct{ r *omRun }
+
+func (l omLookup) Resolve(_ context.Context, name string) ([]netip.Addr, error) {
+	_, alias, _ := strings.Cut(name, ".")
+	l.r.mu.Lock()
+	omStats["probe"]++
+	fail := l.r.failingLookups[alias]
+	routed := !fail && l.r.routedLocked(name)
+	if routed {
+		l.r.probed = append(l.r.probed, alias)
+	}
+	d := l.r.d
+	l.r.mu.Unlock()
+	if fail {
+		return nil, fmt.Errorf("resolve %s: %w", name, syslookup.ErrUnavailable)
+	}
+	if routed {
+		d.ProbeSeen(name)
+	}
+	return nil, fmt.Errorf("resolve %s: %w", name, syslookup.ErrNotFound)
+}
+
+// routedLocked reports whether the system sends the queries for name to
+// ifbound-dns: the most specific applied entry that covers it has the
+// listen address.
+func (r *omRun) routedLocked(name string) bool {
+	best, found := "", false
+	var to netip.AddrPort
+	for _, e := range r.world.AppliedResolverEntries() {
+		d := e.Domain.String()
+		if (name == d || strings.HasSuffix(name, "."+d)) && (!found || len(d) > len(best)) {
+			best, found, to = d, true, e.Server
+		}
+	}
+	return found && to == r.pcfg.DNS.Listen
 }
 
 // ---- daemon lifecycle ----
@@ -707,6 +827,7 @@ func (r *omRun) start() {
 			Resolver:  &omResolver{in: r.world.Resolver(), r: r},
 			Inventory: r.inv,
 		},
+		Lookup: omLookup{r},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel, r.done = cancel, make(chan error, 1)
@@ -734,7 +855,11 @@ func (r *omRun) restart(delSnap bool) {
 			e.mem = e.disk
 		}
 	}
+	for _, e := range r.aliases {
+		e.mem = e.disk
+	}
 	if delSnap {
+		clear(r.aliases)
 		r.expectAdoptionLocked(now)
 	}
 	r.mu.Unlock()
@@ -802,22 +927,42 @@ type omSnapEntry struct {
 	Expiry int64  `json:"expiry_unix_nano"`
 }
 
-func (r *omRun) snapEntries() []omSnapEntry {
+type omSnapAlias struct {
+	Policy string `json:"policy"`
+	Alias  string `json:"alias"`
+	Expiry int64  `json:"expiry_unix_nano"`
+}
+
+type omSnapFile struct {
+	Entries []omSnapEntry `json:"entries"`
+	Aliases []omSnapAlias `json:"aliases"`
+}
+
+func (r *omRun) snapFile() omSnapFile {
+	var f omSnapFile
 	data, err := os.ReadFile(r.snap)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return f
 	}
 	if err != nil {
 		r.violate("reading snapshot: %v", err)
-		return nil
-	}
-	var f struct {
-		Entries []omSnapEntry `json:"entries"`
+		return f
 	}
 	if err := json.Unmarshal(data, &f); err != nil {
 		r.violate("snapshot is not JSON: %v", err)
 	}
-	return f.Entries
+	return f
+}
+
+func (r *omRun) snapEntries() []omSnapEntry { return r.snapFile().Entries }
+
+func (r *omRun) snapAliasExpiry(k omAliasKey) (time.Time, bool) {
+	for _, a := range r.snapFile().Aliases {
+		if a.Policy == k.P && a.Alias == k.Name {
+			return time.Unix(0, a.Expiry), true
+		}
+	}
+	return time.Time{}, false
 }
 
 func (r *omRun) snapExpiry(k omKey) (time.Time, bool) {
@@ -893,6 +1038,15 @@ func (r *omRun) checkAddrCountLocked(st daemon.Status) {
 	if st.Addrs < n {
 		r.violate("status: Addrs=%d, but %d acked entries are unexpired", st.Addrs, n)
 	}
+	n = 0
+	for k := range r.aliases {
+		if r.cfg.has(k.P) {
+			n++
+		}
+	}
+	if st.Aliases < n {
+		r.violate("status: Aliases=%d, but %d acked aliases are unexpired", st.Aliases, n)
+	}
 }
 
 func (r *omRun) checkAdoptionLocked() {
@@ -911,14 +1065,28 @@ func (r *omRun) checkAdoptionLocked() {
 	}
 }
 
+// matchesLocked is the matching rule of the daemon: the policies that
+// match qname, and the configured policies that learned qname as an
+// alias. It holds only the aliases that the daemon must still hold.
+func (r *omRun) matchesLocked(qname string) []string {
+	out := r.cfg.matches(qname)
+	for k := range r.aliases {
+		if k.Name == omCanon(qname) && r.cfg.has(k.P) && !slices.Contains(out, k.P) {
+			out = append(out, k.P)
+		}
+	}
+	return out
+}
+
 // onAck applies the model update and every ack-time check.
-func (r *omRun) onAck(pre daemon.Status, q string, addrs []netip.Addr, ttl time.Duration, unique bool) {
+func (r *omRun) onAck(pre daemon.Status, o omOp, addrs []netip.Addr, unique bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	q, ttl := o.Q, o.TTL
 	if !acksState(pre.State) {
 		r.violate("spec1/2: ack of %q in state %v", q, pre.State)
 	}
-	matched := r.cfg.matches(q)
+	matched := r.matchesLocked(q)
 	omStats["ack "+pre.State.String()]++
 	if len(matched) == 0 {
 		omStats["ack unmatched"]++
@@ -927,8 +1095,14 @@ func (r *omRun) onAck(pre daemon.Status, q string, addrs []netip.Addr, ttl time.
 		}
 		return
 	}
+	if len(r.cfg.matches(q)) == 0 {
+		omStats["ack matched only through a learned alias"]++
+	}
 	now := time.Now()
 	r.recordAckLocked(matched, addrs, now.Add(max(ttl, omRetain)))
+	if len(o.Aliases) > 0 {
+		r.recordAliasAckLocked(matched, o.Aliases, ttl, now)
+	}
 	v := r.view()
 	for _, p := range r.pcfg.Policies {
 		if !omRefers(v.body, p) {
@@ -939,6 +1113,57 @@ func (r *omRun) onAck(pre daemon.Status, q string, addrs []netip.Addr, ttl time.
 		r.violate("spec2: ack while a known problem voids enforcement")
 	}
 	r.checkTrackedAtAckLocked(v, q, now)
+}
+
+// recordAliasAckLocked checks an ack of a report with aliases. Each
+// alias must have its own resolver entry, and the system must apply an
+// entry that sends the queries for the alias to ifbound-dns: the
+// follow-up queries of the client are then reported. The alias itself
+// must be in the snapshot.
+func (r *omRun) recordAliasAckLocked(matched, aliases []string, ttl time.Duration, now time.Time) {
+	omStats["ack with aliases"]++
+	entries := r.world.ResolverEntries()
+	exp := now.Add(max(ttl, omRetain))
+	for _, a := range aliases {
+		name := omCanon(a)
+		if name == omBadAlias {
+			r.violate("ack of a report with the alias %s, which can get no resolver entry", a)
+			continue
+		}
+		if !slices.ContainsFunc(entries, func(e reconcile.ResolverEntry) bool { return e.Domain.String() == name }) {
+			r.violate("ack of a report with the alias %s, which has no resolver entry", a)
+		}
+		switch {
+		case !r.routedLocked(name):
+			r.violate("ack of a report with the alias %s: the system does not send its queries to ifbound-dns", a)
+		case slices.Contains(r.probed, name):
+			omStats["ack after probe"]++
+		default:
+			omStats["ack with proven entry"]++
+		}
+		for _, p := range matched {
+			r.recordAliasLocked(omAliasKey{p, name}, exp)
+		}
+	}
+}
+
+// recordAliasLocked records an acked alias of a policy that expires at
+// exp, and checks that the snapshot holds it.
+func (r *omRun) recordAliasLocked(k omAliasKey, exp time.Time) {
+	e := r.aliases[k]
+	if e == nil {
+		e = &omEntry{}
+		r.aliases[k] = e
+	}
+	if exp.After(e.mem) {
+		e.mem = exp
+	}
+	if d := exp.Add(-omSlack); d.After(e.disk) {
+		e.disk = d
+	}
+	if got, ok := r.snapAliasExpiry(k); !ok || got.Before(exp.Add(-omSlack)) {
+		r.violate("ack of alias %s of %s, snapshot expiry %v (present %v), want >= %v", k.Name, k.P, got, ok, exp.Add(-omSlack))
+	}
 }
 
 // checkNotStoredLocked reports each address that reached a table, or the
@@ -1030,9 +1255,17 @@ func (r *omRun) observe(o omOp) {
 	pre := r.status()
 	addrs := omAddrs(o.Addrs)
 	obs := ipc.Observation{QName: o.Q, Addrs: addrs, TTL: o.TTL}
+	for _, a := range o.Aliases {
+		obs.Aliases = append(obs.Aliases, ipc.Alias{Name: a, TTL: o.TTL})
+	}
 	r.mu.Lock()
-	armed := r.faultsArmed()
-	matched := r.cfg.matches(o.Q)
+	// A report with an alias can converge, and a convergence reads a
+	// voiding problem at once. Its probe fails while an entry is not
+	// applied yet, or when the lookup of the alias fails.
+	armed := r.faultsArmed() || (len(o.Aliases) > 0 && (r.voidOn || r.unsettled)) ||
+		slices.ContainsFunc(o.Aliases, func(a string) bool { return r.failingLookups[a] || r.writeFailed[a] })
+	matched := r.matchesLocked(o.Q)
+	r.probed = nil
 	r.mu.Unlock()
 
 	var err error
@@ -1051,7 +1284,7 @@ func (r *omRun) observe(o omOp) {
 	r.checkObserveResultLocked(pre.State, o, len(matched) > 0, armed, err)
 	r.mu.Unlock()
 	if err == nil {
-		r.onAck(pre, o.Q, addrs, o.TTL, o.Kind != "observe")
+		r.onAck(pre, o, addrs, o.Kind != "observe" && o.Kind != "observeAlias" && o.Kind != "observeViaAlias")
 	}
 	if o.Kind == "malformed" {
 		r.mu.Lock()
@@ -1121,10 +1354,15 @@ func (r *omRun) checkObserveResultLocked(pre daemon.State, o omOp, matched, arme
 		if o.Kind == "malformed" && !errors.Is(err, matcher.ErrMalformedName) {
 			r.violate("spec1: malformed %q = %v, want ErrMalformedName", o.Q, err)
 		}
-		if o.Kind != "malformed" && !matched && err != nil {
+		if o.Kind != "malformed" && o.Kind != "observeViaAlias" && !matched && err != nil {
 			r.violate("spec1: unmatched %q = %v, want an ack", o.Q, err)
 		}
-		if o.Kind == "observe" && matched && err != nil && !armed {
+		bad := slices.Contains(o.Aliases, omBadAlias)
+		if matched && bad && !errors.Is(err, daemon.ErrAliasEntry) {
+			r.violate("%q with the alias %s = %v, want ErrAliasEntry", o.Q, omBadAlias, err)
+		}
+		live := o.Kind == "observe" || o.Kind == "observeAlias" || o.Kind == "observeViaAlias"
+		if live && matched && !bad && err != nil && !armed {
 			r.violate("liveness: %q rejected in %v with no fault armed: %v", o.Q, pre, err)
 		}
 	default:
@@ -1134,8 +1372,21 @@ func (r *omRun) checkObserveResultLocked(pre daemon.State, o omOp, matched, arme
 
 func (r *omRun) exec(o omOp) {
 	switch o.Kind {
-	case "observe", "unmatched", "malformed", "observeCancelled", "observeCancelMidway":
+	case "observe", "unmatched", "malformed", "observeCancelled", "observeCancelMidway", "observeAlias", "observeViaAlias":
 		r.observe(o)
+	case "resolverDelay":
+		r.world.SetResolverDelay(o.On)
+		r.mu.Lock()
+		r.delayOn = o.On
+		r.unsettled = r.unsettled || o.On
+		r.mu.Unlock()
+	case "settle":
+		r.world.SettleResolver()
+		r.mu.Lock()
+		r.unsettled = r.delayOn
+		r.mu.Unlock()
+	case "lookupFault":
+		r.setLookupFault(o.Idx, o.On)
 	case "reconfigure":
 		r.reconfigure(o.Cfg)
 	case "ifaces":
@@ -1167,8 +1418,21 @@ func (r *omRun) exec(o omOp) {
 	}
 }
 
+// setLookupFault makes the system resolver fail for the probes of one
+// alias, or route them again.
+func (r *omRun) setLookupFault(i int, on bool) {
+	r.mu.Lock()
+	r.failingLookups[omAliases[i]] = on
+	r.mu.Unlock()
+}
+
 func (r *omRun) reconfigure(cfg omCfg) {
 	r.mu.Lock()
+	for k := range r.aliases {
+		if !cfg.has(k.P) {
+			delete(r.aliases, k) // the daemon can still hold it until a prune: no longer known
+		}
+	}
 	for k, e := range r.tracked {
 		if !cfg.has(k.P) {
 			r.pending[k] = e
@@ -1283,7 +1547,7 @@ func (r *omRun) externalLoad(idx int) {
 		if err != nil {
 			r.t.Fatal(err)
 		}
-		rs, _ = reconciletest.Compiler{}.Compile(pc.Policies, nil)
+		rs, _ = reconciletest.Compiler{}.Compile(pc.Policies, nil, reconcile.Accounts{})
 	}
 	r.world.ExternalLoad(rs.Body())
 	r.mu.Lock()
@@ -1331,6 +1595,7 @@ func newOmRun(t *testing.T, initial omCfg) *omRun {
 		t: t, world: reconciletest.NewWorld(), inv: reconciletest.NewInventory(omEn0),
 		dir: dir, snap: filepath.Join(dir, "addrbook.json"),
 		tracked: map[omKey]*omEntry{}, pending: map[omKey]*omEntry{}, rsDamageSeq: -1,
+		aliases: map[omAliasKey]*omEntry{}, failingLookups: map[string]bool{}, writeFailed: map[string]bool{},
 	}
 	r.setCfg(initial.clone())
 	r.world.SetBeforeWrite(func(n int) error {
@@ -1357,6 +1622,9 @@ func newOmRun(t *testing.T, initial omCfg) *omRun {
 func (r *omRun) recoverAndCheck() {
 	_ = os.Chmod(r.dir, 0o700)
 	r.world.SetProblems(nil, nil)
+	for i := range omAliases {
+		r.setLookupFault(i, false)
+	}
 	r.mu.Lock()
 	r.failAt, r.failFrom, r.saveFail, r.voidOn, r.nonvoidOn = 0, 0, false, false, false
 	r.mu.Unlock()

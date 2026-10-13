@@ -13,13 +13,17 @@ import (
 // ParseDomain: lower-case labels of [a-z0-9_-], 1 to 63 bytes, no leading
 // or trailing "-".
 var (
-	domainRE = regexp.MustCompile(`^([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*$`)
-	nameRE   = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+	domainRE  = regexp.MustCompile(`^([a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*$`)
+	nameRE    = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
+	accountRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]*$`)
 )
 
 func checkInvariants(t *testing.T, cfg Config) {
 	t.Helper()
 	checkAddrPort(t, "listen", cfg.DNS.Listen)
+	if l := cfg.DNS.Listen.Addr(); !l.IsLoopback() {
+		t.Errorf("listen %v is not loopback", l)
+	}
 	if len(cfg.DNS.Upstream) == 0 {
 		t.Error("no upstream")
 	}
@@ -38,6 +42,7 @@ func checkInvariants(t *testing.T, cfg Config) {
 		names[p.Name] = true
 		checkTo(t, p)
 		checkConstraint(t, p)
+		checkScope(t, p)
 	}
 	// Round trip: render the config back to TOML; it must parse to the
 	// same value.
@@ -128,6 +133,19 @@ func checkConstraint(t *testing.T, p Policy) {
 	}
 }
 
+func checkScope(t *testing.T, p Policy) {
+	t.Helper()
+	users, groups := p.Scope.Users(), p.Scope.Groups()
+	if p.Scope.Limited() != (len(users)+len(groups) > 0) {
+		t.Errorf("policy %s: Limited() disagrees with the lists", p.Name)
+	}
+	for _, a := range append(users, groups...) {
+		if !accountRE.MatchString(a.String()) || len(a.String()) > 32 {
+			t.Errorf("policy %s: account %q breaks the account contract", p.Name, a)
+		}
+	}
+}
+
 func selString(s InterfaceSelector) string {
 	switch s := s.(type) {
 	case InterfaceName:
@@ -187,9 +205,24 @@ func render(cfg Config) string {
 			}
 			b.WriteString(q(selString(s)))
 		}
-		b.WriteString("]\n")
+		b.WriteString("]\n" + renderScope(p.Scope))
 	}
 	return b.String()
+}
+
+func renderScope(s Scope) string {
+	if !s.Limited() {
+		return ""
+	}
+	return "scope = { users = " + accountList(s.Users()) + ", groups = " + accountList(s.Groups()) + " }\n"
+}
+
+func accountList(as []Account) string {
+	parts := make([]string, len(as))
+	for i, a := range as {
+		parts[i] = `"` + a.String() + `"`
+	}
+	return "[" + strings.Join(parts, ", ") + "]"
 }
 
 // TestOracleInvariantsOnAccepts runs the fuzz property over every accept
@@ -203,6 +236,7 @@ func fuzzSeeds() []string {
 		policyDoc(`"a.com", "A.COM.", "*.a.com", "::ffff:1.2.3.4", "1.2.3.4", "::ffff:0:0/96", "0x7f000001"`, "only_via = []\n"),
 		policyDoc(`"a.com"`, "only_via = [\"en0\", \"en0\", \"utun*\", \"@tunnel\"]\n"),
 		policyDoc(`"203.0.113.77/24", "fe80::/10"`, "deny_via = [\"@hardware\"]\n"),
+		policyDoc(`"a.com"`, "deny_via = [\"en0\"]\nscope = { users = [\"_a\", \"_a\"], groups = [\"staff\"] }\n"),
 		dnsTable + "[addrbook]\nretain = \"+7d\"\n",
 		"[dns]\nlisten = \"[::ffff:127.0.0.1]:53\"\nupstream = [\"tls://[::ffff:1.1.1.1]:0853@A.B.\"]\n",
 		policyDoc(`"a.com"`, "only_via = []\n") + policyDoc(`"b.com"`, "only_via = []\n")[len(dnsTable):],

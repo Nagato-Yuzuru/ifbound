@@ -30,11 +30,19 @@ type reporter interface {
 	Report(ctx context.Context, o ipc.Observation) error
 }
 
+// prober tells ifboundd that a probe name reached ifbound-dns. Report
+// must return when ctx ends, and it must not share the in-flight slots of
+// reporter; *ipc.Client does both.
+type prober interface {
+	ReportProbe(ctx context.Context, qname string) error
+}
+
 // handler holds back the reply of the next plugin until ifboundd has the
 // addresses and alias names in it.
 type handler struct {
 	next     plugin.Handler
 	reporter reporter
+	probes   prober
 	timeout  time.Duration
 }
 
@@ -50,6 +58,12 @@ func (h *handler) Name() string { return name }
 // The handler answers the resolver.arpa zone of the DDR probe and the
 // Firefox canary domain itself (see localRcode). Those queries do not go to the next plugin.
 //
+// A probe name of ifboundd (see ipc.IsProbe) also stays here: the handler
+// sends it to ifboundd and then answers NXDOMAIN. The probe proves to
+// ifboundd that the system resolver sends the queries for the alias to
+// ifbound-dns, so it must not go upstream, and the report comes before
+// the reply: ifboundd has it when the system resolver returns.
+//
 // The handler inspects the reply as the client will decode it: it packs the
 // reply when the next plugin writes it, unpacks those bytes, reports the
 // addresses and aliases in the result, and sends that result. Thus a Go
@@ -63,6 +77,9 @@ func (h *handler) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 	// report and the server's error reply must carry the question that the
 	// client asked.
 	qname := (&request.Request{Req: r}).QName()
+	if ipc.IsProbe(qname) {
+		return h.serveProbe(ctx, w, r, qname)
+	}
 	if rcode, ok := localRcode(qname); ok {
 		// No plugin below sees the query, so no upstream answer can tell
 		// the client to go around ifbound-dns. The reply has no address
@@ -111,6 +128,22 @@ func (h *handler) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg
 		rcode = dns.RcodeSuccess
 	}
 	return rcode, err
+}
+
+// serveProbe reports a probe name and answers it with NXDOMAIN. A failed
+// report does not change the answer: ifboundd only counts the report.
+// The error goes to the server log.
+func (h *handler) serveProbe(ctx context.Context, w dns.ResponseWriter, r *dns.Msg, qname string) (int, error) {
+	pctx, cancel := context.WithTimeout(ctx, h.timeout)
+	perr := h.probes.ReportProbe(pctx, qname)
+	cancel()
+	if err := w.WriteMsg(localReply(r, dns.RcodeNameError)); err != nil {
+		return dns.RcodeServerFailure, plugin.Error(name, errors.Join(err, perr))
+	}
+	if perr != nil {
+		return dns.RcodeNameError, plugin.Error(name, perr)
+	}
+	return dns.RcodeNameError, nil
 }
 
 // report waits for the ack at most h.timeout, and less when ctx ends first.

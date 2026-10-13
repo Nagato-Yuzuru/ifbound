@@ -26,6 +26,7 @@ var (
 	errUpstreamEmpty  = errors.New("must list at least one upstream")
 	errUpstreamForm   = errors.New("must have the form tls://<ip>[:port]@<server-name>")
 	errBadAddress     = errors.New("invalid address")
+	errNotLoopback    = errors.New("listen address must be a loopback address (127.0.0.0/8 or ::1): the resolver entries send protected lookups to it, and any other address can bypass ifbound-dns")
 	errPortZero       = errors.New("port must not be zero")
 	errZoned          = errors.New("zoned address is not allowed")
 	errMappedPrefix   = errors.New("IPv4-mapped IPv6 prefix must have at least 96 bits")
@@ -41,6 +42,8 @@ var (
 	errDenyEmpty      = errors.New("deny_via must not be empty: the policy would have no effect")
 	errBadSelector    = errors.New("invalid interface selector")
 	errUnknownClass   = errors.New("unknown interface class")
+	errScopeEmpty     = errors.New("scope must list at least one user or group: the policy would apply to no traffic")
+	errBadAccount     = errors.New("user or group name must be 1 to 32 bytes of [A-Za-z0-9_.-], starting with a letter or \"_\"")
 )
 
 // FieldError reports a configuration fault at one field. Field is the
@@ -96,6 +99,12 @@ type rawPolicy struct {
 	To      []string  `toml:"to"`
 	OnlyVia *[]string `toml:"only_via"`
 	DenyVia *[]string `toml:"deny_via"`
+	Scope   *rawScope `toml:"scope"`
+}
+
+type rawScope struct {
+	Users  []string `toml:"users"`
+	Groups []string `toml:"groups"`
 }
 
 // ParseBytes parses a configuration file. See Parse.
@@ -263,9 +272,15 @@ func checkKeys(tree map[string]any) error {
 		return &FieldError{Field: "policy", Err: errPolicyShape}
 	}
 	for i, e := range list {
-		kinds := map[string]fieldKind{"name": kindString, "to": kindStrings, "only_via": kindStrings, "deny_via": kindStrings}
-		if err := checkTableValue(fmt.Sprintf("policy[%d]", i), e, kinds); err != nil {
+		path := fmt.Sprintf("policy[%d]", i)
+		kinds := map[string]fieldKind{"name": kindString, "to": kindStrings, "only_via": kindStrings, "deny_via": kindStrings, "scope": kindTable}
+		if err := checkTableValue(path, e, kinds); err != nil {
 			return err
+		}
+		if scope, ok := e.(map[string]any)["scope"]; ok {
+			if err := checkTableValue(path+".scope", scope, map[string]fieldKind{"users": kindStrings, "groups": kindStrings}); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -280,6 +295,9 @@ type fieldKind int
 const (
 	kindString fieldKind = iota
 	kindStrings
+	// kindTable is a nested table. checkTableValue checks only that the
+	// value is a table: the caller checks its keys.
+	kindTable
 )
 
 // checkTableValue checks that v is a table that holds only the keys in
@@ -300,11 +318,18 @@ func checkTableValue(path string, v any, kinds map[string]fieldKind) error {
 			continue
 		}
 		field := path + "." + k
-		if kinds[k] == kindString {
+		switch kinds[k] {
+		case kindString:
 			if _, isStr := val.(string); !isStr {
 				return &FieldError{Field: field, Err: typeError("a string")}
 			}
 			continue
+		case kindTable:
+			if _, isTable := val.(map[string]any); !isTable {
+				return &FieldError{Field: field, Err: typeError("a table")}
+			}
+			continue
+		case kindStrings: // checked below
 		}
 		list, isList := val.([]any)
 		if !isList {
@@ -373,6 +398,11 @@ func (d rawDNS) validate() (DNS, error) {
 	}
 	if ap, err = normalizeAddrPort(ap); err != nil {
 		return DNS{}, at("listen", err)
+	}
+	// VMs reach ifbound-dns through the gateway DNS proxy of the host, so
+	// a loopback address serves them too.
+	if !ap.Addr().IsLoopback() {
+		return DNS{}, at("listen", fmt.Errorf("%w: %q", errNotLoopback, listen))
 	}
 	if len(d.Upstream) == 0 {
 		return DNS{}, at("upstream", errUpstreamEmpty)
@@ -483,7 +513,38 @@ func (rp rawPolicy) validate() (Policy, error) {
 	if p.Constraint, err = rp.constraint(); err != nil {
 		return Policy{}, err
 	}
+	if rp.Scope != nil {
+		if p.Scope, err = rp.Scope.validate(); err != nil {
+			return Policy{}, at("scope", err)
+		}
+	}
 	return p, nil
+}
+
+func (rs rawScope) validate() (Scope, error) {
+	users, err := parseAccounts(rs.Users)
+	if err != nil {
+		return Scope{}, at("users", err)
+	}
+	groups, err := parseAccounts(rs.Groups)
+	if err != nil {
+		return Scope{}, at("groups", err)
+	}
+	return NewScope(users, groups)
+}
+
+func parseAccounts(in []string) ([]Account, error) {
+	var out []Account
+	for i, s := range in {
+		a, err := ParseAccount(s)
+		if err != nil {
+			return nil, at(fmt.Sprintf("[%d]", i), err)
+		}
+		if !slices.Contains(out, a) {
+			out = append(out, a)
+		}
+	}
+	return out, nil
 }
 
 func (rp rawPolicy) constraint() (Constraint, error) {

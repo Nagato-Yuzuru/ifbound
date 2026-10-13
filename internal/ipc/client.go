@@ -48,17 +48,31 @@ type Client struct {
 	path      string
 	serverUID uint32
 	inflight  chan struct{}
+	probes    chan struct{}
 }
 
-// maxInFlight bounds the Reports that run at once. It stays below the
-// smallest common listen backlog (128), so a burst waits in the client and
-// does not overflow the server queue.
-const maxInFlight = 32
+const (
+	// maxInFlight bounds the Reports that run at once. It stays below the
+	// smallest common listen backlog (128), so a burst waits in the client
+	// and does not overflow the server queue.
+	maxInFlight = 32
+	// maxProbesInFlight bounds the ReportProbe calls that run at once.
+	// Probes have their own slots: while ifboundd waits for a probe, the
+	// Report that waits for its ack holds a report slot, and all report
+	// slots can be held so. A probe that needed one of them would wait for
+	// itself.
+	maxProbesInFlight = 8
+)
 
 // NewClient returns a client for the socket at path. It trusts a reply only
 // from a server that runs as serverUID. Production passes 0.
 func NewClient(path string, serverUID uint32) *Client {
-	return &Client{path: path, serverUID: serverUID, inflight: make(chan struct{}, maxInFlight)}
+	return &Client{
+		path:      path,
+		serverUID: serverUID,
+		inflight:  make(chan struct{}, maxInFlight),
+		probes:    make(chan struct{}, maxProbesInFlight),
+	}
 }
 
 // Report sends o and waits for the ack. It returns nil only after an ack.
@@ -70,6 +84,24 @@ func NewClient(path string, serverUID uint32) *Client {
 // ends. The server honors waits of up to 30 seconds. A server that runs as
 // another uid than the expected one gives ErrUnavailable.
 func (c *Client) Report(ctx context.Context, o Observation) error {
+	return c.exchange(ctx, c.inflight, o.QName, func(ctx context.Context) envelope { return newObserveEnvelope(ctx, o) })
+}
+
+// ReportProbe tells ifboundd that the probe name qname reached
+// ifbound-dns (see ProbePrefix). It returns nil after ifboundd has
+// recorded the name. ifboundd answers a probe at once, and a probe never
+// waits for a report slot, so a ReportProbe ends also while every Report
+// waits for ifboundd. The errors and the deadline are those of Report. At
+// most maxProbesInFlight calls run at once.
+func (c *Client) ReportProbe(ctx context.Context, qname string) error {
+	return c.exchange(ctx, c.probes, qname, func(context.Context) envelope {
+		return envelopeOf(typeProbe, probeBody{QName: qname})
+	})
+}
+
+// exchange sends one request on its own connection, in one of slots, and
+// reads the reply.
+func (c *Client) exchange(ctx context.Context, slots chan struct{}, qname string, req func(context.Context) envelope) error {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, DefaultTimeout)
@@ -77,19 +109,19 @@ func (c *Client) Report(ctx context.Context, o Observation) error {
 	}
 
 	select {
-	case c.inflight <- struct{}{}:
-		defer func() { <-c.inflight }()
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
 	case <-ctx.Done():
-		return fmt.Errorf("reporting %s: %w", o.QName, ctx.Err())
+		return fmt.Errorf("reporting %s: %w", qname, ctx.Err())
 	}
-	err := c.roundTrip(ctx, o)
+	err := c.roundTrip(ctx, req(ctx))
 	if err != nil && ctx.Err() != nil {
-		return fmt.Errorf("reporting %s: %w", o.QName, ctx.Err())
+		return fmt.Errorf("reporting %s: %w", qname, ctx.Err())
 	}
 	return err
 }
 
-func (c *Client) roundTrip(ctx context.Context, o Observation) error {
+func (c *Client) roundTrip(ctx context.Context, req envelope) error {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", c.path)
 	if err != nil {
@@ -110,7 +142,7 @@ func (c *Client) roundTrip(ctx context.Context, o Observation) error {
 	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
 
-	if err := writeFrame(conn, newObserveEnvelope(ctx, o)); err != nil {
+	if err := writeFrame(conn, req); err != nil {
 		return wrapIO(err)
 	}
 	reply, err := readFrame(conn)

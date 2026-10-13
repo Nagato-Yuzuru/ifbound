@@ -53,8 +53,8 @@ type AddrBook struct {
 
 // Name identifies a policy. Parse guarantees 1 to 24 bytes of
 // [a-z0-9_-] that start with a letter or digit, and uniqueness inside one
-// Config. The limit leaves room for the prefix that the firewall compiler
-// adds to a pf table name.
+// Config. The limit keeps the firewall table name and tag name of a
+// policy within the pf limits.
 type Name string
 
 // Policy is one [[policy]] entry: traffic to any of To must obey Constraint.
@@ -64,7 +64,47 @@ type Policy struct {
 	Name       Name
 	To         []Destination // never empty, no duplicates
 	Constraint Constraint    // never nil
+	// Scope limits the policy to the sockets of some users and groups.
+	// The zero Scope has no limit.
+	Scope Scope
 }
+
+// Scope limits a policy to the local sockets of some users and groups. A
+// socket is in the scope when its owner is one of the users, or when the
+// primary group of its owner is one of the groups. Traffic without a
+// socket owner, such as VM traffic through kernel NAT, is never in a
+// limited scope. The zero Scope has no limit: the policy applies to all
+// traffic. Build a limited Scope with NewScope.
+type Scope struct {
+	users  []Account
+	groups []Account
+}
+
+// Account is a user or group name. Build one with ParseAccount. The zero
+// Account is not valid.
+type Account struct{ s string }
+
+// String returns the name.
+func (a Account) String() string { return a.s }
+
+// NewScope returns a limited Scope. It fails when both lists are empty,
+// because the policy would then apply to no traffic.
+func NewScope(users, groups []Account) (Scope, error) {
+	if len(users) == 0 && len(groups) == 0 {
+		return Scope{}, errScopeEmpty
+	}
+	return Scope{users: slices.Clone(users), groups: slices.Clone(groups)}, nil
+}
+
+// Limited reports whether the scope limits the policy. It is false only
+// for the zero Scope.
+func (s Scope) Limited() bool { return len(s.users) > 0 || len(s.groups) > 0 }
+
+// Users returns a copy of the user list.
+func (s Scope) Users() []Account { return slices.Clone(s.users) }
+
+// Groups returns a copy of the group list.
+func (s Scope) Groups() []Account { return slices.Clone(s.groups) }
 
 // Destination is what a policy matches. Build one with ParseDestination.
 //
