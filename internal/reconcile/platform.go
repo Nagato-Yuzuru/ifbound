@@ -124,7 +124,12 @@ type BackendState struct {
 //     Voids set. A disabled firewall is also such a Problem.
 //   - Read and LoadedID derive the ruleset ID from the kernel content,
 //     never from a cache. After any external change to the ruleset they
-//     report "" or an ID that differs from the loaded one.
+//     report "" or an ID that differs from the loaded one. A rule that
+//     another tool adds below the ruleset (for example in a sub-anchor
+//     that a rule of the ruleset refers to) is such a change, and Load
+//     removes it.
+//   - While the firewall is disabled, Read and LoadedID report "": no
+//     rule is in effect. Load enables the firewall again.
 //   - The write methods are idempotent: adding an entry that is present,
 //     removing one that is absent, and dropping a table that is missing
 //     all succeed. A nil error from a write means the kernel holds the
