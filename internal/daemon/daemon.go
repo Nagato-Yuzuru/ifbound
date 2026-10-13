@@ -23,6 +23,12 @@
 // alias only after a probe proves that the system applies that entry:
 // the follow-up queries then come to ifbound-dns and are reported like
 // any other query. See Daemon.Observe.
+//
+// When the daemon starts to ack reports, and after each configuration
+// change, it warms up: it resolves the listed names through the system
+// resolver, so that their addresses are blocked before an
+// application asks. A probe first proves that the lookups go to
+// ifbound-dns, and their reports take the normal path. See Daemon.Run.
 package daemon
 
 import (
@@ -87,9 +93,11 @@ var (
 
 // SystemResolver resolves a name through the system resolver, as an
 // application does. syslookup.Resolver implements it. The daemon uses it
-// only to send probe names (see ipc.ProbePrefix), and it ignores the
-// result: only the report of the probe from ifbound-dns counts. The
-// deadline of ctx is the budget of the call.
+// to send probe names (see ipc.ProbePrefix) and the names of the
+// warm-up. It ignores the addresses: only the report from ifbound-dns
+// counts. The warm-up logs the error, and it treats an error that wraps
+// syslookup.ErrNotFound as normal. The deadline of ctx is the budget of
+// the call.
 type SystemResolver interface {
 	Resolve(ctx context.Context, name string) ([]netip.Addr, error)
 }
@@ -103,8 +111,8 @@ type Config struct {
 	Snapshot string
 	// Platform converges the platform state. All its fields are required.
 	Platform reconcile.Reconciler
-	// Lookup sends the probe names through the system resolver. It is
-	// required.
+	// Lookup sends the probe names and the warm-up names through the
+	// system resolver. It is required.
 	Lookup SystemResolver
 	// Logger receives state changes and enforcement changes. Nil discards
 	// them.
@@ -164,10 +172,27 @@ func New(cfg Config) *Daemon {
 // learned-looking kernel entries and save them before it leaves
 // StateStarting. The self-heal timer retries the load and the
 // convergence until both succeed.
+//
+// In StateReady and StateDegraded, Run resolves the names that the
+// configuration lists through Config.Lookup: each exact destination and
+// the domain of each suffix destination. Before the lookup of a name, a
+// probe below the name must prove that its queries go to ifbound-dns. A
+// name whose probe fails gets another try after SelfHealInterval. At
+// most WarmUpConcurrency names are in work at one time, outside the
+// loop. The probe and the lookup of a name get WarmUpTimeout each. A
+// failed lookup is logged and skipped. The warm-up stops when the state
+// leaves these two states or the configuration changes, and then starts
+// again under the new state or configuration. Its lookups that already
+// started run to their end. Run returns after every lookup has returned.
 func (d *Daemon) Run(ctx context.Context) error {
 	if !d.started.CompareAndSwap(false, true) {
 		return ErrAlreadyRunning
 	}
+	warm := newWarmUp(d.cfg.Lookup, d.probe, d.cfg.Logger)
+	// The warm-up ends with ctx. Run waits for its lookups after done
+	// closes: a lookup can wait for its report, and that report then
+	// ends with ErrStopped.
+	defer warm.wait()
 	defer close(d.done)
 
 	l := newLoop(d.cfg)
@@ -181,6 +206,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	_ = l.reconcile(ctx, "start") // the phase holds the outcome
 	for {
 		l.armExpiry(expiry)
+		warm.sync(ctx, l)
 		select {
 		case <-ctx.Done():
 			return nil
