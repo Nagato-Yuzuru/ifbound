@@ -148,7 +148,7 @@ func checkRecovered(t *testing.T, world *reconciletest.World, acks *ackLog) {
 			}
 		}
 	}
-	rs, err := reconciletest.Compiler{}.Compile(parse(t, configV2).Policies, []reconcile.Interface{en0, utun0})
+	rs, err := reconciletest.Compiler{}.Compile(parse(t, configV2).Policies, []reconcile.Interface{en0, utun0}, reconcile.Accounts{})
 	if err != nil {
 		t.Fatal(err)
 	}

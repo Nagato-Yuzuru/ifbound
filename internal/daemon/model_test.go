@@ -455,7 +455,7 @@ func (r *omRun) pol(name string) (policy.Policy, bool) {
 // line is the ruleset line that refers to the table of p with its
 // constraint, as the platform compiler writes it.
 func omLine(p policy.Policy) []byte {
-	rs, _ := reconciletest.Compiler{}.Compile([]policy.Policy{p}, nil)
+	rs, _ := reconciletest.Compiler{}.Compile([]policy.Policy{p}, nil, reconcile.Accounts{})
 	return rs.Body()
 }
 
@@ -601,7 +601,7 @@ func (b *omBackend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 	b.pre(kLoad)
 	ifs, _ := b.r.inv.Interfaces(ctx)
 	b.r.mu.Lock()
-	want, _ := reconciletest.Compiler{}.Compile(b.r.pcfg.Policies, ifs)
+	want, _ := reconciletest.Compiler{}.Compile(b.r.pcfg.Policies, ifs, reconcile.Accounts{})
 	if rs.ID() != want.ID() {
 		b.r.violate("spec3: Load of a ruleset that is not the one for the current config and interfaces")
 	}
@@ -1283,7 +1283,7 @@ func (r *omRun) externalLoad(idx int) {
 		if err != nil {
 			r.t.Fatal(err)
 		}
-		rs, _ = reconciletest.Compiler{}.Compile(pc.Policies, nil)
+		rs, _ = reconciletest.Compiler{}.Compile(pc.Policies, nil, reconcile.Accounts{})
 	}
 	r.world.ExternalLoad(rs.Body())
 	r.mu.Lock()

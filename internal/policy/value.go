@@ -12,6 +12,7 @@ const (
 	maxLabelLen     = 63
 	maxIfaceNameLen = 15 // IFNAMSIZ - 1
 	maxPolicyName   = 24
+	maxAccountLen   = 32 // the Linux login name limit, so one file works on both platforms
 )
 
 // Domain is a valid DNS name in lower case, without a trailing dot.
@@ -158,6 +159,24 @@ func validIfaceChars(s string, glob bool) bool {
 	}
 	return true
 }
+
+// ParseAccount checks a user or group name: 1 to 32 bytes of
+// [A-Za-z0-9_.-] that start with a letter or "_". A name never starts
+// with a digit, so a firewall cannot read it as a numeric ID.
+func ParseAccount(s string) (Account, error) {
+	if s == "" || len(s) > maxAccountLen || !isLetter(s[0]) && s[0] != '_' {
+		return Account{}, fmt.Errorf("%w: %q", errBadAccount, s)
+	}
+	for i := range len(s) {
+		c := s[i]
+		if !isLetter(c) && (c < '0' || c > '9') && c != '_' && c != '.' && c != '-' {
+			return Account{}, fmt.Errorf("%w: %q", errBadAccount, s)
+		}
+	}
+	return Account{s: s}, nil
+}
+
+func isLetter(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
 
 func parseName(s string) (Name, error) {
 	if s == "" || len(s) > maxPolicyName || s[0] == '-' || s[0] == '_' {

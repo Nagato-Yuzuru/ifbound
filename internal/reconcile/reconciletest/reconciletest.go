@@ -139,9 +139,12 @@ func (w *World) Ruleset() reconcile.Ruleset {
 
 // Referenced returns the policies whose table the loaded ruleset refers
 // to. It reads a ruleset that Compiler built.
-func (w *World) Referenced() []policy.Name {
+func (w *World) Referenced() []policy.Name { return declared(w.Ruleset()) }
+
+// declared returns the tables that a ruleset of Compiler declares.
+func declared(rs reconcile.Ruleset) []policy.Name {
 	var out []policy.Name
-	for line := range bytes.Lines(w.Ruleset().Body()) {
+	for line := range bytes.Lines(rs.Body()) {
 		if rest, ok := strings.CutPrefix(string(line), "table "); ok {
 			name, _, _ := strings.Cut(rest, " ")
 			out = append(out, policy.Name(name))
@@ -250,8 +253,9 @@ func (w *World) write(apply func()) error {
 	return nil
 }
 
-// Backend is the reconcile.Backend face of a World. Load never changes a
-// table, as the interface contract demands.
+// Backend is the reconcile.Backend face of a World. Load creates the
+// missing tables that the ruleset declares and never changes a table, as
+// the interface contract demands.
 type Backend struct{ w *World }
 
 var _ reconcile.Backend = (*Backend)(nil)
@@ -274,7 +278,14 @@ func (b *Backend) LoadedID(context.Context) (string, error) {
 
 // Load implements reconcile.Backend.
 func (b *Backend) Load(_ context.Context, rs reconcile.Ruleset) error {
-	return b.w.write(func() { b.w.ruleset = rs })
+	return b.w.write(func() {
+		b.w.ruleset = rs
+		for _, name := range declared(rs) {
+			if b.w.tables[name] == nil {
+				b.w.tables[name] = make(map[netip.Prefix]struct{})
+			}
+		}
+	})
 }
 
 // AddEntries implements reconcile.Backend.
@@ -346,18 +357,18 @@ func (r *Resolver) Remove(_ context.Context, d policy.Domain) error {
 }
 
 // Compiler is a fake reconcile.Compiler. Its ruleset text has one
-// "table <name> <constraint>" line per policy and one "iface" line per
-// interface, so any change of constraint, policy set, or interfaces gives
-// a new ID.
+// "table <name> <constraint> <scope>" line per policy and one "iface"
+// line per interface, so any change of constraint, scope, policy set, or
+// interfaces gives a new ID. It ignores the accounts.
 type Compiler struct{}
 
 var _ reconcile.Compiler = Compiler{}
 
 // Compile implements reconcile.Compiler.
-func (Compiler) Compile(policies []policy.Policy, ifaces []reconcile.Interface) (reconcile.Ruleset, error) {
+func (Compiler) Compile(policies []policy.Policy, ifaces []reconcile.Interface, _ reconcile.Accounts) (reconcile.Ruleset, error) {
 	var b []byte
 	for _, p := range policies {
-		b = fmt.Appendf(b, "table %s %#v\n", p.Name, p.Constraint)
+		b = fmt.Appendf(b, "table %s %#v %#v\n", p.Name, p.Constraint, p.Scope)
 	}
 	for _, i := range ifaces {
 		b = fmt.Appendf(b, "iface %s %s\n", i.Name, i.Class)

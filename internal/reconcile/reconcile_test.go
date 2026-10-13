@@ -139,7 +139,7 @@ func (f *fixture) reconfigure(t *testing.T, cfgText string) {
 
 func (f *fixture) compiled(t *testing.T, ifaces ...reconcile.Interface) string {
 	t.Helper()
-	rs, err := reconciletest.Compiler{}.Compile(f.cfg.Policies, ifaces)
+	rs, err := reconciletest.Compiler{}.Compile(f.cfg.Policies, ifaces, reconcile.Accounts{})
 	if err != nil {
 		t.Fatalf("Compile: %v", err)
 	}
@@ -335,6 +335,41 @@ func TestConvergeReportsExternalProblems(t *testing.T) {
 
 	if !slices.Equal(rep.Problems, want) {
 		t.Errorf("problems = %+v, want %+v", rep.Problems, want)
+	}
+}
+
+// noteCompiler wraps the fake Compiler. It reports one problem for each
+// user in its accounts, so a test sees which accounts reached Compile.
+type noteCompiler struct{ reconciletest.Compiler }
+
+func (c noteCompiler) Compile(ps []policy.Policy, ifaces []reconcile.Interface, accounts reconcile.Accounts) (reconcile.Ruleset, error) {
+	rs, err := c.Compiler.Compile(ps, ifaces, accounts)
+	var problems []reconcile.Problem
+	for _, name := range slices.Sorted(maps.Keys(accounts.Users)) {
+		problems = append(problems, reconcile.Problem{Text: "scope dropped: " + name})
+	}
+	return reconcile.NewRuleset(rs.Body(), problems...), err
+}
+
+func TestConvergeReportsCompilerProblemsFirst(t *testing.T) {
+	f := installV1(t)
+	f.rec.Compiler = noteCompiler{}
+	backend := reconcile.Problem{Text: "pf is disabled", Voids: true}
+	f.world.SetProblems([]reconcile.Problem{backend}, nil)
+	in := f.inputs()
+	in.Accounts = reconcile.Accounts{Users: map[string]uint32{"b": 2, "a": 1}}
+
+	rep, err := f.rec.Converge(t.Context(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := []reconcile.Problem{{Text: "scope dropped: a"}, {Text: "scope dropped: b"}, backend}
+	if !slices.Equal(rep.Problems, want) {
+		t.Errorf("problems = %+v, want %+v", rep.Problems, want)
+	}
+	if rep.Installed != f.compiled(t, en0) {
+		t.Errorf("installed %q, want the ruleset of the inputs", rep.Installed)
 	}
 }
 
