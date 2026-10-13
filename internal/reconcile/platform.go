@@ -162,6 +162,12 @@ type ManagedEntry struct {
 	// Server. An entry that is not active yet is present, but the system
 	// can still send its queries to another resolver.
 	Active bool
+	// Version changes at each write of the entry, by ifbound or by another
+	// process, also when the content stays the same, and it does not come
+	// back to an earlier value. It is "" when the platform cannot tell.
+	// For example, a platform can derive it from the inode and the
+	// modification time of the entry file.
+	Version string
 }
 
 // ResolverState is the set of resolver entries that ifbound manages now.
@@ -169,6 +175,13 @@ type ResolverState struct {
 	Entries []ManagedEntry // at most one entry per domain
 	// Problems are conflicts with entries that ifbound does not manage.
 	Problems []Problem
+	// Shadowed lists the domain of each resolver that ifbound does not
+	// manage and that is at or below the domain of an entry, most
+	// specific first (most labels first, then by name), without
+	// duplicates. Such a resolver can take the names of the entry, and
+	// only a probe below its domain can show where those names go. Each
+	// one also has a Problem.
+	Shadowed []policy.Domain
 }
 
 // SysResolver manages the system resolver entries of ifbound. It never
