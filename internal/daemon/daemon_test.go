@@ -905,7 +905,7 @@ func TestInterfaceChangesShareOneDebouncedRecompile(t *testing.T) {
 		time.Sleep(daemon.InterfaceDebounce - half)
 		synctest.Wait()
 
-		want, err := reconciletest.Compiler{}.Compile(parse(t, configV1).Policies, []reconcile.Interface{en0, utun0})
+		want, err := reconciletest.Compiler{}.Compile(parse(t, configV1).Policies, []reconcile.Interface{en0, utun0}, reconcile.Accounts{})
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -48,6 +48,10 @@ type Inputs struct {
 	Apexes []policy.Domain
 	// Listen is the server address of every resolver entry.
 	Listen netip.AddrPort
+	// Accounts resolves the account names of a scope. With the zero
+	// Accounts, the Compiler knows no account and drops every scope, so
+	// each scoped policy applies to all traffic.
+	Accounts Accounts
 }
 
 // Report describes one convergence.
@@ -59,8 +63,8 @@ type Report struct {
 	// otherwise. A non-empty Installed means: the ruleset for the inputs
 	// is loaded, and every table it refers to holds its desired entries.
 	Installed string
-	// Problems lists the external problems that the Backend and the
-	// SysResolver reported, in that order.
+	// Problems lists the external problems that the Compiler, the Backend,
+	// and the SysResolver reported, in that order.
 	Problems []Problem
 }
 
@@ -137,10 +141,11 @@ func (r Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report)
 	if err != nil {
 		return fmt.Errorf("reading interfaces: %w", err)
 	}
-	rs, err := r.Compiler.Compile(in.Policies, ifaces)
+	rs, err := r.Compiler.Compile(in.Policies, ifaces, in.Accounts)
 	if err != nil {
 		return fmt.Errorf("compiling ruleset: %w", err)
 	}
+	rep.Problems = append(rep.Problems, rs.Problems()...)
 	actual, err := r.Backend.Read(ctx)
 	if err != nil {
 		return fmt.Errorf("reading backend: %w", err)
