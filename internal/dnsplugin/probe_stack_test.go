@@ -124,7 +124,7 @@ type pvCounter struct {
 	in atomic.Int32
 }
 
-func (c *pvCounter) Observe(ctx context.Context, o ipc.Observation) error {
+func (c *pvCounter) Observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
 	c.in.Add(1)
 	return c.Daemon.Observe(ctx, o)
 }
@@ -165,7 +165,7 @@ func pvStack(t *testing.T, timeout time.Duration) (*handler, *pvCounter, *reconc
 		<-served
 	})
 	client := ipc.NewClient(path, pvUID())
-	h := &handler{next: pvAnswer(), reporter: client, probes: client, timeout: timeout}
+	h := &handler{key: testKey, next: pvAnswer(), reporter: client, probes: client, timeout: timeout}
 	mdns.plugin = h
 	// The warm-up of the daemon sends probes to the plugin, so Run starts
 	// after the plugin is set.

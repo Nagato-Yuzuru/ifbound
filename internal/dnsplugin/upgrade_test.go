@@ -80,7 +80,7 @@ func TestServeDNSAnswersUpgradeSignalsLocally(t *testing.T) {
 		t.Run(tt.qname+"/"+dns.TypeToString[tt.qtype], func(t *testing.T) {
 			var rep recorder
 			up := &upstream{answer: []dns.RR{rr("example.org. 300 IN A 192.0.2.1")}}
-			h := &handler{next: up, reporter: &rep, timeout: time.Second}
+			h := &handler{key: testKey, next: up, reporter: &rep, timeout: time.Second}
 			req := fromWire(t, tt.qname, tt.qtype)
 			rec := dnstest.NewRecorder(&test.ResponseWriter{})
 
@@ -114,7 +114,7 @@ func TestServeDNSForwardsLookAlikesOfUpgradeSignals(t *testing.T) {
 		t.Run(qname, func(t *testing.T) {
 			var rep recorder
 			up := &upstream{answer: []dns.RR{rr("example.org. 300 IN A 192.0.2.1")}}
-			h := &handler{next: up, reporter: &rep, timeout: time.Second}
+			h := &handler{key: testKey, next: up, reporter: &rep, timeout: time.Second}
 			req := fromWire(t, qname, dns.TypeA)
 			rec := dnstest.NewRecorder(&test.ResponseWriter{})
 
@@ -149,7 +149,7 @@ func TestServeDNSLocalReplyWriteError(t *testing.T) {
 		t.Run(qname, func(t *testing.T) {
 			var rep recorder
 			up := &upstream{}
-			h := &handler{next: up, reporter: &rep, timeout: time.Second}
+			h := &handler{key: testKey, next: up, reporter: &rep, timeout: time.Second}
 			rcode, err := h.ServeDNS(t.Context(), &failWriter{}, fromWire(t, qname, dns.TypeA))
 			if rcode != dns.RcodeServerFailure || !errors.Is(err, errFailWrite) {
 				t.Errorf("ServeDNS = %d, %v; want SERVFAIL, %v", rcode, err, errFailWrite)

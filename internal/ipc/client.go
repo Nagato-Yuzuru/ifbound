@@ -28,6 +28,14 @@ type Observation struct {
 	TTL   time.Duration
 }
 
+// Ack is the reply of ifboundd to an observation that it accepted.
+type Ack struct {
+	// Protected is true when the qname matches at least one policy.
+	// ifbound-dns then changes the reply so that no alias name of the
+	// qname reaches the client (see package dnsplugin).
+	Protected bool
+}
+
 // Client reports observations to ifboundd. It is safe for concurrent use.
 // The in-flight limit is per Client, so a process should create one Client
 // and share it.
@@ -63,16 +71,22 @@ func NewClient(path string, serverUID uint32) *Client {
 	}
 }
 
-// Report sends o and waits for the ack. It returns nil only after an ack.
-// The error set is: ErrUnavailable (no connection, lost connection),
-// ErrRejected (the server refused; the message has the reason), ErrProtocol
-// (malformed reply), ErrFrameTooLarge, and the context error when ctx ends.
-// Without a ctx deadline, DefaultTimeout applies. At most maxInFlight calls
-// run at once; a call that waits for a slot ends with the ctx error when ctx
-// ends. The server honors waits of up to 30 seconds. A server that runs as
-// another uid than the expected one gives ErrUnavailable.
-func (c *Client) Report(ctx context.Context, o Observation) error {
-	return c.exchange(ctx, c.inflight, o.QName, func(ctx context.Context) envelope { return newObserveEnvelope(ctx, o) })
+// Report sends o and waits for the ack. It returns a nil error only with
+// an ack. The error set is: ErrUnavailable (no connection, lost
+// connection), ErrRejected (the server refused; the message has the
+// reason), ErrProtocol (malformed reply, an ack without the protected
+// flag, or a server of another protocol version), ErrFrameTooLarge, and
+// the context error when ctx ends. Without a ctx deadline,
+// DefaultTimeout applies. At most maxInFlight calls run at once; a call
+// that waits for a slot ends with the ctx error when ctx ends. The server
+// honors waits of up to 30 seconds. A server that runs as another uid
+// than the expected one gives ErrUnavailable.
+func (c *Client) Report(ctx context.Context, o Observation) (Ack, error) {
+	body, err := c.exchange(ctx, c.inflight, o.QName, func(ctx context.Context) envelope { return newObserveEnvelope(ctx, o) })
+	if err != nil {
+		return Ack{}, err
+	}
+	return decodeAck(body)
 }
 
 // ReportProbe tells ifboundd that the probe name qname reached
@@ -82,14 +96,15 @@ func (c *Client) Report(ctx context.Context, o Observation) error {
 // waits for ifboundd. The errors and the deadline are those of Report. At
 // most maxProbesInFlight calls run at once.
 func (c *Client) ReportProbe(ctx context.Context, qname string) error {
-	return c.exchange(ctx, c.probes, qname, func(context.Context) envelope {
+	_, err := c.exchange(ctx, c.probes, qname, func(context.Context) envelope {
 		return envelopeOf(typeProbe, probeBody{QName: qname})
 	})
+	return err
 }
 
 // exchange sends one request on its own connection, in one of slots, and
-// reads the reply.
-func (c *Client) exchange(ctx context.Context, slots chan struct{}, qname string, req func(context.Context) envelope) error {
+// reads the reply. It returns the body of the ack.
+func (c *Client) exchange(ctx context.Context, slots chan struct{}, qname string, req func(context.Context) envelope) (json.RawMessage, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, DefaultTimeout)
@@ -100,29 +115,29 @@ func (c *Client) exchange(ctx context.Context, slots chan struct{}, qname string
 	case slots <- struct{}{}:
 		defer func() { <-slots }()
 	case <-ctx.Done():
-		return fmt.Errorf("reporting %s: %w", qname, ctx.Err())
+		return nil, fmt.Errorf("reporting %s: %w", qname, ctx.Err())
 	}
-	err := c.roundTrip(ctx, req(ctx))
+	body, err := c.roundTrip(ctx, req(ctx))
 	if err != nil && ctx.Err() != nil {
-		return fmt.Errorf("reporting %s: %w", qname, ctx.Err())
+		return nil, fmt.Errorf("reporting %s: %w", qname, ctx.Err())
 	}
-	return err
+	return body, err
 }
 
-func (c *Client) roundTrip(ctx context.Context, req envelope) error {
+func (c *Client) roundTrip(ctx context.Context, req envelope) (json.RawMessage, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", c.path)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	defer func() { _ = conn.Close() }() // read-only use after the reply; nothing to flush
 
 	uid, err := peerUID(conn)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUnavailable, err)
+		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	if uid != c.serverUID {
-		return fmt.Errorf("%w: server runs as uid %d, want %d", ErrUnavailable, uid, c.serverUID)
+		return nil, fmt.Errorf("%w: server runs as uid %d, want %d", ErrUnavailable, uid, c.serverUID)
 	}
 
 	// The context is the only source of deadlines. This keeps the context
@@ -131,11 +146,11 @@ func (c *Client) roundTrip(ctx context.Context, req envelope) error {
 	defer stop()
 
 	if err := writeFrame(conn, req); err != nil {
-		return wrapIO(err)
+		return nil, wrapIO(err)
 	}
 	reply, err := readFrame(conn)
 	if err != nil {
-		return wrapIO(err)
+		return nil, wrapIO(err)
 	}
 	return interpretReply(reply)
 }
@@ -169,20 +184,36 @@ func wrapIO(err error) error {
 	return fmt.Errorf("%w: %v", ErrUnavailable, err)
 }
 
-func interpretReply(env envelope) error {
+// interpretReply returns the body of an ack, and an error for every
+// other reply. A reply of another version is an error also when it is an
+// ack: its body can mean something else.
+func interpretReply(env envelope) (json.RawMessage, error) {
 	if env.Version != protocolVersion {
-		return fmt.Errorf("%w: reply version %d", ErrProtocol, env.Version)
+		return nil, fmt.Errorf("%w: reply version %d", ErrProtocol, env.Version)
 	}
 	switch env.Type {
 	case typeAck:
-		return nil
+		return env.Body, nil
 	case typeReject:
 		var b rejectBody
 		if err := json.Unmarshal(env.Body, &b); err != nil {
-			return fmt.Errorf("%w: reject body: %v", ErrProtocol, err)
+			return nil, fmt.Errorf("%w: reject body: %v", ErrProtocol, err)
 		}
-		return fmt.Errorf("%w: %s", ErrRejected, b.Reason)
+		return nil, fmt.Errorf("%w: %s", ErrRejected, b.Reason)
 	default:
-		return fmt.Errorf("%w: reply type %q", ErrProtocol, env.Type)
+		return nil, fmt.Errorf("%w: reply type %q", ErrProtocol, env.Type)
 	}
+}
+
+// decodeAck reads the body of the ack to an observation. An ack without
+// the protected flag is a protocol error, so the caller fails closed.
+func decodeAck(body json.RawMessage) (Ack, error) {
+	var b ackBody
+	if err := json.Unmarshal(body, &b); err != nil {
+		return Ack{}, fmt.Errorf("%w: ack body: %v", ErrProtocol, err)
+	}
+	if b.Protected == nil {
+		return Ack{}, fmt.Errorf("%w: ack without the protected flag", ErrProtocol)
+	}
+	return Ack{Protected: *b.Protected}, nil
 }

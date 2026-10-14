@@ -51,7 +51,7 @@ func worldWithLearned(t *testing.T, dir string) *reconciletest.World {
 		{QName: "example.com", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.1")}, TTL: time.Minute},
 		{QName: "x.ads.example", Addrs: []netip.Addr{netip.MustParseAddr("2001:db8::5")}, TTL: time.Minute},
 	} {
-		if err := rg.d.Observe(context.Background(), o); err != nil {
+		if _, err := rg.d.Observe(context.Background(), o); err != nil {
 			t.Fatalf("first daemon: Observe(%s) = %v", o.QName, err)
 		}
 	}
@@ -98,7 +98,7 @@ func checkRefusedSnapshot(t *testing.T, doc string) {
 	if st := rg.status(); st.State != daemon.StateStarting {
 		t.Fatalf("state = %v, want starting", st.State)
 	}
-	err := rg.d.Observe(context.Background(), ipc.Observation{QName: "example.com", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.9")}})
+	_, err := rg.d.Observe(context.Background(), ipc.Observation{QName: "example.com", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.9")}})
 	if !errors.Is(err, daemon.ErrNotReady) {
 		t.Errorf("Observe = %v, want ErrNotReady", err)
 	}
@@ -220,7 +220,7 @@ func TestV2SnapshotEntriesReachTheTables(t *testing.T) {
 			t.Error("a table for the unconfigured policy gone exists")
 		}
 		rg.checkResolverEntries(true)
-		if err := rg.d.Observe(context.Background(), ipc.Observation{QName: "www.example.net", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.2")}}); err != nil {
+		if _, err := rg.d.Observe(context.Background(), ipc.Observation{QName: "www.example.net", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.2")}}); err != nil {
 			t.Errorf("Observe after a v2 load = %v, want an ack", err)
 		}
 	})

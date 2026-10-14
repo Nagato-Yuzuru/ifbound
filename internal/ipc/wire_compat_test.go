@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -47,9 +48,18 @@ type recordingHandler struct {
 	probes  chan string
 	// deaf makes Observe ignore its ctx and wait for gate only.
 	deaf bool
+	// protected is the flag of each ack.
+	protected bool
 }
 
-func (h *recordingHandler) Observe(ctx context.Context, o ipc.Observation) error {
+func (h *recordingHandler) Observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
+	if err := h.observe(ctx, o); err != nil {
+		return ipc.Ack{}, err
+	}
+	return ipc.Ack{Protected: h.protected}, nil
+}
+
+func (h *recordingHandler) observe(ctx context.Context, o ipc.Observation) error {
 	dl, _ := ctx.Deadline()
 	h.mu.Lock()
 	h.calls = append(h.calls, recordedCall{obs: o, deadline: time.Until(dl)})
@@ -138,14 +148,14 @@ func rawRoundTrip(t *testing.T, path string, payload []byte) map[string]json.Raw
 	return reply
 }
 
-func observeFrame(extra string) []byte {
+func observeFrame(version int, extra string) []byte {
 	body := `{"qname":"www.example.com","addrs":["192.0.2.1","::ffff:198.51.100.7","2001:db8::1"],"ttl_s":300,"timeout_ms":5000` + extra + `}`
-	return []byte(`{"v":2,"type":"observe","body":` + body + `}`)
+	return []byte(`{"v":` + strconv.Itoa(version) + `,"type":"observe","body":` + body + `}`)
 }
 
-// A report with an unknown field, such as the "aliases" that an older
-// plugin sends, is acked and gives the handler the same observation as
-// the report without it.
+// A report of this version with an unknown field, such as the "aliases"
+// that the plugin of version 2 sent, is acked and gives the handler the
+// same observation as the report without it.
 func TestUnknownObserveFieldIsIgnored(t *testing.T) {
 	h := &recordingHandler{}
 	path := serveRecording(t, h)
@@ -170,7 +180,7 @@ func TestUnknownObserveFieldIsIgnored(t *testing.T) {
 			h.mu.Lock()
 			h.calls = nil
 			h.mu.Unlock()
-			reply := rawRoundTrip(t, path, observeFrame(extra))
+			reply := rawRoundTrip(t, path, observeFrame(3, extra))
 			if string(reply["type"]) != `"ack"` {
 				t.Fatalf("reply = %s, want an ack", reply)
 			}
@@ -185,6 +195,49 @@ func TestUnknownObserveFieldIsIgnored(t *testing.T) {
 			}
 			if got.deadline <= 4*time.Second || got.deadline > 5*time.Second {
 				t.Errorf("handler deadline = %v, want the 5 s that the old plugin asked for", got.deadline)
+			}
+		})
+	}
+}
+
+// The plugin of version 2 does not read the protected flag, so it would
+// pass the aliases of a protected name to the client. The daemon refuses
+// its reports, and the reply has version 3, which that plugin refuses
+// too. Both sides fail closed, and the plugin gives SERVFAIL.
+func TestReportOfVersion2IsRefused(t *testing.T) {
+	h := &recordingHandler{protected: true}
+	path := serveRecording(t, h)
+	for name, extra := range map[string]string{
+		"without aliases": ``,
+		"with aliases":    `,"aliases":[{"name":"cdn.example.net","ttl_s":60}]`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			reply := rawRoundTrip(t, path, observeFrame(2, extra))
+			if string(reply["type"]) != `"reject"` || string(reply["v"]) != "3" {
+				t.Errorf("reply = %s, want a reject of version 3", reply)
+			}
+		})
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.calls) != 0 {
+		t.Errorf("handler calls = %d, want 0", len(h.calls))
+	}
+}
+
+// The daemon of version 2 replies to a report of version 3 with a reject
+// of version 2. Report gives a protocol error, never an ack.
+func TestReplyOfVersion2DaemonIsAnError(t *testing.T) {
+	for name, reply := range map[string]string{
+		"reject": `{"v":2,"type":"reject","body":{"reason":"unsupported version 3"}}`,
+		"ack":    `{"v":2,"type":"ack"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := fakeServer(t, func(map[string]json.RawMessage) string { return reply })
+			c := ipc.NewClient(path, uint32(os.Getuid())) //nolint:gosec // a uid fits in uint32
+			ack, err := c.Report(t.Context(), ipc.Observation{QName: "www.example.com."})
+			if !errors.Is(err, ipc.ErrProtocol) || ack.Protected {
+				t.Errorf("Report = %+v, %v; want ErrProtocol", ack, err)
 			}
 		})
 	}
@@ -210,7 +263,7 @@ func TestReportDefaultTimeoutIsTwoSeconds(t *testing.T) {
 	defer close(h.gate)
 	c := ipc.NewClient(path, uint32(os.Getuid())) //nolint:gosec // a uid fits in uint32
 	start := time.Now()
-	err := c.Report(context.Background(), ipc.Observation{QName: "example.com", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.1")}})
+	_, err := c.Report(context.Background(), ipc.Observation{QName: "example.com", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.1")}})
 	elapsed := time.Since(start)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Report = %v, want DeadlineExceeded", err)
@@ -247,7 +300,7 @@ func TestProbeGetsThroughWhileReportSlotsAreFull(t *testing.T) {
 	errs := make(chan error, reports)
 	for range reports {
 		wg.Go(func() {
-			errs <- c.Report(ctx, ipc.Observation{QName: "example.com", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.1")}})
+			errs <- errOf(c.Report(ctx, ipc.Observation{QName: "example.com", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.1")}}))
 		})
 	}
 	for i := range 32 {
@@ -291,17 +344,17 @@ func TestProbeGetsThroughWhileReportSlotsAreFull(t *testing.T) {
 	}
 }
 
-// The observe body that a Client sends has the qname, the addresses, the
-// TTL and the timeout, and no other key.
-func TestReportBodyHasOnlyKnownKeys(t *testing.T) {
+// fakeServer accepts one connection at a new socket, reads one request,
+// and writes the payload that reply returns for its body.
+func fakeServer(t *testing.T, reply func(body map[string]json.RawMessage) string) string {
+	t.Helper()
 	path := shortSocket(t)
 	var lc net.ListenConfig
 	ln, err := lc.Listen(t.Context(), "unix", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = ln.Close() }()
-	got := make(chan map[string]json.RawMessage, 1)
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -320,13 +373,23 @@ func TestReportBodyHasOnlyKnownKeys(t *testing.T) {
 			Body map[string]json.RawMessage `json:"body"`
 		}
 		_ = json.Unmarshal(payload, &env)
-		got <- env.Body
-		ack := []byte(`{"v":2,"type":"ack"}`)
-		frame := binary.BigEndian.AppendUint32(nil, uint32(len(ack))) //nolint:gosec // constant size
-		_, _ = conn.Write(append(frame, ack...))
+		out := []byte(reply(env.Body))
+		frame := binary.BigEndian.AppendUint32(nil, uint32(len(out))) //nolint:gosec // test replies are small
+		_, _ = conn.Write(append(frame, out...))
 	}()
+	return path
+}
+
+// The observe body that a Client sends has the qname, the addresses, the
+// TTL and the timeout, and no other key.
+func TestReportBodyHasOnlyKnownKeys(t *testing.T) {
+	got := make(chan map[string]json.RawMessage, 1)
+	path := fakeServer(t, func(body map[string]json.RawMessage) string {
+		got <- body
+		return `{"v":3,"type":"ack","body":{"protected":false}}`
+	})
 	c := ipc.NewClient(path, uint32(os.Getuid())) //nolint:gosec // a uid fits in uint32
-	if err := c.Report(context.Background(), ipc.Observation{QName: "www.example.com.", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.7")}, TTL: time.Minute}); err != nil {
+	if _, err := c.Report(context.Background(), ipc.Observation{QName: "www.example.com.", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.7")}, TTL: time.Minute}); err != nil {
 		t.Fatalf("Report = %v", err)
 	}
 	body := <-got
@@ -339,3 +402,6 @@ func TestReportBodyHasOnlyKnownKeys(t *testing.T) {
 		t.Errorf("observe body keys = %q, want %q", keys, want)
 	}
 }
+
+// errOf drops the ack of a Report, for a test that checks only the error.
+func errOf(_ ipc.Ack, err error) error { return err }

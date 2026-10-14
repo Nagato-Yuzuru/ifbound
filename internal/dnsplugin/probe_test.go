@@ -38,7 +38,7 @@ func TestProbeIsReportedBeforeTheLocalAnswer(t *testing.T) {
 			rec := dnstest.NewRecorder(&test.ResponseWriter{})
 			var got string
 			var repliedBefore bool
-			h := &handler{next: next, reporter: &recorder{}, timeout: time.Second,
+			h := &handler{key: testKey, next: next, reporter: &recorder{}, timeout: time.Second,
 				probes: proberFunc(func(_ context.Context, q string) error {
 					got, repliedBefore = q, rec.Msg != nil
 					return nil
@@ -64,7 +64,7 @@ func TestProbeIsReportedBeforeTheLocalAnswer(t *testing.T) {
 
 func TestFailedProbeReportStillAnswersLocally(t *testing.T) {
 	next := &countingNext{}
-	h := &handler{next: next, reporter: &recorder{}, timeout: time.Second,
+	h := &handler{key: testKey, next: next, reporter: &recorder{}, timeout: time.Second,
 		probes: proberFunc(func(context.Context, string) error { return ipc.ErrUnavailable })}
 
 	rec, rcode, err := serve(t.Context(), h, ipc.ProbePrefix+"0a1b.cdn.test.")
@@ -79,7 +79,7 @@ func TestFailedProbeReportStillAnswersLocally(t *testing.T) {
 
 func TestProbeReportWaitsAtMostTheTimeout(t *testing.T) {
 	var deadline time.Time
-	h := &handler{next: &countingNext{}, reporter: &recorder{}, timeout: 300 * time.Millisecond,
+	h := &handler{key: testKey, next: &countingNext{}, reporter: &recorder{}, timeout: 300 * time.Millisecond,
 		probes: proberFunc(func(ctx context.Context, _ string) error {
 			deadline, _ = ctx.Deadline()
 			<-ctx.Done()
@@ -127,12 +127,12 @@ func (g *probeGate) ProbeSeen(qname string) {
 	}
 }
 
-func (g *probeGate) Observe(ctx context.Context, o ipc.Observation) error {
+func (g *probeGate) Observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
 	select {
 	case <-g.ch(ipc.ProbePrefix + "x." + o.QName):
-		return nil
+		return ipc.Ack{}, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return ipc.Ack{}, ctx.Err()
 	}
 }
 
@@ -155,7 +155,7 @@ func TestProbesPassWhileEveryReportWaits(t *testing.T) {
 		}
 	})
 	client := ipc.NewClient(path, selfUID())
-	h := &handler{next: writeA(done), reporter: client, probes: client, timeout: 10 * time.Second}
+	h := &handler{key: testKey, next: writeA(done), reporter: client, probes: client, timeout: 10 * time.Second}
 
 	const n = 40 // more than the report slots of the client
 	replies := make(chan int, n)

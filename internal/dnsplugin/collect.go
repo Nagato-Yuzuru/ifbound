@@ -16,25 +16,27 @@ import (
 
 var errBadAddr = errors.New("malformed address")
 
-// observation collects every address in every section of m under qname. A
-// record off the CNAME chain of qname counts too: reporting too much blocks
-// too much, which is safe, but an unreported address would leak.
+// observation collects every address in every section of m under qname.
+// A record off the CNAME chain of qname counts too: reporting too much
+// blocks too much, which is safe, but an unreported address would leak.
+// rrAddrs is the single rule for which records carry an address.
 //
 // The TTL is the smallest TTL of the records that carry the addresses and
-// of the CNAME records that the walk from qname follows (see
-// followedCNAMEs). found is false when m has no address. An address record
-// that the plugin cannot read is an error.
+// of every CNAME record in the answer section: a client can follow any of
+// them. Without an address, Addrs is empty and the TTL is zero. An
+// address record that the plugin cannot read is an error.
 //
-// m must be a message unpacked from wire form. Then every A, AAAA, SVCB, and
-// HTTPS record has its own Go type, and no address hides in a generic or
+// m must be unpacked from wire form. Then every A, AAAA, SVCB, and HTTPS
+// record has its own Go type, and no address hides in a generic or
 // mistyped value.
-func observation(qname string, m *dns.Msg) (o ipc.Observation, found bool, err error) {
+func observation(qname string, m *dns.Msg) (ipc.Observation, error) {
+	o := ipc.Observation{QName: qname}
 	ttl := uint32(math.MaxUint32)
 	for _, section := range [][]dns.RR{m.Answer, m.Ns, m.Extra} {
 		for _, rr := range section {
 			addrs, err := rrAddrs(rr)
 			if err != nil {
-				return ipc.Observation{}, false, fmt.Errorf("%s record of %s: %w",
+				return ipc.Observation{}, fmt.Errorf("%s record of %s: %w",
 					dns.TypeToString[rr.Header().Rrtype], rr.Header().Name, err)
 			}
 			if len(addrs) > 0 {
@@ -44,44 +46,17 @@ func observation(qname string, m *dns.Msg) (o ipc.Observation, found bool, err e
 		}
 	}
 	if len(o.Addrs) == 0 {
-		return ipc.Observation{}, false, nil
+		return o, nil
+	}
+	for _, rr := range m.Answer {
+		if c, ok := rr.(*dns.CNAME); ok {
+			ttl = min(ttl, c.Hdr.Ttl)
+		}
 	}
 	slices.SortFunc(o.Addrs, netip.Addr.Compare)
 	o.Addrs = slices.Compact(o.Addrs)
-	o.QName = qname
-	for _, c := range followedCNAMEs(qname, m.Answer) {
-		ttl = min(ttl, c.Hdr.Ttl)
-	}
 	o.TTL = time.Duration(ttl) * time.Second
-	return o, true, nil
-}
-
-// followedCNAMEs returns every CNAME record in answer that the client can
-// follow from qname. A name can have more than one CNAME record, and the
-// client can follow each of them, so the walk is breadth-first over all
-// of them. Names match without regard to ASCII case. Each name is walked
-// once, so a loop ends.
-func followedCNAMEs(qname string, answer []dns.RR) []*dns.CNAME {
-	byOwner := map[string][]*dns.CNAME{}
-	for _, rr := range answer {
-		if c, ok := rr.(*dns.CNAME); ok {
-			owner := dns.CanonicalName(c.Hdr.Name)
-			byOwner[owner] = append(byOwner[owner], c)
-		}
-	}
-	var followed []*dns.CNAME
-	start := dns.CanonicalName(qname)
-	seen := map[string]bool{start: true}
-	for queue := []string{start}; len(queue) > 0; queue = queue[1:] {
-		for _, c := range byOwner[queue[0]] {
-			followed = append(followed, c)
-			if target := dns.CanonicalName(c.Target); !seen[target] {
-				seen[target] = true
-				queue = append(queue, target)
-			}
-		}
-	}
-	return followed
+	return o, nil
 }
 
 // rrAddrs returns the addresses that rr gives to a client.

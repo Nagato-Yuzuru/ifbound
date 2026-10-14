@@ -49,11 +49,12 @@ var (
 
 // Handler decides what to do with an observation. The server parses and
 // limits the input and does nothing else with it. Addresses are canonical:
-// no zone, and IPv4-mapped IPv6 is unmapped. A nil return becomes an ack. An
-// error becomes a rejection, and the first 256 bytes of its text go to the
-// client. ctx ends when the client deadline passes or the server shuts down.
+// no zone, and IPv4-mapped IPv6 is unmapped. A nil error becomes an ack
+// that carries the Ack. An error becomes a rejection, and the first 256
+// bytes of its text go to the client. ctx ends when the client deadline
+// passes or the server shuts down.
 type Handler interface {
-	Observe(ctx context.Context, o Observation) error
+	Observe(ctx context.Context, o Observation) (Ack, error)
 }
 
 // ProbeHandler receives the probe names that ifbound-dns saw (see
@@ -385,10 +386,11 @@ func (s *Server) observe(ctx context.Context, req envelope) envelope {
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	if err := s.handler.Observe(ctx, obs); err != nil {
+	ack, err := s.handler.Observe(ctx, obs)
+	if err != nil {
 		return rejectEnvelope(err.Error())
 	}
-	return envelopeOf(typeAck, nil)
+	return envelopeOf(typeAck, ackBody{Protected: &ack.Protected})
 }
 
 func (s *Server) probe(req envelope) envelope {

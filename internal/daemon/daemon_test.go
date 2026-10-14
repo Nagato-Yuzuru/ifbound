@@ -573,6 +573,47 @@ func TestForeignRulesetStopsAcksAndConvergesAtOnce(t *testing.T) {
 	})
 }
 
+// A report without an address asks only for the protected flag. Its ack
+// reads nothing from the platform: a foreign ruleset, which a report with
+// an address finds, goes unnoticed, and nothing is written.
+func TestObserveWithoutAddressAsksOnlyForTheFlag(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, configV1)
+		defer h.stop()
+		h.wantState(daemon.StateReady)
+		h.world.ExternalLoad([]byte("pass all\n"))
+		writes := h.world.Writes()
+
+		for name, want := range map[string]bool{"www.example.net": true, "www.example.org": false} {
+			ack, err := h.d.Observe(t.Context(), obs(name))
+			if err != nil || ack.Protected != want {
+				t.Errorf("Observe(%s) without an address = %+v, %v; want Protected %v", name, ack, err, want)
+			}
+		}
+		synctest.Wait()
+		if h.world.Writes() != writes {
+			t.Error("a report without an address wrote to the platform")
+		}
+		if _, err := h.d.Observe(t.Context(), obs("www.example.net", "203.0.113.1")); !errors.Is(err, daemon.ErrUnenforced) {
+			t.Errorf("Observe with an address = %v, want ErrUnenforced: the fixture is broken", err)
+		}
+	})
+}
+
+// A report without an address gets the phase checks.
+func TestObserveWithoutAddressNeedsAnEnforcingPhase(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, configV1)
+		defer h.stop()
+		h.world.SetProblems([]reconcile.Problem{pfDisabled}, nil)
+		heal()
+		h.wantState(daemon.StateUnenforced)
+		if _, err := h.d.Observe(t.Context(), obs("www.example.net")); !errors.Is(err, daemon.ErrUnenforced) {
+			t.Errorf("Observe without an address while unenforced = %v, want ErrUnenforced", err)
+		}
+	})
+}
+
 func TestForeignRulesetIsUnenforcedWhileRepairFails(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		world := reconciletest.NewWorld()
@@ -633,7 +674,7 @@ func TestObserveReturnsContextErrorWhileLoopIsBusy(t *testing.T) {
 
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
-		err := h.d.Observe(ctx, obs("www.example.net", "203.0.113.1"))
+		_, err := h.d.Observe(ctx, obs("www.example.net", "203.0.113.1"))
 
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Observe = %v, want DeadlineExceeded", err)

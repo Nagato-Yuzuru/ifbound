@@ -8,6 +8,13 @@
 // The wire format is a 4-byte big-endian length followed by a JSON envelope.
 // The envelope has a protocol version and a message type. New message types
 // can use the same frame.
+//
+// Each side accepts only its own protocol version. ifbound-dns and ifboundd
+// are released together, so a version mismatch is an install error, and it
+// must fail closed: a plugin that cannot read the ack would not know if the
+// name is protected. Thus a change that a peer of the old version would
+// misread increments the version. Version 3 added the protected flag to
+// the ack of an observation.
 package ipc
 
 import (
@@ -40,7 +47,7 @@ const (
 	// below MaxFrameSize, whatever the peer sent.
 	maxReasonLen = 256
 
-	protocolVersion = 2
+	protocolVersion = 3
 
 	typeObserve = "observe"
 	typeProbe   = "probe"
@@ -74,6 +81,13 @@ type observeBody struct {
 // ProbePrefix.
 type probeBody struct {
 	QName string `json:"qname"`
+}
+
+// ackBody is the body of the ack to an observation. Protected is a
+// pointer so that the client can refuse an ack without the flag: a
+// missing flag must not read as "not protected".
+type ackBody struct {
+	Protected *bool `json:"protected"`
 }
 
 type rejectBody struct {
