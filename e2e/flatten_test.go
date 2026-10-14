@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -95,7 +96,39 @@ func startFlattenStack(t *testing.T) *flattenStack {
 	r := macresolver.New(macresolver.Dir, macresolver.Scutil{})
 	s.apex = writeEntry(t, r, s.plugin)
 	s.out = writeEntry(t, r, s.alias.addr)
+	s.waitRouted(t)
 	return s
+}
+
+// ready is the upstream answer for the names that waitRouted asks. It
+// differs from leaked, so a lookup shows which server answered.
+var ready = netip.MustParseAddr("198.18.0.77")
+
+// waitRouted waits until macOS applies both resolver entries. A test that
+// asks before then gets an error from the default resolver, not from the
+// stack under test. Each attempt uses a new name, because mDNSResponder
+// keeps negative answers.
+func (s *flattenStack) waitRouted(t *testing.T) {
+	t.Helper()
+	routed := func(domain policy.Domain, want netip.Addr) func() (bool, string) {
+		return func() (bool, string) {
+			name := "ifbound-ready-" + nonce(t) + "." + domain.String() + "."
+			s.upstream.set(name + " 30 IN A " + ready.String())
+			addrs, err := syslookup.Resolver{}.Resolve(t.Context(), name)
+			return err == nil && slices.Equal(addrs, []netip.Addr{want}), fmt.Sprintf("%s: %v %v", name, addrs, err)
+		}
+	}
+	waitFor(t, 5*time.Second, routed(s.apex, ready))
+	waitFor(t, 5*time.Second, routed(s.out, leaked))
+	s.upstream.set()
+	// The wait itself queried the alias resolver. Only the queries of the
+	// test may count.
+	s.alias.mu.Lock()
+	s.alias.names = nil
+	s.alias.mu.Unlock()
+	s.mu.Lock()
+	s.reports = nil
+	s.mu.Unlock()
 }
 
 // Observe implements ipc.Handler for the fake ifboundd.
