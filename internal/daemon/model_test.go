@@ -1068,7 +1068,12 @@ func (r *omRun) observe(o omOp) {
 	matched := r.cfg.matches(o.Q)
 	r.mu.Unlock()
 
-	var err error
+	var (
+		err error
+		ack ipc.Ack
+		// flagged is true when ack is the reply to obs.
+		flagged bool
+	)
 	switch o.Kind {
 	case "observeCancelled":
 		if err = r.observeCancelled(obs); errors.Is(err, context.Canceled) {
@@ -1077,10 +1082,14 @@ func (r *omRun) observe(o omOp) {
 	case "observeCancelMidway":
 		err = r.observeCancelMidway(obs)
 	default:
-		err = r.d.Observe(context.Background(), obs)
+		ack, err = r.d.Observe(context.Background(), obs)
+		flagged = true
 	}
 
 	r.mu.Lock()
+	if flagged && err == nil && ack.Protected != (len(matched) > 0) {
+		r.violate("spec: ack of %q has protected=%v, but it matches %d policies", o.Q, ack.Protected, len(matched))
+	}
 	r.checkObserveResultLocked(pre.State, o, len(matched) > 0, armed, err)
 	r.mu.Unlock()
 	if err == nil {
@@ -1097,7 +1106,7 @@ func (r *omRun) observe(o omOp) {
 func (r *omRun) observeCancelled(obs ipc.Observation) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := r.d.Observe(ctx, obs)
+	_, err := r.d.Observe(ctx, obs)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	omStats["pre-cancelled: "+fmt.Sprint(errors.Is(err, context.Canceled))]++
@@ -1117,7 +1126,10 @@ func (r *omRun) observeCancelMidway(obs ipc.Observation) error {
 	r.block, r.entered, r.release = entered, entered, release
 	r.mu.Unlock()
 	res := make(chan error, 1)
-	go func() { res <- r.d.Observe(ctx, obs) }()
+	go func() {
+		_, err := r.d.Observe(ctx, obs)
+		res <- err
+	}()
 	synctest.Wait()
 	taken := false
 	select {

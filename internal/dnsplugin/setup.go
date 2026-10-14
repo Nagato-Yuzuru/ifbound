@@ -3,8 +3,28 @@
 // only after ifboundd acknowledges. Every failure becomes SERVFAIL, so no
 // address reaches an application before the kernel can block it.
 //
-// The plugin does not read policies. It reports every reply that carries an
-// address, and ifboundd decides what matches.
+// The plugin does not read policies. It reports each reply that carries an
+// address or a name that a client follows to another lookup (see
+// followsName), and ifboundd decides what matches. The ack tells the
+// plugin if the name is protected: it matches a policy. A reply with
+// neither goes out without a report.
+//
+// macOS sends the queries for a protected name to ifbound-dns through the
+// resolver entry of its domain. A reply can name an alias outside that
+// domain: a CNAME target, or the TargetName of an HTTPS or SVCB record.
+// The client caches the alias records apart and later asks for the alias
+// by its own name, which goes to the default resolver and not to
+// ifbound-dns. Its addresses would then reach the application unblocked.
+// So the plugin flattens the reply to a protected name (see flatten): the
+// CNAME chain goes away, an HTTPS TargetName outside the name becomes a
+// synthetic name below the protected name (see synth.go), and an SVCB
+// record with such a target goes away. The query for the synthetic name
+// comes to ifbound-dns, and the plugin resolves the target and reports its
+// addresses under the protected name.
+//
+// Known gap: the target names of SRV, MX, NS, NAPTR, and other records
+// that name another host stay in the reply. The client looks them up by
+// their own names.
 package dnsplugin
 
 import (
@@ -96,13 +116,28 @@ func withDirective(dirs []string) ([]string, error) {
 	return slices.Insert(slices.Clone(dirs), i, name), nil
 }
 
-// clients holds the shared ipc.Client for each socket path. The zero value
-// is ready to use and trusts a server that runs as uid 0.
+// clients holds the shared ipc.Client for each socket path, and the key
+// of the synthetic names. The zero value is ready to use and trusts a
+// server that runs as uid 0.
+//
+// The key is new for each process, and all server blocks and reloads
+// share it: a synthetic name that one handler made is valid in each
+// handler of the process.
 type clients struct {
 	serverUID uint32
 
 	mu     sync.Mutex
 	byPath map[string]*ipc.Client
+	key    *tagKey
+}
+
+func (cs *clients) tagKey() *tagKey {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if cs.key == nil {
+		cs.key = newTagKey()
+	}
+	return cs.key
 }
 
 func (cs *clients) get(path string) *ipc.Client {
@@ -126,8 +161,9 @@ func (cs *clients) setup(c *caddy.Controller) error {
 		return plugin.Error(name, err)
 	}
 	rep := cs.get(d.socket)
+	key := cs.tagKey()
 	dnsserver.GetConfig(c).AddPlugin(func(next plugin.Handler) plugin.Handler {
-		return &handler{next: next, reporter: rep, probes: rep, timeout: d.timeout}
+		return &handler{next: next, reporter: rep, probes: rep, timeout: d.timeout, key: key}
 	})
 	return nil
 }

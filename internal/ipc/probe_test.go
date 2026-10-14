@@ -42,12 +42,12 @@ func (b *probeBoard) ProbeSeen(qname string) {
 	}
 }
 
-func (b *probeBoard) Observe(ctx context.Context, o Observation) error {
+func (b *probeBoard) Observe(ctx context.Context, o Observation) (Ack, error) {
 	select {
 	case <-b.ch(ProbePrefix + "x." + o.QName):
-		return nil
+		return Ack{}, nil
 	case <-ctx.Done():
-		return ctx.Err()
+		return Ack{}, ctx.Err()
 	}
 }
 
@@ -79,7 +79,7 @@ func TestProbesPassWhileEveryReportSlotWaits(t *testing.T) {
 
 	reports := make(chan error, maxInFlight)
 	for i := range maxInFlight {
-		go func() { reports <- c.Report(ctx, Observation{QName: fmt.Sprintf("r%d.test", i)}) }()
+		go func() { reports <- errOf(c.Report(ctx, Observation{QName: fmt.Sprintf("r%d.test", i)})) }()
 	}
 	for len(c.inflight) < maxInFlight {
 		time.Sleep(time.Millisecond) // waits for the slots to fill; no other signal exists

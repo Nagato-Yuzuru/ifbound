@@ -280,7 +280,7 @@ func (rg *rig) checkObserve(r *rand.Rand) (rechecked bool) {
 	tablesBefore := rg.world.Tables()
 	snapBefore, _ := os.ReadFile(rg.snap)
 	start := time.Now()
-	err := rg.d.Observe(context.Background(), o)
+	_, err := rg.d.Observe(context.Background(), o)
 	if waited := time.Since(start); waited != 0 {
 		rg.fatalf("Observe(%q) waited %v; a report must never wait", o.QName, waited)
 	}
@@ -302,7 +302,9 @@ func (rg *rig) checkObserve(r *rand.Rand) (rechecked bool) {
 		if !errors.Is(err, daemon.ErrUnenforced) {
 			rg.fatalf("in unenforced: err = %v, want ErrUnenforced", err)
 		}
-	case len(want) == 0:
+	case len(want) == 0, len(o.Addrs) == 0:
+		// A report without an address only asks for the protected flag,
+		// so its ack promises nothing about the platform.
 		rg.checkUnmatched(err, st.State, tablesBefore, snapBefore)
 	case err != nil:
 		if rg.f.healthy() {
@@ -315,8 +317,9 @@ func (rg *rig) checkObserve(r *rand.Rand) (rechecked bool) {
 	return false
 }
 
-// checkUnmatched pins today's behavior: an unmatched name is acked in
-// ready and degraded, and changes no table and no snapshot.
+// checkUnmatched pins today's behavior: an unmatched name, and a report
+// without an address, is acked in ready and degraded, and changes no
+// table and no snapshot.
 func (rg *rig) checkUnmatched(err error, state daemon.State, tablesBefore map[policy.Name][]netip.Prefix, snapBefore []byte) {
 	rg.t.Helper()
 	if err != nil {

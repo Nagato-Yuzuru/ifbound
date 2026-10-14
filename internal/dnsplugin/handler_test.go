@@ -20,20 +20,33 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 )
 
+// testKey is the tag key of the handlers in the tests.
+var testKey = newTagKey()
+
+// reporterFunc is a reporter whose acks say "not protected".
 type reporterFunc func(ctx context.Context, o ipc.Observation) error
 
-func (f reporterFunc) Report(ctx context.Context, o ipc.Observation) error { return f(ctx, o) }
-
-// recorder is a reporter that acks and keeps every observation.
-type recorder struct {
-	calls atomic.Int32
-	last  atomic.Pointer[ipc.Observation]
+func (f reporterFunc) Report(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
+	return ipc.Ack{}, f(ctx, o)
 }
 
-func (r *recorder) Report(_ context.Context, o ipc.Observation) error {
+// ackFunc is a reporter with the ack of a function.
+type ackFunc func(ctx context.Context, o ipc.Observation) (ipc.Ack, error)
+
+func (f ackFunc) Report(ctx context.Context, o ipc.Observation) (ipc.Ack, error) { return f(ctx, o) }
+
+// recorder is a reporter that acks and keeps every observation. Its acks
+// carry protected.
+type recorder struct {
+	protected bool
+	calls     atomic.Int32
+	last      atomic.Pointer[ipc.Observation]
+}
+
+func (r *recorder) Report(_ context.Context, o ipc.Observation) (ipc.Ack, error) {
 	r.calls.Add(1)
 	r.last.Store(&o)
-	return nil
+	return ipc.Ack{Protected: r.protected}, nil
 }
 
 // rr parses a record in zone file form. A test fixture that does not parse
@@ -47,6 +60,7 @@ func rr(s string) dns.RR {
 }
 
 // upstream is a fake next plugin. It writes one reply and returns rcode.
+// It gives the same records for each question. sent is its first reply.
 type upstream struct {
 	rcode             int
 	tc                bool
@@ -58,7 +72,9 @@ func (u *upstream) ServeDNS(_ context.Context, w dns.ResponseWriter, r *dns.Msg)
 	m := new(dns.Msg).SetRcode(r, u.rcode)
 	m.Truncated = u.tc
 	m.Answer, m.Ns, m.Extra = u.answer, u.ns, u.extra
-	u.sent = m.Copy()
+	if u.sent == nil {
+		u.sent = m.Copy()
+	}
 	if err := w.WriteMsg(m); err != nil {
 		return dns.RcodeServerFailure, err
 	}
@@ -273,7 +289,7 @@ func TestServeDNSReportsEveryAddressBeforeTheReply(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var rep recorder
-			h := &handler{next: &tt.up, reporter: &rep, timeout: time.Second}
+			h := &handler{key: testKey, next: &tt.up, reporter: &rep, timeout: time.Second}
 			rec, rcode, err := serve(t.Context(), h, tt.qname)
 			if err != nil || rcode != dns.RcodeSuccess {
 				t.Fatalf("ServeDNS = %d, %v; want success", rcode, err)
@@ -349,29 +365,37 @@ func hints(kvs []dns.SVCBKeyValue) []net.IP {
 	return out
 }
 
+// A reply without an address goes out unchanged when the name is not
+// protected. A reply that flattening does not change needs no report. A
+// reply with an alias needs a report without an address, because only the
+// ack tells if the alias must go.
 func TestServeDNSPassesThroughWithoutAddress(t *testing.T) {
 	soa := rr("example.org. 300 IN SOA ns.example.org. host.example.org. 1 7200 3600 1209600 300")
 	tests := []struct {
-		name string
-		up   upstream
+		name    string
+		up      upstream
+		reports int32
 	}{
 		{name: "NXDOMAIN", up: upstream{rcode: dns.RcodeNameError, ns: []dns.RR{soa}}},
 		{name: "NODATA", up: upstream{ns: []dns.RR{soa}}},
 		{name: "CNAME without address", up: upstream{
 			answer: []dns.RR{rr("example.org. 300 IN CNAME a.example.net.")},
 			ns:     []dns.RR{soa},
-		}},
+		}, reports: 1},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var rep recorder
-			h := &handler{next: &tt.up, reporter: &rep, timeout: time.Second}
+			h := &handler{key: testKey, next: &tt.up, reporter: &rep, timeout: time.Second}
 			rec, rcode, err := serve(t.Context(), h, "example.org.")
 			if err != nil || rcode != tt.up.rcode {
 				t.Fatalf("ServeDNS = %d, %v; want %d, nil", rcode, err, tt.up.rcode)
 			}
-			if n := rep.calls.Load(); n != 0 {
-				t.Errorf("reports = %d, want 0", n)
+			if n := rep.calls.Load(); n != tt.reports {
+				t.Errorf("reports = %d, want %d", n, tt.reports)
+			}
+			if o := rep.last.Load(); o != nil && len(o.Addrs) != 0 {
+				t.Errorf("report has addresses %v, want none", o.Addrs)
 			}
 			if rec.Msg == nil || rec.Msg.String() != tt.up.sent.String() {
 				t.Errorf("client got\n%v\nwant\n%v", rec.Msg, tt.up.sent)
@@ -386,7 +410,7 @@ func TestServeDNSPassesThroughUpstreamError(t *testing.T) {
 		return dns.RcodeServerFailure, errUpstream
 	})
 	var rep recorder
-	h := &handler{next: next, reporter: &rep, timeout: time.Second}
+	h := &handler{key: testKey, next: next, reporter: &rep, timeout: time.Second}
 	rec, rcode, err := serve(t.Context(), h, "example.org.")
 	if rcode != dns.RcodeServerFailure || !errors.Is(err, errUpstream) {
 		t.Errorf("ServeDNS = %d, %v; want SERVFAIL, %v", rcode, err, errUpstream)
@@ -516,9 +540,10 @@ func TestServeDNSFailsClosed(t *testing.T) {
 			var calls atomic.Int32
 			rep := reporterFunc(func(ctx context.Context, o ipc.Observation) error {
 				calls.Add(1)
-				return tt.reporter.Report(ctx, o)
+				_, err := tt.reporter.Report(ctx, o)
+				return err
 			})
-			h := &handler{next: tt.next, reporter: rep, timeout: 20 * time.Millisecond}
+			h := &handler{key: testKey, next: tt.next, reporter: rep, timeout: 20 * time.Millisecond}
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
 			if tt.cancel {
@@ -555,7 +580,7 @@ func TestServeDNSDropsWriteAfterFailedReport(t *testing.T) {
 		close(failed)
 		return ipc.ErrRejected
 	})
-	h := &handler{next: next, reporter: rep, timeout: time.Second}
+	h := &handler{key: testKey, next: next, reporter: rep, timeout: time.Second}
 	rec, rcode, _ := serve(t.Context(), h, "example.org.")
 	if err := <-late; !errors.Is(err, errLateWrite) {
 		t.Errorf("late write error = %v, want %v", err, errLateWrite)
@@ -583,7 +608,7 @@ func TestReportDeadline(t *testing.T) {
 					got, _ = ctx.Deadline()
 					return nil
 				})
-				h := &handler{next: writeA(done), reporter: rep, timeout: 2 * time.Second}
+				h := &handler{key: testKey, next: writeA(done), reporter: rep, timeout: 2 * time.Second}
 				ctx := t.Context()
 				if tt.requestTTL > 0 {
 					var cancel context.CancelFunc
@@ -635,7 +660,7 @@ func TestServeDNSSendsTheSnapshotItReported(t *testing.T) {
 				<-changed
 				return nil
 			})
-			h := &handler{next: next, reporter: rep, timeout: time.Second}
+			h := &handler{key: testKey, next: next, reporter: rep, timeout: time.Second}
 			rec, rcode, err := serve(t.Context(), h, "example.org.")
 			if err != nil || rcode != dns.RcodeSuccess {
 				t.Fatalf("ServeDNS = %d, %v; want success", rcode, err)
@@ -683,7 +708,7 @@ func TestServeDNSWrittenReplyWithServfailRcodeGoesOutOnce(t *testing.T) {
 				return dns.RcodeServerFailure, errNext
 			})
 			var rep recorder
-			h := &handler{next: next, reporter: &rep, timeout: time.Second}
+			h := &handler{key: testKey, next: next, reporter: &rep, timeout: time.Second}
 			cw := &countingWriter{}
 			rcode, err := h.ServeDNS(t.Context(), cw, new(dns.Msg).SetQuestion("example.org.", dns.TypeA))
 			if !plugin.ClientWrite(rcode) || !errors.Is(err, errNext) {
@@ -709,7 +734,7 @@ func TestServeDNSReportsTheRequestQName(t *testing.T) {
 		return dns.RcodeSuccess, w.WriteMsg(m)
 	})
 	var rep recorder
-	h := &handler{next: next, reporter: &rep, timeout: time.Second}
+	h := &handler{key: testKey, next: next, reporter: &rep, timeout: time.Second}
 	if _, rcode, err := serve(t.Context(), h, "example.org."); rcode != dns.RcodeSuccess || err != nil {
 		t.Fatalf("ServeDNS = %d, %v", rcode, err)
 	}

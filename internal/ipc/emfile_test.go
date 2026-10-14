@@ -144,7 +144,7 @@ func TestAcceptSurvivesRealEMFILE(t *testing.T) {
 
 	c := NewClient(path, self())
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
-	if err := c.Report(ctx, Observation{QName: "a.test."}); err == nil {
+	if _, err := c.Report(ctx, Observation{QName: "a.test."}); err == nil {
 		t.Fatal("Report acked while the server had no free descriptor: the pressure is not real")
 	}
 	cancel()
@@ -152,7 +152,7 @@ func TestAcceptSurvivesRealEMFILE(t *testing.T) {
 
 	_, _ = io.WriteString(stdin, "RELEASE\n")
 	m.waitFor(t, "RELEASED")
-	if err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Errorf("Report after the pressure ended: %v", err)
 	}
 	_, _ = io.WriteString(stdin, "QUIT\n")

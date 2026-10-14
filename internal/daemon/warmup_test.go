@@ -83,7 +83,7 @@ func (n *warmNet) Resolve(ctx context.Context, name string) ([]netip.Addr, error
 	addrs := n.answers[name]
 	if routed && len(addrs) > 0 {
 		o := ipc.Observation{QName: name, Addrs: addrs, TTL: time.Minute}
-		err := n.d.Observe(ctx, o)
+		_, err := n.d.Observe(ctx, o)
 		n.mu.Lock()
 		n.reports[name] = err
 		n.mu.Unlock()
@@ -740,7 +740,7 @@ func TestSlowWarmUpLookupDelaysNoReport(t *testing.T) {
 		t0 := time.Now()
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
-		if err := h.d.Observe(ctx, obs("fast.example", "203.0.113.7")); err != nil {
+		if _, err := h.d.Observe(ctx, obs("fast.example", "203.0.113.7")); err != nil {
 			t.Fatalf("Observe = %v, want the ack", err)
 		}
 		if _, err := h.d.Status(ctx); err != nil {
@@ -773,7 +773,7 @@ func TestHeldLookupsOfAStoppedWarmUpDelayNoReport(t *testing.T) {
 		if err := h.d.Reconfigure(ctx, warmConfig(t, "new.example")); err != nil {
 			t.Fatalf("Reconfigure = %v", err)
 		}
-		if err := h.d.Observe(ctx, obs("new.example", "203.0.113.8")); err != nil {
+		if _, err := h.d.Observe(ctx, obs("new.example", "203.0.113.8")); err != nil {
 			t.Fatalf("Observe = %v, want the ack", err)
 		}
 		if _, err := h.d.Status(ctx); err != nil {

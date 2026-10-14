@@ -156,7 +156,8 @@ func (h *harness) wantState(want daemon.State) daemon.Status {
 }
 
 func (h *harness) observe(o ipc.Observation) error {
-	return h.d.Observe(h.t.Context(), o)
+	_, err := h.d.Observe(h.t.Context(), o)
+	return err
 }
 
 func (h *harness) hasEntry(table policy.Name, p netip.Prefix) bool {

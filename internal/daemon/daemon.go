@@ -198,22 +198,28 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 }
 
-// Observe implements ipc.Handler. It returns nil, the acknowledgement,
-// only when every address is in the table of each matching policy, in
-// the saved snapshot, and the installed ruleset is still loaded. A name
-// that matches no policy is acknowledged and not stored. It returns
-// ErrNotReady in StateStarting, ErrUnenforced when enforcement is not
-// installed, an error that wraps matcher.ErrMalformedName for a name that
-// cannot be classified, and the platform error otherwise. See call for
-// ctx.Err() and ErrStopped.
-func (d *Daemon) Observe(ctx context.Context, o ipc.Observation) error {
-	err, cerr := call(ctx, d, func(ctx context.Context, l *loop) error {
-		return l.observe(ctx, o)
+// Observe implements ipc.Handler. It returns a nil error, the
+// acknowledgement, only when every address is in the table of each
+// matching policy, in the saved snapshot, and the installed ruleset is
+// still loaded. The ack is protected when the name matches at least one
+// policy. A name that matches no policy is acknowledged as not protected
+// and not stored. It returns ErrNotReady in StateStarting, ErrUnenforced
+// when enforcement is not installed, an error that wraps
+// matcher.ErrMalformedName for a name that cannot be classified, and the
+// platform error otherwise. See call for ctx.Err() and ErrStopped.
+func (d *Daemon) Observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
+	type result struct {
+		ack ipc.Ack
+		err error
+	}
+	r, cerr := call(ctx, d, func(ctx context.Context, l *loop) result {
+		ack, err := l.observe(ctx, o)
+		return result{ack, err}
 	})
 	if cerr != nil {
-		return cerr
+		return ipc.Ack{}, cerr
 	}
-	return err
+	return r.ack, r.err
 }
 
 // Reconfigure replaces the configuration and converges. The new

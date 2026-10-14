@@ -149,7 +149,7 @@ func serveOnce(t testing.TB, qname string, up *upstream, report func(context.Con
 		}
 		return report(ctx, o)
 	})
-	h := &handler{next: up, reporter: rep, timeout: 2 * time.Second}
+	h := &handler{key: testKey, next: up, reporter: rep, timeout: 2 * time.Second}
 	rec, rcode, err := serve(context.Background(), h, qname)
 	out.rcode, out.err, out.reply = rcode, err, rec.Msg
 	return out
@@ -171,8 +171,10 @@ func checkOutcome(t testing.TB, qname string, sent *dns.Msg, got outcome) []stri
 		fail("client got\n%v\nwant\n%v", a, b)
 	}
 	if len(wantAddrs) == 0 {
-		if got.calls != 0 {
-			fail("%d reports for a reply without an address, want 0", got.calls)
+		// A report can still ask whether to flatten the reply, but it
+		// carries no address of the unprotected reply.
+		if got.calls > 1 || got.calls == 1 && len(got.obs.Addrs) != 0 {
+			fail("%d reports with %v for a reply without an address, want at most 1 without an address", got.calls, got.obs.Addrs)
 		}
 		return bad
 	}
@@ -403,6 +405,88 @@ func (g *replyGen) upstream() *upstream {
 	return up
 }
 
+// serveProtected asks qname with acks that say protected. It returns the
+// reply, or nil, and the addresses of all reports before the reply.
+func serveProtected(t testing.TB, qname string, up *upstream) (*dns.Msg, map[netip.Addr]bool) {
+	t.Helper()
+	reported := map[netip.Addr]bool{}
+	rep := ackFunc(func(_ context.Context, o ipc.Observation) (ipc.Ack, error) {
+		for _, a := range o.Addrs {
+			reported[a.Unmap()] = true
+		}
+		return ipc.Ack{Protected: true}, nil
+	})
+	h := &handler{key: testKey, next: up, reporter: rep, timeout: 2 * time.Second}
+	rec, _, _ := serve(context.Background(), h, qname) // a SERVFAIL writes nothing
+	return rec.Msg, reported
+}
+
+// The same random replies to a protected name: the client gets SERVFAIL,
+// or a reply whose addresses were all reported. A reply names nothing
+// outside the qname, unless it goes out unchanged without an address and
+// without a name that a client follows: such a reply needs no report.
+func TestServeDNSProtectedRandomReplies(t *testing.T) {
+	const iterations = 4000
+	var failures, replies int
+	for seed := range uint64(iterations) {
+		r := rand.New(rand.NewPCG(seed, 116))
+		g := newReplyGen(t, r)
+		up := g.upstream()
+		reply, reported := serveProtected(t, g.qname, up)
+		if reply == nil {
+			continue
+		}
+		replies++
+		bad := safetyViolations(t, reply, reported)
+		var outside []string
+		for _, n := range namesOutside(g.qname, reply) {
+			outside = append(outside, "names "+n)
+		}
+		// An unchanged reply is fine without any name outside, or when it
+		// needed no report.
+		unchanged := decodeAs(t, reply, false).String() == decodeAs(t, up.sent, false).String()
+		if pass := passThroughViolations(t, reply); len(outside) > 0 && (!unchanged || len(pass) > 0) {
+			bad = append(append(bad, outside...), pass...)
+		}
+		if len(bad) > 0 {
+			failures++
+			if failures <= 10 {
+				t.Errorf("seed %d qname %q:\n  %s\nreply:\n%v", seed, g.qname, strings.Join(bad, "\n  "), reply)
+			}
+		}
+	}
+	if replies < iterations/4 {
+		t.Errorf("only %d of %d protected queries got a reply", replies, iterations)
+	}
+}
+
+// passThroughViolations returns why m needs flattening: an address, or a
+// name that a client follows to another lookup.
+func passThroughViolations(t testing.TB, m *dns.Msg) []string {
+	t.Helper()
+	var bad []string
+	if as, _ := clientAddrs(t, m); len(as) > 0 {
+		bad = append(bad, fmt.Sprintf("unchanged reply has addresses %v", as))
+	}
+	for _, sec := range [][]dns.RR{m.Answer, m.Ns, m.Extra} {
+		for _, r := range sec {
+			target := ""
+			switch v := r.(type) {
+			case *dns.CNAME, *dns.DNAME:
+				bad = append(bad, fmt.Sprintf("unchanged reply has the alias %v", r))
+			case *dns.HTTPS:
+				target = v.Target
+			case *dns.SVCB:
+				target = v.Target
+			}
+			if target != "" && target != "." && nameKey(t, target) != nameKey(t, r.Header().Name) {
+				bad = append(bad, fmt.Sprintf("unchanged reply has the target of %v", r))
+			}
+		}
+	}
+	return bad
+}
+
 func TestServeDNSAddressesOnRandomReplies(t *testing.T) {
 	const iterations = 4000
 	var failures, withAddrs, viaCNAME int
@@ -455,7 +539,10 @@ func TestRandomReportsReachIfboundd(t *testing.T) {
 		mu.Lock()
 		seen = nil
 		mu.Unlock()
-		got := serveOnce(t, g.qname, up, client.Report)
+		got := serveOnce(t, g.qname, up, func(ctx context.Context, o ipc.Observation) error {
+			_, err := client.Report(ctx, o)
+			return err
+		})
 		if bad := checkOutcome(t, g.qname, up.sent, got); len(bad) > 0 {
 			t.Errorf("seed %d: %s", seed, strings.Join(bad, "; "))
 			continue

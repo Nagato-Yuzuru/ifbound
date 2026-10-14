@@ -23,7 +23,9 @@ import (
 
 type handlerFunc func(ctx context.Context, o Observation) error
 
-func (f handlerFunc) Observe(ctx context.Context, o Observation) error { return f(ctx, o) }
+func (f handlerFunc) Observe(ctx context.Context, o Observation) (Ack, error) {
+	return Ack{}, f(ctx, o)
+}
 
 var errNo = errors.New("no such policy")
 
@@ -82,7 +84,7 @@ func TestRoundTrip(t *testing.T) {
 		Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")},
 		TTL:   30 * time.Second,
 	}
-	if err := c.Report(t.Context(), want); err != nil {
+	if _, err := c.Report(t.Context(), want); err != nil {
 		t.Fatal(err)
 	}
 	if got.QName != want.QName || got.TTL != want.TTL || len(got.Addrs) != 2 ||
@@ -95,6 +97,41 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if mode := fi.Mode().Perm(); mode != 0o660 {
 		t.Errorf("socket mode = %o, want 660", mode)
+	}
+}
+
+type ackFunc func(ctx context.Context, o Observation) (Ack, error)
+
+func (f ackFunc) Observe(ctx context.Context, o Observation) (Ack, error) { return f(ctx, o) }
+
+// The ack gives the client the protected flag of the handler, true and
+// false, and the wire form always spells the flag out.
+func TestAckCarriesTheProtectedFlag(t *testing.T) {
+	for _, protected := range []bool{false, true} {
+		t.Run(fmt.Sprint(protected), func(t *testing.T) {
+			c, path := start(t, ackFunc(func(context.Context, Observation) (Ack, error) {
+				return Ack{Protected: protected}, nil
+			}))
+			got, err := c.Report(t.Context(), Observation{QName: "a.test."})
+			if err != nil || got.Protected != protected {
+				t.Fatalf("Report = %+v, %v; want Protected %v", got, err, protected)
+			}
+			env, _ := rawExchange(t, path, frameOf(observePayload("3")))
+			if want := fmt.Sprintf(`{"protected":%v}`, protected); env.Type != typeAck || string(env.Body) != want {
+				t.Errorf("ack = %s %s, want body %s", env.Type, env.Body, want)
+			}
+		})
+	}
+}
+
+// A rejection carries no flag, so the client gets no ack and no flag.
+func TestRejectionHasNoProtectedFlag(t *testing.T) {
+	c, _ := start(t, ackFunc(func(context.Context, Observation) (Ack, error) {
+		return Ack{Protected: true}, errNo
+	}))
+	got, err := c.Report(t.Context(), Observation{QName: "a.test."})
+	if !errors.Is(err, ErrRejected) || got.Protected {
+		t.Errorf("Report = %+v, %v; want ErrRejected and no flag", got, err)
 	}
 }
 
@@ -112,6 +149,7 @@ func TestServerRejectsBadVersions(t *testing.T) {
 	}))
 	tests := map[string]string{
 		"version 1":         observePayload("1"),
+		"version 2":         observePayload("2"),
 		"version 0":         observePayload("0"),
 		"negative version":  observePayload("-2"),
 		"version as string": observePayload(`"2"`),
@@ -133,7 +171,7 @@ func TestServerRejectsBadVersions(t *testing.T) {
 
 func TestRejection(t *testing.T) {
 	c, _ := start(t, handlerFunc(func(context.Context, Observation) error { return errNo }))
-	err := c.Report(t.Context(), Observation{QName: "a.test."})
+	_, err := c.Report(t.Context(), Observation{QName: "a.test."})
 	if !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), errNo.Error()) {
 		t.Errorf("err = %v, want ErrRejected with the reason", err)
 	}
@@ -149,7 +187,7 @@ func TestTimeout(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
-	err := c.Report(ctx, Observation{QName: "slow.test."})
+	_, err := c.Report(ctx, Observation{QName: "slow.test."})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, want DeadlineExceeded", err)
 	}
@@ -166,7 +204,7 @@ func TestHandlerContextCarriesClientDeadline(t *testing.T) {
 	}))
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	if err := c.Report(ctx, Observation{QName: "a.test."}); err != nil {
+	if _, err := c.Report(ctx, Observation{QName: "a.test."}); err != nil {
 		t.Fatal(err)
 	}
 	got := time.Duration(remaining.Load())
@@ -187,7 +225,7 @@ func TestInvalidObservationsAreRejectedBeforeHandler(t *testing.T) {
 	}
 	for name, o := range tests {
 		t.Run(name, func(t *testing.T) {
-			if err := c.Report(t.Context(), o); !errors.Is(err, ErrRejected) {
+			if _, err := c.Report(t.Context(), o); !errors.Is(err, ErrRejected) {
 				t.Errorf("err = %v, want ErrRejected", err)
 			}
 		})
@@ -197,7 +235,7 @@ func TestInvalidObservationsAreRejectedBeforeHandler(t *testing.T) {
 		"escaped non-ASCII, 258 chars": strings.Repeat(`\195\175`, 31) + ".bing.com.",
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := c.Report(t.Context(), Observation{QName: q}); err != nil {
+			if _, err := c.Report(t.Context(), Observation{QName: q}); err != nil {
 				t.Error(err)
 			}
 		})
@@ -261,14 +299,15 @@ func TestMalformedFrame(t *testing.T) {
 func TestUnknownTypeAndVersion(t *testing.T) {
 	_, path := start(t, handlerFunc(ack))
 	tests := map[string]string{
-		"unknown type":    `{"v":2,"type":"bogus"}`,
+		"unknown type":    `{"v":3,"type":"bogus"}`,
 		"old version":     `{"v":1,"type":"observe","body":{"qname":"a.test.","timeout_ms":1000}}`,
-		"unknown version": `{"v":3,"type":"observe","body":{"qname":"a.test.","timeout_ms":1000}}`,
-		"bad address":     `{"v":2,"type":"observe","body":{"qname":"a.test.","addrs":["nope"],"timeout_ms":1000}}`,
-		"missing body":    `{"v":2,"type":"observe"}`,
-		"zero timeout":    `{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":0}}`,
-		"huge timeout":    `{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":9223372036854775807}}`,
-		"zoned address":   `{"v":2,"type":"observe","body":{"qname":"a.test.","addrs":["fe80::1%en0"],"timeout_ms":1000}}`,
+		"version 2":       `{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":1000}}`,
+		"unknown version": `{"v":4,"type":"observe","body":{"qname":"a.test.","timeout_ms":1000}}`,
+		"bad address":     `{"v":3,"type":"observe","body":{"qname":"a.test.","addrs":["nope"],"timeout_ms":1000}}`,
+		"missing body":    `{"v":3,"type":"observe"}`,
+		"zero timeout":    `{"v":3,"type":"observe","body":{"qname":"a.test.","timeout_ms":0}}`,
+		"huge timeout":    `{"v":3,"type":"observe","body":{"qname":"a.test.","timeout_ms":9223372036854775807}}`,
+		"zoned address":   `{"v":3,"type":"observe","body":{"qname":"a.test.","addrs":["fe80::1%en0"],"timeout_ms":1000}}`,
 	}
 	for name, payload := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -286,20 +325,30 @@ func TestClientRejectsBadReplies(t *testing.T) {
 		reply []byte
 		want  error
 	}{
-		{"unknown type", frameOf(`{"v":2,"type":"bogus"}`), ErrProtocol},
+		{"unknown type", frameOf(`{"v":3,"type":"bogus"}`), ErrProtocol},
 		{"bad version", frameOf(`{"v":9,"type":"ack"}`), ErrProtocol},
 		{"no version", frameOf(`{"type":"ack"}`), ErrProtocol},
-		{"version as string", frameOf(`{"v":"2","type":"ack"}`), ErrProtocol},
-		{"no type", frameOf(`{"v":2}`), ErrProtocol},
-		{"upper case type", frameOf(`{"v":2,"type":"ACK"}`), ErrProtocol},
-		{"type with space", frameOf(`{"v":2,"type":"ack "}`), ErrProtocol},
-		{"echoed request type", frameOf(`{"v":2,"type":"observe"}`), ErrProtocol},
+		{"version as string", frameOf(`{"v":"3","type":"ack"}`), ErrProtocol},
+		// A daemon of version 2 sends an ack without the protected flag.
+		{"version 2 ack", frameOf(`{"v":2,"type":"ack"}`), ErrProtocol},
+		{"version 2 ack with a flag", frameOf(`{"v":2,"type":"ack","body":{"protected":true}}`), ErrProtocol},
+		{"version 2 reject", frameOf(`{"v":2,"type":"reject","body":{"reason":"unsupported version 3"}}`), ErrProtocol},
+		{"ack without body", frameOf(`{"v":3,"type":"ack"}`), ErrProtocol},
+		{"ack without the flag", frameOf(`{"v":3,"type":"ack","body":{}}`), ErrProtocol},
+		{"null flag", frameOf(`{"v":3,"type":"ack","body":{"protected":null}}`), ErrProtocol},
+		{"flag as string", frameOf(`{"v":3,"type":"ack","body":{"protected":"true"}}`), ErrProtocol},
+		{"flag as number", frameOf(`{"v":3,"type":"ack","body":{"protected":1}}`), ErrProtocol},
+		{"body as array", frameOf(`{"v":3,"type":"ack","body":[true]}`), ErrProtocol},
+		{"no type", frameOf(`{"v":3}`), ErrProtocol},
+		{"upper case type", frameOf(`{"v":3,"type":"ACK"}`), ErrProtocol},
+		{"type with space", frameOf(`{"v":3,"type":"ack "}`), ErrProtocol},
+		{"echoed request type", frameOf(`{"v":3,"type":"observe"}`), ErrProtocol},
 		{"empty object", frameOf(`{}`), ErrProtocol},
 		{"null", frameOf(`null`), ErrProtocol},
 		{"array", frameOf(`[1,"ack"]`), ErrProtocol},
 		{"not json", frameOf(`xx`), ErrProtocol},
 		{"empty frame", frameOf(``), ErrProtocol},
-		{"bad reject body", frameOf(`{"v":2,"type":"reject","body":5}`), ErrProtocol},
+		{"bad reject body", frameOf(`{"v":3,"type":"reject","body":5}`), ErrProtocol},
 		{"oversize header", binary.BigEndian.AppendUint32(nil, MaxFrameSize+1), ErrFrameTooLarge},
 		{"half header", []byte{0, 0}, ErrUnavailable},
 		{"short body", []byte{0, 0, 0, 30, '{'}, ErrUnavailable},
@@ -323,7 +372,7 @@ func TestClientRejectsBadReplies(t *testing.T) {
 				_, _ = readFrame(conn)
 				_, _ = conn.Write(tc.reply)
 			}()
-			err = NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."})
+			_, err = NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."})
 			if !errors.Is(err, tc.want) {
 				t.Errorf("err = %v, want %v", err, tc.want)
 			}
@@ -343,7 +392,7 @@ func TestConcurrentReport(t *testing.T) {
 	for i := range n {
 		wg.Go(func() {
 			name := strings.Repeat("a", i+1) + ".test."
-			errs <- c.Report(t.Context(), Observation{QName: name})
+			errs <- errOf(c.Report(t.Context(), Observation{QName: name}))
 		})
 	}
 	wg.Wait()
@@ -363,19 +412,19 @@ func TestConcurrentReport(t *testing.T) {
 func TestClientRecoversAfterServerRestart(t *testing.T) {
 	path := shortPath(t)
 	c := NewClient(path, self())
-	if err := c.Report(t.Context(), Observation{QName: "a.test."}); !errors.Is(err, ErrUnavailable) {
+	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v, want ErrUnavailable", err)
 	}
 	srv := listen(t, path, handlerFunc(ack), self())
-	if err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Fatalf("after start: %v", err)
 	}
 	_ = srv.Close()
-	if err := c.Report(t.Context(), Observation{QName: "a.test."}); !errors.Is(err, ErrUnavailable) {
+	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("after stop: err = %v, want ErrUnavailable", err)
 	}
 	listen(t, path, handlerFunc(ack), self())
-	if err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Fatalf("after restart: %v", err)
 	}
 }
@@ -387,7 +436,7 @@ func TestDisallowedUIDGetsNoAck(t *testing.T) {
 		calls.Add(1)
 		return nil
 	}), self()+1)
-	err := NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."})
+	_, err := NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."})
 	if !errors.Is(err, ErrUnavailable) {
 		t.Errorf("err = %v, want ErrUnavailable", err)
 	}
@@ -414,7 +463,7 @@ func TestServeStopsOnContextCancel(t *testing.T) {
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx) }()
 
-	go func() { _ = NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}) }()
+	go func() { _, _ = NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}) }()
 	<-started
 	cancel()
 	select {
@@ -437,7 +486,7 @@ func TestServeStopsOnContextCancel(t *testing.T) {
 
 func TestFrameRoundTripJSON(t *testing.T) {
 	b, _ := json.Marshal(envelopeOf(typeAck, nil))
-	if string(b) != `{"v":2,"type":"ack"}` {
+	if string(b) != `{"v":3,"type":"ack"}` {
 		t.Errorf("wire = %s", b)
 	}
 }
@@ -451,7 +500,7 @@ func TestBurstOfReportsAllSucceeds(t *testing.T) {
 	for range n {
 		wg.Go(func() {
 			<-gate
-			if err := c.Report(t.Context(), Observation{QName: "a.test.", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.1")}}); err != nil {
+			if _, err := c.Report(t.Context(), Observation{QName: "a.test.", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.1")}}); err != nil {
 				fails.Add(1)
 			}
 		})
@@ -472,14 +521,14 @@ func TestReportWaitingForSlotHonorsContext(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 	var wg sync.WaitGroup
 	for range maxInFlight {
-		wg.Go(func() { _ = c.Report(t.Context(), Observation{QName: "a.test."}) })
+		wg.Go(func() { _, _ = c.Report(t.Context(), Observation{QName: "a.test."}) })
 	}
 	for len(c.inflight) < maxInFlight {
 		time.Sleep(time.Millisecond) // waits for the pool to fill; no other signal exists
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
-	err := c.Report(ctx, Observation{QName: "a.test."})
+	_, err := c.Report(ctx, Observation{QName: "a.test."})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, want DeadlineExceeded", err)
 	}
@@ -502,20 +551,20 @@ func TestServerConnectionCap(t *testing.T) {
 	// Every slot is taken: the next client waits in the kernel backlog.
 	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 	defer cancel()
-	if err := c.Report(ctx, Observation{QName: "a.test."}); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := c.Report(ctx, Observation{QName: "a.test."}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("err = %v, want DeadlineExceeded while the cap is full", err)
 	}
 	for _, conn := range idle {
 		_ = conn.Close()
 	}
-	if err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Errorf("after the idle connections close: %v", err)
 	}
 }
 
 func TestOneRequestPerConnection(t *testing.T) {
 	_, path := start(t, handlerFunc(ack))
-	req := frameOf(`{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":1000}}`)
+	req := frameOf(`{"v":3,"type":"observe","body":{"qname":"a.test.","timeout_ms":1000}}`)
 	env, conn := rawExchange(t, path, req)
 	if env.Type != typeAck {
 		t.Fatalf("type = %q, want ack", env.Type)
@@ -526,7 +575,7 @@ func TestOneRequestPerConnection(t *testing.T) {
 func TestClientRejectsServerWithOtherUID(t *testing.T) {
 	path := shortPath(t)
 	listen(t, path, handlerFunc(ack), self())
-	err := NewClient(path, self()+1).Report(t.Context(), Observation{QName: "a.test."})
+	_, err := NewClient(path, self()+1).Report(t.Context(), Observation{QName: "a.test."})
 	if !errors.Is(err, ErrUnavailable) {
 		t.Errorf("err = %v, want ErrUnavailable", err)
 	}
@@ -539,14 +588,14 @@ func TestHandlerGetsCanonicalAddrs(t *testing.T) {
 		return nil
 	}))
 	mapped := netip.MustParseAddr("::ffff:192.0.2.7")
-	if err := c.Report(t.Context(), Observation{QName: "a.test.", Addrs: []netip.Addr{mapped}}); err != nil {
+	if _, err := c.Report(t.Context(), Observation{QName: "a.test.", Addrs: []netip.Addr{mapped}}); err != nil {
 		t.Fatal(err)
 	}
 	if len(got) != 1 || got[0] != netip.MustParseAddr("192.0.2.7") || got[0].Is4In6() {
 		t.Errorf("got %v, want the unmapped IPv4 address", got)
 	}
 	zoned := netip.MustParseAddr("fe80::1%en0")
-	if err := c.Report(t.Context(), Observation{QName: "a.test.", Addrs: []netip.Addr{zoned}}); !errors.Is(err, ErrRejected) {
+	if _, err := c.Report(t.Context(), Observation{QName: "a.test.", Addrs: []netip.Addr{zoned}}); !errors.Is(err, ErrRejected) {
 		t.Errorf("zoned address: err = %v, want ErrRejected", err)
 	}
 }
@@ -566,7 +615,7 @@ func TestLargestDNSAnswer(t *testing.T) {
 	label := strings.Repeat("<", 63)
 	qname := fmt.Sprintf("%s.%s.%s.%s.", label, label, label, label[:62])
 	o := Observation{QName: qname, Addrs: addrs, TTL: time.Hour}
-	if err := c.Report(t.Context(), o); err != nil {
+	if _, err := c.Report(t.Context(), o); err != nil {
 		t.Fatal(err)
 	}
 	if g := got.Load(); g == nil || len(g.Addrs) != len(addrs) {
@@ -578,8 +627,8 @@ func TestLongRejectionReasonStillArrives(t *testing.T) {
 	_, path := start(t, handlerFunc(ack))
 	long := strings.Repeat("x", 20<<10)
 	tests := map[string]string{
-		"long unknown type": `{"v":2,"type":"` + long + `"}`,
-		"long bad address":  `{"v":2,"type":"observe","body":{"qname":"a.test.","addrs":["` + long + `"],"timeout_ms":1000}}`,
+		"long unknown type": `{"v":3,"type":"` + long + `"}`,
+		"long bad address":  `{"v":3,"type":"observe","body":{"qname":"a.test.","addrs":["` + long + `"],"timeout_ms":1000}}`,
 	}
 	for name, payload := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -594,7 +643,7 @@ func TestLongRejectionReasonStillArrives(t *testing.T) {
 	}
 	t.Run("handler error", func(t *testing.T) {
 		c, _ := start(t, handlerFunc(func(context.Context, Observation) error { return fmt.Errorf("%w: %s", errNo, long) }))
-		if err := c.Report(t.Context(), Observation{QName: "a.test."}); !errors.Is(err, ErrRejected) {
+		if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); !errors.Is(err, ErrRejected) {
 			t.Errorf("err = %v, want ErrRejected", err)
 		}
 	})
@@ -613,7 +662,7 @@ func TestListenRefusals(t *testing.T) {
 		if !errors.Is(err, ErrAlreadyRunning) {
 			t.Errorf("err = %v, want ErrAlreadyRunning", err)
 		}
-		if err := NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+		if _, err := NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 			t.Errorf("first server broken: %v", err)
 		}
 	})
@@ -654,7 +703,7 @@ func TestListenReplacesStaleSocket(t *testing.T) {
 	ln.(*net.UnixListener).SetUnlinkOnClose(false) //nolint:forcetypeassert // unix listener
 	_ = ln.Close()                                 // leaves a dead socket file, as a crash does
 	listen(t, path, handlerFunc(ack), self())
-	if err := NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+	if _, err := NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Error(err)
 	}
 }
@@ -726,7 +775,7 @@ func TestListenSaturatedLiveServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := frameOf(`{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":30000}}`)
+	req := frameOf(`{"v":3,"type":"observe","body":{"qname":"a.test.","timeout_ms":30000}}`)
 	saturated := false
 	for range 6000 {
 		d := net.Dialer{Timeout: 200 * time.Millisecond}
@@ -760,7 +809,7 @@ func TestServeTwiceFails(t *testing.T) {
 	if err := srv.Serve(t.Context()); err == nil {
 		t.Error("second Serve returned nil")
 	}
-	if err := NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+	if _, err := NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Errorf("first Serve was disturbed: %v", err)
 	}
 }
@@ -841,7 +890,7 @@ func TestHelperReport(t *testing.T) {
 	if path == "" {
 		t.Skip("child process only")
 	}
-	err := NewClient(path, 0).Report(t.Context(), Observation{QName: "x.test."})
+	_, err := NewClient(path, 0).Report(t.Context(), Observation{QName: "x.test."})
 	switch {
 	case err == nil:
 		fmt.Println("RESULT ACKED")
@@ -940,7 +989,7 @@ func TestCloseCancelsHandlersAndServeReturns(t *testing.T) {
 		go func() {
 			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 			defer cancel()
-			results <- c.Report(ctx, Observation{QName: "a.test."})
+			results <- errOf(c.Report(ctx, Observation{QName: "a.test."}))
 		}()
 	}
 	for range 3 {
@@ -970,7 +1019,7 @@ func TestTimeoutBounds(t *testing.T) {
 	tests := map[string]string{"0": typeReject, "-1": typeReject, "1": typeAck, "30000": typeAck, "30001": typeReject}
 	for ms, want := range tests {
 		t.Run(ms, func(t *testing.T) {
-			env, _ := rawExchange(t, path, frameOf(`{"v":2,"type":"observe","body":{"qname":"a.test.","timeout_ms":`+ms+`}}`))
+			env, _ := rawExchange(t, path, frameOf(`{"v":3,"type":"observe","body":{"qname":"a.test.","timeout_ms":`+ms+`}}`))
 			if env.Type != want {
 				t.Errorf("type = %q, want %q", env.Type, want)
 			}
@@ -1042,10 +1091,10 @@ func TestCrossUIDImpostor(t *testing.T) {
 	defer func() { _ = stdin.Close() }() // ends the impostor
 
 	// The fixture is sound: the same ack is trusted when the uid matches.
-	if err := NewClient(path, nobody).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+	if _, err := NewClient(path, nobody).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Fatalf("expecting uid %d: %v (fixture broken)", nobody, err)
 	}
-	err = NewClient(path, 0).Report(t.Context(), Observation{QName: "a.test."})
+	_, err = NewClient(path, 0).Report(t.Context(), Observation{QName: "a.test."})
 	if !errors.Is(err, ErrUnavailable) {
 		t.Errorf("err = %v, want ErrUnavailable", err)
 	}
@@ -1100,7 +1149,7 @@ func TestHelperImpostor(t *testing.T) {
 			go func() {
 				defer func() { _ = c.Close() }()
 				if _, err := readFrame(c); err == nil {
-					_, _ = c.Write(frameOf(`{"v":2,"type":"ack"}`))
+					_, _ = c.Write(frameOf(`{"v":3,"type":"ack","body":{"protected":false}}`))
 				}
 			}()
 		}
@@ -1109,3 +1158,6 @@ func TestHelperImpostor(t *testing.T) {
 	_, _ = io.Copy(io.Discard, os.Stdin) // until the parent closes stdin
 	_ = ln.Close()
 }
+
+// errOf drops the ack of a Report, for a test that checks only the error.
+func errOf(_ Ack, err error) error { return err }

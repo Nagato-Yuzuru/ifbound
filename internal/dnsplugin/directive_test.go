@@ -24,7 +24,7 @@ type timedReporter struct {
 	left []time.Duration
 }
 
-func (r *timedReporter) Report(ctx context.Context, o ipc.Observation) error {
+func (r *timedReporter) Report(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
 	dl, ok := ctx.Deadline()
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -34,7 +34,7 @@ func (r *timedReporter) Report(ctx context.Context, o ipc.Observation) error {
 	} else {
 		r.left = append(r.left, -1)
 	}
-	return nil
+	return ipc.Ack{}, nil
 }
 
 type countingProber struct {
@@ -129,8 +129,9 @@ func TestPluginDefaultAckWaitIsTwoSeconds(t *testing.T) {
 }
 
 // A reply that only points to other names (CNAME, HTTPS TargetName)
-// and has no address is not reported; a reply with addresses is reported
-// with the qname, the addresses and the TTL only.
+// and has no address is reported without an address: only the ack tells
+// if the plugin must flatten it. A reply with addresses is reported with
+// the qname, the addresses and the TTL only.
 func TestPluginReportsAddressesOnly(t *testing.T) {
 	cnameOnly := fixedUpstream{answer: []dns.RR{
 		mustRR(t, "www.example.com. 300 IN CNAME cdn.example.net."),
@@ -140,8 +141,8 @@ func TestPluginReportsAddressesOnly(t *testing.T) {
 	if rcode != dns.RcodeSuccess || len(m.Answer) != 1 {
 		t.Fatalf("CNAME-only reply: rcode %d, answer %v; want it passed on", rcode, m.Answer)
 	}
-	if len(rep.obs) != 0 || len(pr.names) != 0 {
-		t.Errorf("CNAME-only reply gave reports %v and probes %v, want none", rep.obs, pr.names)
+	if len(rep.obs) != 1 || len(rep.obs[0].Addrs) != 0 || len(pr.names) != 0 {
+		t.Errorf("CNAME-only reply gave reports %v and probes %v, want one report without an address", rep.obs, pr.names)
 	}
 
 	httpsOnly := fixedUpstream{answer: []dns.RR{
@@ -149,8 +150,8 @@ func TestPluginReportsAddressesOnly(t *testing.T) {
 	}}
 	h, rep, _ = directiveHandler(t, "ifbound /run/ifbound.sock", httpsOnly)
 	serveQuery(t, h, "www.example.com.", dns.TypeHTTPS)
-	if len(rep.obs) != 0 {
-		t.Errorf("HTTPS reply without hints gave reports %v, want none", rep.obs)
+	if len(rep.obs) != 1 || len(rep.obs[0].Addrs) != 0 {
+		t.Errorf("HTTPS reply without hints gave reports %v, want one without an address", rep.obs)
 	}
 
 	withAddrs := fixedUpstream{answer: []dns.RR{

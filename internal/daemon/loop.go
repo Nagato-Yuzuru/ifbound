@@ -190,20 +190,34 @@ func (l *loop) reconfigure(ctx context.Context, cfg policy.Config) error {
 // one LoadedID read per report that matches a policy. After a failure the
 // book keeps the addresses, so the next report or convergence completes
 // the work.
-func (l *loop) observe(ctx context.Context, o ipc.Observation) error {
+//
+// The ack is protected when the name matches a policy: ifbound-dns then
+// removes the aliases from the reply. A report without an address only
+// asks for that flag. The ack promises nothing about addresses then, so
+// it needs no platform call; the phase checks still apply.
+func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
 	switch {
 	case !l.phase.loaded():
-		return ErrNotReady
+		return ipc.Ack{}, ErrNotReady
 	case !l.phase.acks():
-		return ErrUnenforced
+		return ipc.Ack{}, ErrUnenforced
 	}
 	names, err := l.matcher.Match(o.QName)
 	if err != nil {
-		return fmt.Errorf("classifying qname: %w", err)
+		return ipc.Ack{}, fmt.Errorf("classifying qname: %w", err)
 	}
-	if len(names) == 0 {
-		return nil
+	if len(names) == 0 || len(o.Addrs) == 0 {
+		return ipc.Ack{Protected: len(names) > 0}, nil
 	}
+	if err := l.record(ctx, names, o); err != nil {
+		return ipc.Ack{}, err
+	}
+	return ipc.Ack{Protected: true}, nil
+}
+
+// record puts the addresses of o in the book, the tables, and the
+// snapshot of each policy in names.
+func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observation) error {
 	addrs := canonical(o.Addrs)
 	needSave := false
 	for _, name := range names {
