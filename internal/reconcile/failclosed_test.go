@@ -15,8 +15,7 @@ import (
 // enforcement is what is blocked and resolved on one side of a change.
 type enforcement struct {
 	tables map[policy.Name][]netip.Prefix
-	// resolver lists the domains of the resolver entries, apexes and
-	// aliases, sorted.
+	// resolver lists the domains of the resolver entries, sorted.
 	resolver []string
 }
 
@@ -51,33 +50,6 @@ only_via = ["en0"]
 name = "mail"
 to = ["mail.example.org", "198.51.100.0/24"]
 deny_via = ["en1"]
-`
-
-// aliasTo is configV2 with a new apex, cover.test, above an alias that
-// configV1 learns.
-const aliasTo = header + `
-[[policy]]
-name = "web"
-to = ["example.com", "*.example.net", "192.0.2.10", "198.51.100.0/24"]
-only_via = ["utun*"]
-
-[[policy]]
-name = "mail"
-to = ["mail.example.org", "*.cover.test", "203.0.113.0/28"]
-deny_via = ["en1"]
-`
-
-// apexGone is configV1 without the apex example.com.
-const apexGone = header + `
-[[policy]]
-name = "web"
-to = ["*.example.net", "192.0.2.10", "198.51.100.0/24"]
-only_via = ["en0"]
-
-[[policy]]
-name = "ads"
-to = ["*.ads.example", "2001:db8::/32"]
-deny_via = ["@tunnel"]
 `
 
 func transitions() []transition {
@@ -121,57 +93,6 @@ func transitions() []transition {
 		// One fill, one load, one removal, two resolver writes, one
 		// resolver removal.
 		writes: 6,
-	}, {
-		name: "aliases learned, expired, pruned, and met by an apex",
-		from: configV1,
-		install: func(t *testing.T, f *fixture) {
-			f.learn(t, "web", "cdn.web.test", "old.web.test", "www.example.net", "edge.cover.test", "cover.test")
-			f.learn(t, "ads", "track.ads.test")
-		},
-		change: func(t *testing.T, f *fixture) {
-			f.now = f.now.Add(40 * time.Minute)
-			f.learn(t, "web", "cdn.web.test", "new.web.test", "edge.cover.test", "cover.test")
-			f.learn(t, "ads", "track.ads.test")
-			f.now = f.now.Add(21 * time.Minute)
-			f.book.Expire()           // old.web.test and www.example.net expire
-			f.reconfigure(t, aliasTo) // the prune removes track.ads.test
-		},
-		next: enforcement{
-			tables: map[policy.Name][]netip.Prefix{
-				"web":  prefixes("198.51.100.0/24", "192.0.2.10/32"),
-				"mail": prefixes("203.0.113.0/28"),
-			},
-			// The new apex cover.test is equal to an alias, and
-			// edge.cover.test is below it: both keep their one entry.
-			resolver: []string{
-				"cdn.web.test", "cover.test", "edge.cover.test", "example.com", "example.net",
-				"mail.example.org", "new.web.test", canary,
-			},
-		},
-		// One fill, one load, one drop, two resolver writes (an apex and
-		// an alias), four resolver removals (an apex, two expired aliases,
-		// and a pruned alias).
-		writes: 9,
-	}, {
-		name: "apex removed while aliases below it stay learned",
-		from: configV1,
-		install: func(t *testing.T, f *fixture) {
-			f.learn(t, "ads", "cdn.example.com")
-		},
-		change: func(t *testing.T, f *fixture) {
-			f.learn(t, "ads", "cdn.example.com", "new.example.com")
-			f.reconfigure(t, apexGone)
-		},
-		next: enforcement{
-			tables: map[policy.Name][]netip.Prefix{
-				"web": prefixes("198.51.100.0/24", "192.0.2.10/32"),
-				"ads": prefixes("2001:db8::/32"),
-			},
-			resolver: []string{"ads.example", "cdn.example.com", "example.net", "new.example.com", canary},
-		},
-		// One resolver write (the new alias below the old apex) and one
-		// resolver removal (the apex).
-		writes: 2,
 	}}
 }
 
@@ -184,8 +105,8 @@ func transitions() []transition {
 //     only one side has the policy.
 //   - An entry that is blocked before and after the change, also in
 //     another policy, is in some table that the loaded ruleset refers to.
-//   - A resolver entry, apex or alias, that is present before and desired
-//     after the change stays present.
+//   - A resolver entry that is present before and desired after the
+//     change stays present.
 //   - A name of an old or a new resolver entry that both sides cover stays
 //     covered.
 //

@@ -26,11 +26,11 @@ func TestParseScutilReadsUnscopedResolvers(t *testing.T) {
 		{Servers: []netip.Addr{ip("192.0.2.1"), ip("2001:db8::1")}, Port: 53},
 		{Domain: "example.test", Servers: []netip.Addr{ip("127.0.0.1")}, Port: 10053},
 		{Domain: "www.example.test", Servers: []netip.Addr{ip("127.0.0.1")}, Port: 10054},
-		{Domain: "api.example.test", Servers: []netip.Addr{ip("10.0.0.53"), ip("fe80::1%utun4")}, Port: 53, Order: 102200, Supplemental: true},
+		{Domain: "api.example.test", Servers: []netip.Addr{ip("10.0.0.53"), ip("fe80::1%utun4")}, Port: 53, Supplemental: true},
 		{Domain: "high-port.test", Servers: []netip.Addr{ip("127.0.0.1")}, Port: 53536},
-		// The unreadable server is the zero Addr, the unreadable order is 0.
+		// The unreadable server is the zero Addr.
 		{Domain: "odd.example.test", Servers: []netip.Addr{{}}, Port: 65535},
-		{Domain: "local", Port: 53, Order: 300000},
+		{Domain: "local", Port: 53},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("parseScutil =\n%+v\nwant\n%+v", got, want)

@@ -1,11 +1,10 @@
 // Package dnsplugin is the ifbound CoreDNS plugin. It reports the addresses
-// and alias names in every DNS reply to ifboundd and lets the reply go to
-// the application only after ifboundd acknowledges. Every failure becomes
-// SERVFAIL, so no address reaches an application before the kernel can
-// block it.
+// in every DNS reply to ifboundd and lets the reply go to the application
+// only after ifboundd acknowledges. Every failure becomes SERVFAIL, so no
+// address reaches an application before the kernel can block it.
 //
 // The plugin does not read policies. It reports every reply that carries an
-// address or an alias name, and ifboundd decides what matches.
+// address, and ifboundd decides what matches.
 package dnsplugin
 
 import (
@@ -31,11 +30,10 @@ const (
 	// follow. withDirective checks that no directive above it can answer.
 	directiveAnchor = "local"
 
-	// defaultTimeout is the default wait for the ack. It is the ack budget
-	// of ifboundd: an ack usually takes milliseconds, but the first report
-	// of a new alias waits until the system applies the resolver entry of
-	// the alias (up to about 1.5 s measured).
-	defaultTimeout = 5 * time.Second
+	// defaultTimeout is the default wait for the ack: the ack budget of
+	// the ipc package. The socket is local, so an ack takes milliseconds.
+	// The wait stays well below the usual 5-second stub resolver timeout.
+	defaultTimeout = ipc.DefaultTimeout
 )
 
 var (

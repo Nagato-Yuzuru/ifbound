@@ -52,9 +52,6 @@ type Status struct {
 	Policies int
 	// Addrs is the number of learned addresses of the configured policies.
 	Addrs int
-	// Aliases is the number of learned aliases of the configured
-	// policies. An alias of two policies counts twice.
-	Aliases int
 	// RetainRestart is true when the configured retain differs from the
 	// retain of the running address book. Only a restart applies it.
 	RetainRestart bool

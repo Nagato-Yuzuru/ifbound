@@ -1,0 +1,1 @@
+{"version":2,"entries":[],"aliases":[{"policy":"web","alias":"cdn.example.net","last_seen_unix_nano":1767225600000000000,"ttl_nano":3600000000000,"expiry_unix_nano":1767229200000000000},{"policy":"web","alias":"edge.example.org","last_seen_unix_nano":1767225600000000000,"ttl_nano":3600000000000,"expiry_unix_nano":1767229200000000000}]}

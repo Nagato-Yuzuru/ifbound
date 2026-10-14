@@ -151,7 +151,7 @@ func (w *warmUp) warm(wctx, ctx context.Context, name policy.Domain, first bool)
 	if err != nil {
 		if first && wctx.Err() == nil {
 			w.log.WarnContext(ctx, "warm-up: no proof that the queries for the name go to ifbound-dns; the warm-up tries the name again later",
-				slog.String("name", name.String()))
+				slog.String("name", name.String()), slog.Any("error", err))
 		}
 		return false
 	}

@@ -110,12 +110,6 @@ func setField(c *ConfigEntry, line string) error {
 			p = 0
 		}
 		c.Port = uint16(p)
-	case key == "order":
-		o, err := strconv.ParseUint(val, 10, 32)
-		if err != nil {
-			o = 0
-		}
-		c.Order = uint32(o)
 	case key == "flags":
 		c.Supplemental = slices.Contains(strings.Split(val, ", "), "Supplemental")
 	}

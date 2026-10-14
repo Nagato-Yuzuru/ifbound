@@ -13,7 +13,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,105 +98,24 @@ func TestRoundTrip(t *testing.T) {
 	}
 }
 
-func TestRoundTripWithAliases(t *testing.T) {
-	var got Observation
-	c, _ := start(t, handlerFunc(func(_ context.Context, o Observation) error {
-		got = o
-		return nil
-	}))
-	o := Observation{
-		QName: "www.example.com.",
-		Aliases: []Alias{
-			{Name: "a.example.net.", TTL: 60 * time.Second},
-			{Name: `B\.x.example.net.`, TTL: 0},
-			{Name: "a.example.net.", TTL: 300 * time.Second},
-			{Name: "A.example.net.", TTL: 10 * time.Second},
-			{Name: "a.example.net.", TTL: 30 * time.Second},
-		},
-	}
-	if err := c.Report(t.Context(), o); err != nil {
-		t.Fatal(err)
-	}
-	// A duplicate keeps its largest TTL and its first position. Case is
-	// not folded.
-	want := []Alias{
-		{Name: "a.example.net.", TTL: 300 * time.Second},
-		{Name: `B\.x.example.net.`, TTL: 0},
-		{Name: "A.example.net.", TTL: 10 * time.Second},
-	}
-	if !slices.Equal(got.Aliases, want) {
-		t.Errorf("aliases = %+v, want %+v", got.Aliases, want)
-	}
-}
-
-func TestAliasLimits(t *testing.T) {
-	var calls atomic.Int32
-	c, _ := start(t, handlerFunc(func(context.Context, Observation) error {
-		calls.Add(1)
-		return nil
-	}))
-	aliases := func(n int) []Alias {
-		out := make([]Alias, n)
-		for i := range out {
-			out[i] = Alias{Name: fmt.Sprintf("a%d.example.", i)}
-		}
-		return out
-	}
-	for name, as := range map[string][]Alias{
-		"too many aliases": aliases(MaxAliases + 1),
-		"empty alias":      {{Name: "a.example."}, {Name: ""}},
-		"alias too long":   {{Name: strings.Repeat("a", MaxQNameLen+1)}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			err := c.Report(t.Context(), Observation{QName: "a.test.", Aliases: as})
-			if !errors.Is(err, ErrRejected) {
-				t.Errorf("err = %v, want ErrRejected", err)
-			}
-		})
-	}
-	for name, as := range map[string][]Alias{
-		"aliases at the limit":    aliases(MaxAliases),
-		"alias name at the limit": {{Name: strings.Repeat("a", MaxQNameLen)}},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if err := c.Report(t.Context(), Observation{QName: "a.test.", Aliases: as}); err != nil {
-				t.Error(err)
-			}
-		})
-	}
-	if calls.Load() != 2 {
-		t.Errorf("handler called %d times, want 2", calls.Load())
-	}
-}
-
-// observePayload returns an observe payload with the given version and
-// aliases JSON.
-func observePayload(version, aliases string) string {
+// observePayload returns an observe payload with the given version.
+func observePayload(version string) string {
 	return fmt.Sprintf(`{"v":%s,"type":"observe","body":{"qname":"q.test.","addrs":["192.0.2.1"],`+
-		`"ttl_s":60,"aliases":%s,"timeout_ms":1000}}`, version, aliases)
+		`"ttl_s":60,"timeout_ms":1000}}`, version)
 }
 
-func TestServerRejectsHostileAliasFrames(t *testing.T) {
+func TestServerRejectsBadVersions(t *testing.T) {
 	var calls atomic.Int32
 	_, path := start(t, handlerFunc(func(context.Context, Observation) error {
 		calls.Add(1)
 		return nil
 	}))
 	tests := map[string]string{
-		"version 1 with aliases":          observePayload("1", `[{"name":"b.test.","ttl_s":1}]`),
-		"version 0":                       observePayload("0", `[]`),
-		"negative version":                observePayload("-2", `[]`),
-		"version as string":               observePayload(`"2"`, `[]`),
-		"version as float":                observePayload("2.5", `[]`),
-		"missing alias name":              observePayload("2", `[{"ttl_s":1}]`),
-		"null alias name":                 observePayload("2", `[{"name":null,"ttl_s":1}]`),
-		"alias name 513 runes 1026 bytes": observePayload("2", `[{"name":"`+strings.Repeat("é", 513)+`","ttl_s":1}]`),
-		"alias name as number":            observePayload("2", `[{"name":5,"ttl_s":1}]`),
-		"aliases as object":               observePayload("2", `{"name":"b.test."}`),
-		"alias as string":                 observePayload("2", `["b.test."]`),
-		"negative alias TTL":              observePayload("2", `[{"name":"b.test.","ttl_s":-1}]`),
-		"alias TTL above uint32":          observePayload("2", `[{"name":"b.test.","ttl_s":4294967296}]`),
-		"fractional alias TTL":            observePayload("2", `[{"name":"b.test.","ttl_s":1.5}]`),
+		"version 1":         observePayload("1"),
+		"version 0":         observePayload("0"),
+		"negative version":  observePayload("-2"),
+		"version as string": observePayload(`"2"`),
+		"version as float":  observePayload("2.5"),
 	}
 	for name, payload := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -210,53 +128,6 @@ func TestServerRejectsHostileAliasFrames(t *testing.T) {
 	}
 	if n := calls.Load(); n != 0 {
 		t.Errorf("handler called %d times, want 0", n)
-	}
-}
-
-// TestClientSendsAliasesOnTheWire reads the frame that the client writes:
-// version 2, and each alias name and TTL as given. A TTL is sent in whole
-// seconds and clamped to the uint32 range.
-func TestClientSendsAliasesOnTheWire(t *testing.T) {
-	path := shortPath(t)
-	var lc net.ListenConfig
-	ln, err := lc.Listen(t.Context(), "unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = ln.Close() })
-	frames := make(chan envelope, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer func() { _ = conn.Close() }()
-		env, _ := readFrame(conn)
-		frames <- env
-		_ = writeFrame(conn, envelopeOf(typeAck, nil))
-	}()
-	o := Observation{
-		QName: "q.test.",
-		Aliases: []Alias{
-			{Name: `a\ b.test.`, TTL: 90 * time.Second},
-			{Name: "B.test.", TTL: 1500 * time.Millisecond},
-			{Name: "c.test.", TTL: 1<<32*time.Second + time.Hour},
-		},
-	}
-	if err := NewClient(path, self()).Report(t.Context(), o); err != nil {
-		t.Fatal(err)
-	}
-	env := <-frames
-	if env.Version != 2 || env.Type != typeObserve {
-		t.Fatalf("frame v=%d type=%q, want v=2 observe", env.Version, env.Type)
-	}
-	var body observeBody
-	if err := json.Unmarshal(env.Body, &body); err != nil {
-		t.Fatal(err)
-	}
-	want := []aliasBody{{`a\ b.test.`, 90}, {"B.test.", 1}, {"c.test.", 1<<32 - 1}}
-	if !slices.Equal(body.Aliases, want) {
-		t.Errorf("wire aliases %+v, want %+v", body.Aliases, want)
 	}
 }
 
@@ -687,21 +558,18 @@ func TestLargestDNSAnswer(t *testing.T) {
 		return nil
 	}))
 	// The worst case of a 64 KiB message: IPv4 hints of the longest text
-	// form, and aliases of 255 octets that JSON escapes into 6 bytes each.
+	// form, and a qname of 255 octets that JSON escapes into 6 bytes each.
 	addrs := make([]netip.Addr, 16384)
 	for i := range addrs {
 		addrs[i] = netip.AddrFrom4([4]byte{200, 200, byte(100 + i/156), byte(100 + i%156)})
 	}
 	label := strings.Repeat("<", 63)
-	aliases := make([]Alias, MaxAliases)
-	for i := range aliases {
-		aliases[i] = Alias{Name: fmt.Sprintf("%s.%s.%s.%s.", label, label, label, label[:59]+fmt.Sprintf("%04d", i))}
-	}
-	o := Observation{QName: aliases[0].Name, Addrs: addrs, TTL: time.Hour, Aliases: aliases}
+	qname := fmt.Sprintf("%s.%s.%s.%s.", label, label, label, label[:62])
+	o := Observation{QName: qname, Addrs: addrs, TTL: time.Hour}
 	if err := c.Report(t.Context(), o); err != nil {
 		t.Fatal(err)
 	}
-	if g := got.Load(); g == nil || len(g.Addrs) != len(addrs) || len(g.Aliases) != MaxAliases {
+	if g := got.Load(); g == nil || len(g.Addrs) != len(addrs) {
 		t.Errorf("handler did not see the whole observation")
 	}
 }

@@ -30,9 +30,6 @@ type ConfigEntry struct {
 	// port, and 0 when the source cannot read it. Port 0 is never the port
 	// of an ifbound entry.
 	Port uint16
-	// Order is the search order. A lower order wins. It is 0 when the
-	// configuration gives no order or the source cannot read it.
-	Order uint32
 	// Supplemental is true for a resolver that a network service or a VPN
 	// client added, not a file.
 	Supplemental bool
@@ -45,31 +42,15 @@ type findings struct {
 	// shadowed are the domains of the resolvers that ifbound does not
 	// manage at or below an entry, most specific first.
 	shadowed []policy.Domain
-	// own maps the domain of each entry that the configuration lists as
-	// the file of that entry to the order of that resolver.
-	own map[string]uint32
-	// contested holds the domain of each entry for which another resolver
-	// with the same domain can win.
-	contested map[string]bool
 }
 
 // examine compares the configuration with the entries. A resolver is the
 // file of an entry only when it has the domain, the single server, and
 // the port of the entry and is not supplemental. Each other resolver at
-// or below an entry is a finding. Another resolver for the domain of an
-// entry contests the entry when its order is equal to or lower than the
-// order of the ifbound file, or when the configuration does not list the
-// ifbound file: macOS can then send the queries to that resolver.
-func examine(entries []reconcile.ManagedEntry, conf []ConfigEntry) findings {
-	own := make(map[string]uint32)
-	for _, c := range conf {
-		for _, e := range entries {
-			if isFileOf(c, e) {
-				own[c.Domain] = max(own[c.Domain], c.Order)
-			}
-		}
-	}
-	f := findings{own: own, contested: make(map[string]bool)}
+// or below an entry is a finding: macOS can send the queries for names of
+// the entry to that resolver.
+func examine(entries []reconcile.ResolverEntry, conf []ConfigEntry) findings {
+	var f findings
 	for _, c := range conf {
 		e, ok := covering(entries, c.Domain)
 		if !ok || isFileOf(c, e) {
@@ -81,11 +62,6 @@ func examine(entries []reconcile.ManagedEntry, conf []ConfigEntry) findings {
 		if d, err := policy.ParseDomain(c.Domain); err == nil {
 			f.shadowed = append(f.shadowed, d)
 		}
-		if c.Domain == e.Domain.String() {
-			if order, listed := own[c.Domain]; !listed || c.Order <= order {
-				f.contested[c.Domain] = true
-			}
-		}
 	}
 	slices.Sort(f.texts)
 	f.texts = slices.Compact(f.texts)
@@ -95,8 +71,8 @@ func examine(entries []reconcile.ManagedEntry, conf []ConfigEntry) findings {
 }
 
 // covering returns the most specific entry at or above d.
-func covering(entries []reconcile.ManagedEntry, d string) (reconcile.ManagedEntry, bool) {
-	var best reconcile.ManagedEntry
+func covering(entries []reconcile.ResolverEntry, d string) (reconcile.ResolverEntry, bool) {
+	var best reconcile.ResolverEntry
 	found := false
 	for _, e := range entries {
 		if d != "" && atOrBelow(d, e.Domain.String()) && (!found || len(e.Domain.String()) > len(best.Domain.String())) {
@@ -107,7 +83,7 @@ func covering(entries []reconcile.ManagedEntry, d string) (reconcile.ManagedEntr
 }
 
 // isFileOf reports whether c is the resolver that the file of e gives.
-func isFileOf(c ConfigEntry, e reconcile.ManagedEntry) bool {
+func isFileOf(c ConfigEntry, e reconcile.ResolverEntry) bool {
 	return c.Domain == e.Domain.String() && !c.Supplemental && e.Server.IsValid() &&
 		len(c.Servers) == 1 && c.Servers[0] == e.Server.Addr() && c.Port == e.Server.Port()
 }

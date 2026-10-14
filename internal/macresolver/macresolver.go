@@ -7,20 +7,13 @@
 // it for a domain that ifbound wants is a conflict: Write refuses it with
 // ErrConflict and does not change the file.
 //
-// macOS applies a new or changed file after a delay. Read reports an
-// entry as active when Settle has passed since the modification time of
-// its file, the file is exactly what Write renders, the system resolver
-// configuration lists the file, and no other resolver for the same domain
-// can win against it. The time is in the file, not in memory, so a daemon
-// that restarts does not report a new entry as active too early.
-//
 // Read also reads the resolver configuration of the system and reports
 // each resolver that is at or below an ifbound entry but is not an
 // ifbound file. The most specific resolver domain wins on macOS, so such a
 // resolver takes names from the ifbound entry.
 //
-// The directory, the clock, and the source of the resolver configuration
-// are parameters, so the logic runs without root on any system.
+// The directory and the source of the resolver configuration are
+// parameters, so the logic runs without root on any system.
 package macresolver
 
 import (
@@ -35,7 +28,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
@@ -44,9 +36,6 @@ import (
 const (
 	// Dir is the directory of the per-domain resolver files on macOS.
 	Dir = "/etc/resolver"
-	// Settle is the time from a write until Read reports the entry as
-	// active. The slowest measured application of a new file took 1.55 s.
-	Settle = 2 * time.Second
 	// Marker is the first line of each file that ifbound writes. It is a
 	// comment for the resolver file parser of macOS.
 	Marker = "# Managed by ifboundd. Do not edit: ifboundd changes or removes this file."
@@ -83,23 +72,15 @@ const (
 // not safe for concurrent use. Build one with New.
 type Resolver struct {
 	dir    string
-	now    func() time.Time
 	config ConfigSource
-	// writes counts the Writes that changed the file of each domain. It
-	// is part of the version, because a file system can give a new file
-	// the inode number of a file that was just removed (ext4 does), and
-	// two Writes in one clock tick then give the same file identity.
-	writes map[policy.Domain]uint64
 }
 
 var _ reconcile.SysResolver = (*Resolver)(nil)
 
-// New returns a Resolver for the files in dir (Dir on macOS). Now is the
-// clock: Write sets it as the modification time of a file, and Read
-// compares it with that time. Config gives the system resolver
-// configuration (Scutil on macOS).
-func New(dir string, now func() time.Time, config ConfigSource) *Resolver {
-	return &Resolver{dir: dir, now: now, config: config, writes: make(map[policy.Domain]uint64)}
+// New returns a Resolver for the files in dir (Dir on macOS). Config
+// gives the system resolver configuration (Scutil on macOS).
+func New(dir string, config ConfigSource) *Resolver {
+	return &Resolver{dir: dir, config: config}
 }
 
 // Read implements reconcile.SysResolver. It reports each file that starts
@@ -111,16 +92,9 @@ func New(dir string, now func() time.Time, config ConfigSource) *Resolver {
 // configuration. For each resolver at or below an entry that is not the
 // file of an entry, it reports a Problem and lists the domain in
 // Shadowed. Read compares the configuration with all entries at once, so
-// the file of an alias entry below an apex entry is never foreign. When
+// the file of an entry below another entry is never foreign. When
 // the configuration cannot be read, Read reports that as a Problem and
 // still returns the entries.
-//
-// An entry is active only when all of these are true:
-//   - Settle has passed since the modification time of its file;
-//   - the file is exactly what Write renders (Server is valid);
-//   - the configuration lists the file with the server of the entry;
-//   - no other resolver for the domain has an order that is equal to or
-//     lower than the order of the file.
 //
 // Read reports a resolver at or below an entry only from the second
 // convergence that sees the entry: the Reconciler reads before it
@@ -141,19 +115,10 @@ func (r *Resolver) Read(ctx context.Context) (reconcile.ResolverState, error) {
 		if cerr := ctx.Err(); cerr != nil {
 			return reconcile.ResolverState{}, fmt.Errorf("reading the resolver configuration: %w", cerr)
 		}
-		for i := range st.Entries {
-			st.Entries[i].Active = false
-		}
 		st.Problems = []reconcile.Problem{{Text: "cannot read the system resolver configuration: " + err.Error()}}
 		return st, nil
 	}
 	f := examine(entries, conf)
-	for i, e := range st.Entries {
-		d := e.Domain.String()
-		if _, listed := f.own[d]; !listed || f.contested[d] {
-			st.Entries[i].Active = false
-		}
-	}
 	for _, t := range f.texts {
 		st.Problems = append(st.Problems, reconcile.Problem{Text: t})
 	}
@@ -166,8 +131,8 @@ func (r *Resolver) Read(ctx context.Context) (reconcile.ResolverState, error) {
 // file over an ifbound file, or links it to the name when no file exists,
 // so a file that appears in the meantime is not replaced. It creates the
 // directory when it is missing. When the file already holds the rendered
-// content, Write does not change the file: the modification time stays,
-// so the entry stays active.
+// content, Write does not change the file: each change can make macOS
+// flush its DNS cache and apply the file again after a delay.
 //
 // The error wraps ErrConflict or ErrCannotWrite when that is the cause.
 func (r *Resolver) Write(_ context.Context, e reconcile.ResolverEntry) error {
@@ -186,7 +151,6 @@ func (r *Resolver) Write(_ context.Context, e reconcile.ResolverEntry) error {
 	if err := r.replace(path, data, exists); err != nil {
 		return fmt.Errorf("writing resolver entry %s: %w", e.Domain, err)
 	}
-	r.writes[e.Domain]++
 	return nil
 }
 
@@ -214,9 +178,8 @@ func (r *Resolver) Remove(_ context.Context, d policy.Domain) error {
 	return nil
 }
 
-// managed returns the entries in the directory, sorted by domain. Active
-// here depends only on the file; Read also checks the configuration.
-func (r *Resolver) managed() ([]reconcile.ManagedEntry, error) {
+// managed returns the entries in the directory, sorted by domain.
+func (r *Resolver) managed() ([]reconcile.ResolverEntry, error) {
 	des, err := os.ReadDir(r.dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -224,8 +187,7 @@ func (r *Resolver) managed() ([]reconcile.ManagedEntry, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errRead, err)
 	}
-	now := r.now()
-	var out []reconcile.ManagedEntry
+	var out []reconcile.ResolverEntry
 	for _, de := range des {
 		d, err := policy.ParseDomain(de.Name())
 		if err != nil || d.String() != de.Name() || !de.Type().IsRegular() {
@@ -242,36 +204,9 @@ func (r *Resolver) managed() ([]reconcile.ManagedEntry, error) {
 		if !hasMarker(data) {
 			continue
 		}
-		fi, err := os.Lstat(path)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", errRead, err)
-		}
-		server := parseServer(d, data)
-		out = append(out, reconcile.ManagedEntry{
-			Domain:  d,
-			Server:  server,
-			Active:  server.IsValid() && !now.Before(fi.ModTime().Add(Settle)),
-			Version: fileVersion(r.writes[d], fi),
-		})
+		out = append(out, reconcile.ResolverEntry{Domain: d, Server: parseServer(d, data)})
 	}
 	return out, nil
-}
-
-// fileVersion returns the version of an entry: the number of Writes of
-// this Resolver that changed the file, then the identity of the file
-// content (device, inode, modification time in nanoseconds, and size).
-// The count makes each Write of ifbound give a new version, also when the
-// file system reuses the inode number in the same clock tick. A rename of
-// a new file by another process gives a new inode, and a write in place
-// gives a new modification time. The count starts again in a new
-// process, so a version can come back only across a restart of ifboundd.
-// It is "" when the file information has no inode.
-func fileVersion(writes uint64, fi fs.FileInfo) string {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return ""
-	}
-	return fmt.Sprintf("%d:%d:%d:%d:%d", writes, st.Dev, st.Ino, fi.ModTime().UnixNano(), fi.Size())
 }
 
 // managedFile reads the file at path. It returns ok == false when no file
@@ -332,9 +267,9 @@ func (r *Resolver) replace(path string, data []byte, exists bool) error {
 	return nil
 }
 
-// fill writes, syncs, and closes f, and then sets its modification time
-// to the clock. The sync comes before the rename, so a crash cannot leave
-// an empty file without the marker, which Read would take for a conflict.
+// fill writes, syncs, and closes f. The sync comes before the rename, so a
+// crash cannot leave an empty file without the marker, which Read would
+// take for a conflict.
 func (r *Resolver) fill(f *os.File, data []byte) error {
 	_, err := f.Write(data)
 	if err == nil {
@@ -346,11 +281,7 @@ func (r *Resolver) fill(f *os.File, data []byte) error {
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
-	if err != nil {
-		return err
-	}
-	now := r.now()
-	return os.Chtimes(f.Name(), now, now)
+	return err
 }
 
 // removeTemps deletes the temporary files that an interrupted write left.

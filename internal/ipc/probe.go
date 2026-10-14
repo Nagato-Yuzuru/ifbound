@@ -7,8 +7,8 @@ import (
 )
 
 // ProbePrefix starts the first label of a probe name. To prove that the
-// resolver entry of an alias applies, ifboundd resolves
-// "<ProbePrefix><nonce>.<alias>" through the system resolver. When the
+// queries for a domain go to ifbound-dns, ifboundd resolves
+// "<ProbePrefix><nonce>.<domain>" through the system resolver. When the
 // query reaches ifbound-dns, the plugin answers it itself and sends the
 // name with Client.ReportProbe. The nonce is lower-case and new for each
 // probe, so no cache can answer it.

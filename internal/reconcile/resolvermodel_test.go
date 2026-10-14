@@ -12,9 +12,6 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/net/publicsuffix"
-
-	"github.com/Nagato-Yuzuru/ifbound/internal/dnsname"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
@@ -35,24 +32,10 @@ var modelListens = []netip.AddrPort{
 	netip.MustParseAddrPort("127.0.0.1:53554"),
 }
 
-// modelApexes holds apexes, some nested in others and in aliases.
+// modelApexes holds apexes, some nested in others.
 var modelApexes = []string{
 	"example.com", "www.example.com", "example.net", "a.b.example.net",
 	"ads.example", "provider.test", "sub.provider.test", canary,
-}
-
-// modelAliases holds learned alias names: names at, below, and next to
-// apexes; nested aliases; public suffixes; names that the domain rules
-// refuse; names that differ only in case or final dot.
-var modelAliases = []string{
-	"example.com", "WWW.Example.com.", "x.www.example.com", "myexample.com",
-	"cdn.example.net", "a.b.example.net", "b.example.net",
-	"provider.test", "cdn.provider.test", "deep.cdn.provider.test", "xprovider.test",
-	"other.org", "user.github.io", "x.co.uk", canary,
-	"com", "co.uk", "github.io", "cdn.cloudflare.net", "local", "test", "arpa",
-	"in-addr.arpa", "net",
-	`a\032b.test`, `a/b.test`, `*.wild.test`, "192.0.2.1", "-lead.test", `\195\169.test`,
-	`a\.b.test`, `\046\046.test`, `\000.test`,
 }
 
 const modelConfig = header + `
@@ -72,48 +55,17 @@ to = ["192.0.2.12"]
 deny_via = ["en1"]
 `
 
-// aliasBook is a fake AddrSource: learned aliases per policy, no
-// addresses.
-type aliasBook map[policy.Name][]dnsname.Name
+// noAddrs is an AddrSource with no learned address. The resolver part
+// does not depend on the addresses.
+type noAddrs struct{}
 
-func (aliasBook) Addrs(policy.Name) []netip.Addr { return nil }
-
-func (b aliasBook) Aliases(name policy.Name) []dnsname.Name { return slices.Clone(b[name]) }
-
-// verdict is the reference decision for one alias.
-type verdict int
-
-const (
-	accepted verdict = iota
-	notDomain
-	publicSuffix
-)
-
-// refAliasEntry is the reference of AliasEntry, built directly on
-// the configuration domain rules and the public suffix list.
-func refAliasEntry(n dnsname.Name) (string, verdict) {
-	d, err := policy.ParseDomain(n.String())
-	if err != nil {
-		return "", notDomain
-	}
-	if ps, _ := publicsuffix.PublicSuffix(d.String()); ps == d.String() {
-		return "", publicSuffix
-	}
-	return d.String(), accepted
-}
+func (noAddrs) Addrs(policy.Name) []netip.Addr { return nil }
 
 // refDesired is the reference desired set of resolver domains.
-func refDesired(apexes []string, policies []policy.Policy, book aliasBook) map[string]bool {
+func refDesired(apexes []string) map[string]bool {
 	out := make(map[string]bool)
 	for _, a := range apexes {
 		out[a] = true
-	}
-	for _, p := range policies {
-		for _, n := range book[p.Name] {
-			if d, v := refAliasEntry(n); v == accepted {
-				out[d] = true
-			}
-		}
 	}
 	others := len(out)
 	if out[canary] {
@@ -144,15 +96,6 @@ func coverageNames() []string {
 	add := func(d string) { set[d], set["zz."+d] = true, true }
 	for _, a := range modelApexes {
 		add(a)
-	}
-	for _, s := range modelAliases {
-		n, err := dnsname.Parse(s)
-		if err != nil {
-			continue
-		}
-		if d, err := policy.ParseDomain(n.String()); err == nil {
-			add(d.String())
-		}
 	}
 	return slices.Sorted(maps.Keys(set))
 }
@@ -269,10 +212,8 @@ type resolverModel struct {
 	probe    *resolverProbe
 	rec      reconcile.Reconciler
 	rng      *rand.Rand
-	all      []policy.Policy
 	policies []policy.Policy
 	apexes   []string
-	book     aliasBook
 	listen   netip.AddrPort
 	delay    bool
 	trace    []string
@@ -293,13 +234,12 @@ func newResolverModel(t *testing.T, seed uint64) *resolverModel {
 	rng := rand.New(rand.NewPCG(seed, 0x0dd))
 	w := reconciletest.NewWorld()
 	m := &resolverModel{
-		world:  w,
-		probe:  &resolverProbe{inner: w.Resolver(), world: w, rng: rng},
-		rng:    rng,
-		all:    cfg.Policies,
-		book:   make(aliasBook),
-		listen: modelListens[0],
-		delay:  rng.IntN(2) == 0,
+		world:    w,
+		probe:    &resolverProbe{inner: w.Resolver(), world: w, rng: rng},
+		rng:      rng,
+		policies: cfg.Policies,
+		listen:   modelListens[0],
+		delay:    rng.IntN(2) == 0,
 	}
 	w.SetResolverDelay(m.delay)
 	m.rec = reconcile.Reconciler{
@@ -308,7 +248,6 @@ func newResolverModel(t *testing.T, seed uint64) *resolverModel {
 		Resolver:  m.probe,
 		Inventory: reconciletest.NewInventory(en0),
 	}
-	m.policies = m.all
 	return m
 }
 
@@ -321,7 +260,7 @@ func (m *resolverModel) inputs() reconcile.Inputs {
 		}
 		apexes[i] = d
 	}
-	return reconcile.Inputs{Policies: m.policies, Book: m.book, Apexes: apexes, Listen: m.listen}
+	return reconcile.Inputs{Policies: m.policies, Book: noAddrs{}, Apexes: apexes, Listen: m.listen}
 }
 
 func (m *resolverModel) logf(format string, args ...any) {
@@ -330,16 +269,10 @@ func (m *resolverModel) logf(format string, args ...any) {
 
 // mutate changes the inputs at random.
 func (m *resolverModel) mutate() {
-	switch m.rng.IntN(6) {
-	case 0:
+	switch m.rng.IntN(3) {
+	case 0, 1:
 		m.newApexes()
-	case 1, 2:
-		m.learn()
-	case 3:
-		m.expire()
-	case 4:
-		m.newPolicies()
-	case 5:
+	case 2:
 		m.listen = modelListens[m.rng.IntN(len(modelListens))]
 		m.logf("listen = %v", m.listen)
 	}
@@ -353,44 +286,6 @@ func (m *resolverModel) newApexes() {
 		}
 	}
 	m.logf("apexes = %v", m.apexes)
-}
-
-func (m *resolverModel) learn() {
-	p := m.all[m.rng.IntN(len(m.all))].Name
-	for range 1 + m.rng.IntN(3) {
-		s := modelAliases[m.rng.IntN(len(modelAliases))]
-		n, err := dnsname.Parse(s)
-		if err != nil {
-			panic(err) // the pool holds names that dnsname accepts
-		}
-		if !slices.Contains(m.book[p], n) {
-			m.book[p] = append(m.book[p], n)
-		}
-		m.logf("learn %s %q", p, s)
-	}
-}
-
-func (m *resolverModel) expire() {
-	p := m.all[m.rng.IntN(len(m.all))].Name
-	if len(m.book[p]) > 0 {
-		i := m.rng.IntN(len(m.book[p]))
-		m.logf("expire %s %q", p, m.book[p][i])
-		m.book[p] = slices.Delete(m.book[p], i, i+1)
-	}
-}
-
-// newPolicies removes a random part of the policies; the others come
-// back.
-func (m *resolverModel) newPolicies() {
-	m.policies = nil
-	var names []policy.Name
-	for _, p := range m.all {
-		if m.rng.IntN(3) != 0 {
-			m.policies = append(m.policies, p)
-			names = append(names, p.Name)
-		}
-	}
-	m.logf("policies = %v", names)
 }
 
 func servers(w *reconciletest.World) map[string]netip.AddrPort {
@@ -435,7 +330,7 @@ func (m *resolverModel) step(t *testing.T, failP float64) bool {
 		delay:        m.delay,
 		before:       servers(m.world),
 		appliedStart: entryDomains(m.world.AppliedResolverEntries()),
-		desired:      refDesired(m.apexes, m.policies, m.book),
+		desired:      refDesired(m.apexes),
 	}
 	c.beforeDomains, c.desiredDomains = sortedKeys(c.before), sortedKeys(c.desired)
 	settleP := 0.0
@@ -680,5 +575,50 @@ func (m *resolverModel) randomStep(t *testing.T) {
 	if n := len(m.probe.calls); n != 0 || m.world.Writes() != before {
 		t.Fatalf("second convergence made %d resolver calls, world writes %d -> %d\ntrace:\n  %s",
 			n, before, m.world.Writes(), strings.Join(m.trace, "\n  "))
+	}
+}
+
+// fixedModel returns a model with no random faults, no delay, and no
+// random settles.
+func fixedModel(t *testing.T) *resolverModel {
+	t.Helper()
+	m := newResolverModel(t, 0)
+	m.delay = false
+	m.world.SetResolverDelay(false)
+	m.stats = &modelStats{}
+	return m
+}
+
+// The keep rule compares whole labels. An old entry stays when the write
+// of a desired entry on its label path fails: at or below it, or at or
+// above it. A failed entry that only ends with the same text, or is on
+// another path, does not keep it.
+func TestConvergeKeepsOldEntryOnLabelPathOfFailedWrite(t *testing.T) {
+	tests := []struct {
+		old, failed string
+		kept        bool
+	}{
+		{"provider.test", "cdn.provider.test", true},
+		{"provider.test", "deep.cdn.provider.test", true},
+		{"deep.cdn.provider.test", "provider.test", true},
+		{"cdn.provider.test", "provider.test", true},
+		{"provider.test", "xprovider.test", false},
+		{"provider.test", "other.org", false},
+		{"cdn.provider.test", "xprovider.test", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.old+" "+tt.failed, func(t *testing.T) {
+			m := fixedModel(t)
+			m.apexes = []string{tt.old}
+			m.step(t, 0)
+			m.apexes = []string{tt.failed}
+			m.probe.failOn = map[string]bool{tt.failed: true}
+
+			m.step(t, 0)
+
+			if got := slices.Contains(entryDomains(m.world.ResolverEntries()), tt.old); got != tt.kept {
+				t.Errorf("%s kept = %v, want %v; calls %v", tt.old, got, tt.kept, m.probe.calls)
+			}
+		})
 	}
 }
