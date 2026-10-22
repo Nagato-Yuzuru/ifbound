@@ -72,11 +72,11 @@ url_api = "https://api.github.com/repos/j178/prek/releases/assets/611684483"
 provenance = "github-attestations"
 
 [[tools.tart]]
-version = "2.40.1"
+version = "2.41.1"
 backend = "aqua:openai/tart"
-specifiers = ["2.40.1"]
+specifiers = ["2.41.1"]
 
 [tools.tart."platforms.macos-arm64"]
-checksum = "sha256:363e2701154a8155cbc1bb6d845430c9b42697d2a186bc49574471ca2877db46"
-url = "https://github.com/openai/tart/releases/download/2.40.1/tart.tar.gz"
-url_api = "https://api.github.com/repos/openai/tart/releases/assets/600797855"
+checksum = "sha256:e680a734febccfce7d4e910c1f7f13fc3b00f19a181c945e2d746de3214c32c2"
+url = "https://github.com/openai/tart/releases/download/2.41.1/tart.tar.gz"
+url_api = "https://api.github.com/repos/openai/tart/releases/assets/644183490"
