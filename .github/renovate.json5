@@ -47,5 +47,17 @@
       groupName: "CoreDNS",
       automerge: false,
     },
+    {
+      // A Go point release usually fixes a vulnerability in the standard
+      // library. Neither osv.dev nor GitHub advisories match it to the
+      // toolchain version, so it does not get a security update. It skips the
+      // weekly group and the 7-day wait, and a person reviews it.
+      matchManagers: ["mise"],
+      matchDepNames: ["go"],
+      groupName: null,
+      schedule: ["at any time"],
+      minimumReleaseAge: null,
+      automerge: false,
+    },
   ],
 }
