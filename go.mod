@@ -3,7 +3,7 @@ module github.com/Nagato-Yuzuru/ifbound
 go 1.27.3
 
 require (
-	github.com/coredns/caddy v1.1.4
+	github.com/coredns/caddy/v2 v2.1.1
 	github.com/coredns/coredns v1.14.7
 	github.com/miekg/dns v1.1.73
 	github.com/pelletier/go-toml/v2 v2.4.3
