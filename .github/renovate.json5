@@ -7,19 +7,25 @@
   minimumReleaseAge: "7 days",
   internalChecksFilter: "strict",
   postUpdateOptions: ["gomodTidy"],
+  timezone: "Asia/Taipei",
   // GitHub advisories miss many Go vulnerabilities. osv.dev includes the
   // Go vulnerability database that govulncheck uses.
   osvVulnerabilityAlerts: true,
   // A security update skips the 7-day wait and goes to the lowest fixed
   // version. Without the wait, a compromised release is not filtered out,
-  // so a person reviews each one.
+  // so a person reviews each one. It does not join the weekly group and
+  // does not wait for the schedule.
   vulnerabilityAlerts: {
     automerge: false,
     labels: ["security"],
   },
   packageRules: [
     {
+      // One PR each week holds all non-major updates, so that the CI runs
+      // once for them.
       matchUpdateTypes: ["minor", "patch", "digest", "pinDigest"],
+      groupName: "non-major dependencies",
+      schedule: ["before 6am on monday"],
       automerge: true,
     },
     {
@@ -28,21 +34,17 @@
       matchManagers: ["gomod"],
       matchDepTypes: ["indirect"],
       enabled: true,
-      groupName: "indirect Go modules",
     },
     {
       // The DNS plugin depends on the behavior of these modules. A person
-      // reviews each update.
+      // reviews each update. They have their own group, so that the weekly
+      // group can merge without a review.
       matchPackageNames: [
         "github.com/coredns/coredns",
         "github.com/coredns/caddy",
         "github.com/miekg/dns",
       ],
-      automerge: false,
-    },
-    {
-      // Renovate cannot always refresh mise.lock.
-      matchManagers: ["mise"],
+      groupName: "CoreDNS",
       automerge: false,
     },
   ],

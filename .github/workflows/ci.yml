@@ -15,6 +15,10 @@ concurrency:
 env:
   # CI does not start a VM, so it does not need tart.
   MISE_DISABLE_TOOLS: tart
+  # Renovate updates mise.lock itself. A lock that does not agree with
+  # mise.toml fails the install, so that a mise update can merge without
+  # a review. Without this, mise-action repairs the lock and hides it.
+  MISE_LOCKED: "1"
 
 jobs:
   # The test jobs are required checks, so a path filter on the workflow
