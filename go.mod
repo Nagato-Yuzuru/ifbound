@@ -1,6 +1,6 @@
 module github.com/Nagato-Yuzuru/ifbound
 
-go 1.27.1
+go 1.27.3
 
 require (
 	github.com/coredns/caddy v1.1.4
