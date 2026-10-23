@@ -21,8 +21,9 @@ env:
   MISE_LOCKED: "1"
 
 jobs:
-  # The test jobs are required checks, so a path filter on the workflow
-  # would leave them pending. A job that its `if` skips counts as passed.
+  # The jobs that cannot use the Go test cache run only for a change that
+  # can affect them. A workflow path filter would leave a required check
+  # pending, so ci-ok is the only required check of this workflow.
   changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -69,9 +70,6 @@ jobs:
 
   test:
     name: test (${{ matrix.os }})
-    # A failed changes job gives no output, so the tests run.
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +81,15 @@ jobs:
         with:
           persist-credentials: false
       - uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
+      # go test reuses the result of a package whose test binary did not
+      # change, so a PR runs only the tests that its change can affect.
+      - id: gocache
+        run: echo "dir=$(go env GOCACHE)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.gocache.outputs.dir }}
+          key: gocache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: gocache-${{ runner.os }}-
       - run: go test -race ./...
 
   test-root:
@@ -123,3 +130,15 @@ jobs:
           persist-credentials: false
       - uses: jdx/mise-action@08ae2a091c038e1e05ec6f5115dc5c69d5a2a6b8 # v5.1.2
       - run: mise run e2e
+
+  # The only required check of this workflow. A skipped job counts as
+  # passed; a failed or cancelled job fails it. A new job must be added
+  # to needs.
+  ci-ok:
+    needs: [check, test, test-root, e2e]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: exit 1
