@@ -48,6 +48,13 @@
       automerge: false,
     },
     {
+      // The CoreDNS plugin API uses caddy types, so the caddy major version
+      // must be the one that CoreDNS uses (v1 in CoreDNS v1.15.0). Another
+      // major version does not compile.
+      matchPackageNames: ["github.com/coredns/caddy"],
+      allowedVersions: "<2",
+    },
+    {
       // A Go point release usually fixes a vulnerability in the standard
       // library. Neither osv.dev nor GitHub advisories match it to the
       // toolchain version, so it does not get a security update. It skips the
