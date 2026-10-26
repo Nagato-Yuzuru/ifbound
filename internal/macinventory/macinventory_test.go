@@ -199,7 +199,7 @@ func TestParseLinksRejectsSkippedInterface(t *testing.T) {
 	if err != nil {
 		t.Fatalf("socket: %v", err)
 	}
-	t.Cleanup(func() { _ = unix.Close(fd) })
+	t.Cleanup(func() { _ = unix.Close(fd) }) //nolint:errcheck // the test only reads from the socket; a close error loses nothing
 	if _, err := parseLinks(rib, fd); err != nil {
 		t.Fatalf("parseLinks of the real list: %v", err)
 	}
@@ -469,7 +469,7 @@ func sendRTMGet(t *testing.T, n int) {
 	if err != nil {
 		t.Fatalf("socket: %v", err)
 	}
-	defer func() { _ = unix.Close(w) }()
+	defer func() { _ = unix.Close(w) }() //nolint:errcheck // a close error cannot change the messages already sent
 	for i := range n {
 		m := route.RouteMessage{
 			Version: unix.RTM_VERSION, Type: unix.RTM_GET, ID: uintptr(os.Getpid()), Seq: i + 1,
@@ -517,7 +517,7 @@ func TestSocketKeepsBurst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openSocket: %v", err)
 	}
-	t.Cleanup(func() { _ = f.Close() })
+	t.Cleanup(func() { _ = f.Close() }) //nolint:errcheck // the test only reads from the socket; a close error loses nothing
 	const sent = 2000
 	sendRTMGet(t, sent)
 

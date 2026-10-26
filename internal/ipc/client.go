@@ -130,7 +130,7 @@ func (c *Client) roundTrip(ctx context.Context, req envelope) (json.RawMessage, 
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
-	defer func() { _ = conn.Close() }() // read-only use after the reply; nothing to flush
+	defer func() { _ = conn.Close() }() //nolint:errcheck // read-only use after the reply; nothing to flush
 
 	uid, err := peerUID(conn)
 	if err != nil {
@@ -142,7 +142,7 @@ func (c *Client) roundTrip(ctx context.Context, req envelope) (json.RawMessage, 
 
 	// The context is the only source of deadlines. This keeps the context
 	// error and the I/O error in the same order.
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) }) //nolint:errcheck // a closed conn needs no wake-up; the read already failed
 	defer stop()
 
 	if err := writeFrame(conn, req); err != nil {

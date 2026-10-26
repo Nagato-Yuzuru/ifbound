@@ -31,7 +31,11 @@ func TestFoundGivesNormalizedCopy(t *testing.T) {
 		t.Fatalf("Resolve = %v, want %v", got, want)
 	}
 	got[0] = netip.MustParseAddr("192.0.2.1")
-	if again, _ := f.Resolve(t.Context(), "cdn.alias.test."); !slices.Equal(again, want) {
+	again, err := f.Resolve(t.Context(), "cdn.alias.test.")
+	if err != nil {
+		t.Fatalf("second Resolve: %v", err)
+	}
+	if !slices.Equal(again, want) {
 		t.Fatalf("a change to a result changed the stored answer: %v", again)
 	}
 }
@@ -88,7 +92,7 @@ func TestNamesInCallOrder(t *testing.T) {
 		t.Fatalf("Names before any call = %v, want none", got)
 	}
 	for _, n := range []string{"b.test.", "a.test.", "b.test."} {
-		_, _ = f.Resolve(t.Context(), n) // only the record matters here
+		_, _ = f.Resolve(t.Context(), n) //nolint:errcheck // only the recorded name matters here
 	}
 	if got, want := f.Names(), []string{"b.test.", "a.test.", "b.test."}; !slices.Equal(got, want) {
 		t.Fatalf("Names = %v, want %v", got, want)

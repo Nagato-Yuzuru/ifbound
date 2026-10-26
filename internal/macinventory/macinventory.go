@@ -152,9 +152,9 @@ func (i *Inventory) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = f.Close() }() // the socket is read-only: a close error loses nothing
+	defer func() { _ = f.Close() }() //nolint:errcheck // the socket is read-only: a close error loses nothing
 	stop := context.AfterFunc(ctx, func() {
-		_ = f.SetReadDeadline(time.Unix(1, 0)) // a failure means that the file is closed and the read is done
+		_ = f.SetReadDeadline(time.Unix(1, 0)) //nolint:errcheck // a failure means that the file is closed and the read is done
 	})
 	defer stop()
 	i.signal()
@@ -168,13 +168,13 @@ func openSocket() (*os.File, error) {
 		return nil, fmt.Errorf("%w: opening the socket: %v", errWatch, err)
 	}
 	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, rcvBuf); err != nil {
-		_ = unix.Close(fd) // the error below is the cause
+		_ = unix.Close(fd) //nolint:errcheck // the error below is the cause
 		return nil, fmt.Errorf("%w: setting the receive buffer: %v", errWatch, err)
 	}
 	// A non-blocking descriptor joins the runtime poller, so a read
 	// deadline can stop a blocked read.
 	if err := unix.SetNonblock(fd, true); err != nil {
-		_ = unix.Close(fd) // the error below is the cause
+		_ = unix.Close(fd) //nolint:errcheck // the error below is the cause
 		return nil, fmt.Errorf("%w: setting the socket non-blocking: %v", errWatch, err)
 	}
 	return os.NewFile(uintptr(fd), "route"), nil
@@ -282,7 +282,7 @@ func systemLinks() ([]link, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: opening a socket for SIOCGIFTYPE: %v", errList, err)
 	}
-	defer func() { _ = unix.Close(fd) }() // nothing was written to the socket
+	defer func() { _ = unix.Close(fd) }() //nolint:errcheck // nothing was written to the socket
 	return parseLinks(rib, fd)
 }
 

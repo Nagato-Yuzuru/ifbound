@@ -224,7 +224,7 @@ func udpExchange(t *testing.T, to netip.AddrPort) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = conn.Close() }() // a UDP close error does not change the result
+	defer func() { _ = conn.Close() }() //nolint:errcheck // a UDP close error does not change the result
 	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		return err
 	}

@@ -278,7 +278,7 @@ func (rg *rig) checkObserve(r *rand.Rand) (rechecked bool) {
 	o := rigObservation(r)
 	st := rg.status()
 	tablesBefore := rg.world.Tables()
-	snapBefore, _ := os.ReadFile(rg.snap)
+	snapBefore, _ := os.ReadFile(rg.snap) //nolint:errcheck // a missing snapshot reads as empty; the test compares the bytes after
 	start := time.Now()
 	_, err := rg.d.Observe(context.Background(), o)
 	if waited := time.Since(start); waited != 0 {
@@ -328,7 +328,7 @@ func (rg *rig) checkUnmatched(err error, state daemon.State, tablesBefore map[po
 	if after := rg.world.Tables(); !maps.EqualFunc(after, tablesBefore, slices.Equal) {
 		rg.fatalf("unmatched name changed the tables: %v -> %v", tablesBefore, after)
 	}
-	if after, _ := os.ReadFile(rg.snap); !bytes.Equal(after, snapBefore) {
+	if after, _ := os.ReadFile(rg.snap); !bytes.Equal(after, snapBefore) { //nolint:errcheck // a missing snapshot reads as empty, as before
 		rg.fatalf("unmatched name changed the snapshot")
 	}
 }

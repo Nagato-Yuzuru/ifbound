@@ -36,7 +36,11 @@ func shortPath(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
 	return filepath.Join(dir, "s.sock")
 }
 
@@ -49,7 +53,7 @@ func listen(t *testing.T, path string, h Handler, uids ...uint32) *Server {
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(context.Background()) }()
 	t.Cleanup(func() {
-		_ = srv.Close()
+		_ = srv.Close() //nolint:errcheck // a test may close the server first; Serve's result is checked below
 		select {
 		case err := <-served:
 			if err != nil {
@@ -253,8 +257,10 @@ func rawExchange(t *testing.T, path string, raw []byte) (envelope, net.Conn) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = conn.Close() })
-	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	t.Cleanup(func() { _ = conn.Close() }) //nolint:errcheck // closes the client end after the reply is read
+	if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
 	if _, err := conn.Write(raw); err != nil {
 		t.Fatal(err)
 	}
@@ -362,15 +368,19 @@ func TestClientRejectsBadReplies(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			t.Cleanup(func() { _ = ln.Close() })
+			t.Cleanup(func() {
+				if err := ln.Close(); err != nil {
+					t.Error(err)
+				}
+			})
 			go func() {
 				conn, err := ln.Accept()
 				if err != nil {
 					return
 				}
-				defer func() { _ = conn.Close() }()
-				_, _ = readFrame(conn)
-				_, _ = conn.Write(tc.reply)
+				defer func() { _ = conn.Close() }() //nolint:errcheck // the peer may have closed first
+				_, _ = readFrame(conn)              //nolint:errcheck // the canned reply goes out whatever the request was
+				_, _ = conn.Write(tc.reply)         //nolint:errcheck // the client side asserts on a failed reply
 			}()
 			_, err = NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."})
 			if !errors.Is(err, tc.want) {
@@ -419,7 +429,9 @@ func TestClientRecoversAfterServerRestart(t *testing.T) {
 	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Fatalf("after start: %v", err)
 	}
-	_ = srv.Close()
+	if err := srv.Close(); err != nil {
+		t.Fatalf("closing the server: %v", err)
+	}
 	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("after stop: err = %v, want ErrUnavailable", err)
 	}
@@ -463,7 +475,7 @@ func TestServeStopsOnContextCancel(t *testing.T) {
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx) }()
 
-	go func() { _, _ = NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}) }()
+	go func() { _, _ = NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}) }() //nolint:errcheck // the call is cut off with the server; the test checks Serve instead
 	<-started
 	cancel()
 	select {
@@ -485,7 +497,10 @@ func TestServeStopsOnContextCancel(t *testing.T) {
 }
 
 func TestFrameRoundTripJSON(t *testing.T) {
-	b, _ := json.Marshal(envelopeOf(typeAck, nil))
+	b, err := json.Marshal(envelopeOf(typeAck, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if string(b) != `{"v":3,"type":"ack"}` {
 		t.Errorf("wire = %s", b)
 	}
@@ -521,7 +536,7 @@ func TestReportWaitingForSlotHonorsContext(t *testing.T) {
 	t.Cleanup(func() { close(release) })
 	var wg sync.WaitGroup
 	for range maxInFlight {
-		wg.Go(func() { _, _ = c.Report(t.Context(), Observation{QName: "a.test."}) })
+		wg.Go(func() { _, _ = c.Report(t.Context(), Observation{QName: "a.test."}) }) //nolint:errcheck // these calls only fill the pool; the test checks the cap, not their results
 	}
 	for len(c.inflight) < maxInFlight {
 		time.Sleep(time.Millisecond) // waits for the pool to fill; no other signal exists
@@ -555,7 +570,9 @@ func TestServerConnectionCap(t *testing.T) {
 		t.Errorf("err = %v, want DeadlineExceeded while the cap is full", err)
 	}
 	for _, conn := range idle {
-		_ = conn.Close()
+		if err := conn.Close(); err != nil {
+			t.Error(err)
+		}
 	}
 	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Errorf("after the idle connections close: %v", err)
@@ -675,7 +692,7 @@ func TestListenRefusals(t *testing.T) {
 		if !errors.Is(err, ErrNotSocket) {
 			t.Errorf("err = %v, want ErrNotSocket", err)
 		}
-		if b, _ := os.ReadFile(path); string(b) != "keep" {
+		if b, err := os.ReadFile(path); err != nil || string(b) != "keep" {
 			t.Error("file was changed")
 		}
 	})
@@ -701,7 +718,10 @@ func TestListenReplacesStaleSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	ln.(*net.UnixListener).SetUnlinkOnClose(false) //nolint:forcetypeassert // unix listener
-	_ = ln.Close()                                 // leaves a dead socket file, as a crash does
+	// Closing leaves a dead socket file, as a crash does.
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
 	listen(t, path, handlerFunc(ack), self())
 	if _, err := NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Error(err)
@@ -722,7 +742,11 @@ func TestOldServerCloseKeepsNewerSocket(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = newer.Close() })
+	t.Cleanup(func() {
+		if err := newer.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	if err := old.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -740,7 +764,9 @@ func TestLockReleasedOnCloseAndLockFileKept(t *testing.T) {
 	if _, err := Listen(ServerConfig{Path: path, Handler: handlerFunc(ack)}); !errors.Is(err, ErrAlreadyRunning) {
 		t.Errorf("second Listen: err = %v, want ErrAlreadyRunning", err)
 	}
-	_ = srv.Close()
+	if err := srv.Close(); err != nil {
+		t.Fatalf("closing the server: %v", err)
+	}
 	if _, err := os.Lstat(path + ".lock"); err != nil {
 		t.Errorf("lock file was removed: %v", err)
 	}
@@ -748,7 +774,9 @@ func TestLockReleasedOnCloseAndLockFileKept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Listen after Close: %v", err)
 	}
-	_ = again.Close()
+	if err := again.Close(); err != nil {
+		t.Error(err)
+	}
 }
 
 // TestListenSaturatedLiveServer: a live server with a full accept queue
@@ -768,7 +796,9 @@ func TestListenSaturatedLiveServer(t *testing.T) {
 	t.Cleanup(func() {
 		close(release)
 		for _, c := range conns {
-			_ = c.Close()
+			if err := c.Close(); err != nil {
+				t.Error(err)
+			}
 		}
 	})
 	before, err := os.Lstat(path)
@@ -784,7 +814,7 @@ func TestListenSaturatedLiveServer(t *testing.T) {
 			saturated = true
 			break
 		}
-		_, _ = c.Write(req)
+		_, _ = c.Write(req) //nolint:errcheck // the loop counts dials; a failed write only changes the load
 		conns = append(conns, c)
 	}
 	if !saturated {
@@ -871,7 +901,9 @@ func TestAcceptErrorsDoNotStopServe(t *testing.T) {
 	if fl.closes.Load() != 0 {
 		t.Error("listener was closed after a transient Accept error")
 	}
-	_ = srv.Close()
+	if err := srv.Close(); err != nil {
+		t.Fatalf("closing the server: %v", err)
+	}
 	select {
 	case err := <-served:
 		if err != nil {
@@ -912,7 +944,7 @@ func TestCrossUID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })  //nolint:errcheck // best-effort cleanup; files made by the other uid can block removal
 	if err := os.Chmod(dir, 0o755); err != nil { //nolint:gosec // the other uid must reach the socket and the binary copy
 		t.Fatal(err)
 	}
@@ -995,7 +1027,9 @@ func TestCloseCancelsHandlersAndServeReturns(t *testing.T) {
 	for range 3 {
 		<-started
 	}
-	_ = srv.Close()
+	if err := srv.Close(); err != nil {
+		t.Fatalf("closing the server: %v", err)
+	}
 	select {
 	case err := <-served:
 		if err != nil {
@@ -1037,21 +1071,29 @@ func TestTrickleCannotExtendDeadline(t *testing.T) {
 	}
 	srv.connTimeout = 200 * time.Millisecond // set before Serve starts
 	served := make(chan struct{})
-	go func() { _ = srv.Serve(t.Context()); close(served) }()
-	t.Cleanup(func() { _ = srv.Close(); <-served })
+	go func() { _ = srv.Serve(t.Context()); close(served) }() //nolint:errcheck // Serve ends when the cleanup closes it; this test does not assert on that result
+	t.Cleanup(func() {
+		if err := srv.Close(); err != nil {
+			t.Error(err)
+		}
+		<-served
+	})
 
 	var d net.Dialer
 	conn, err := d.DialContext(t.Context(), "unix", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = conn.Close() }()
+	defer func() { _ = conn.Close() }() //nolint:errcheck // the server closes first; this call only frees the descriptor
 	begin := time.Now()
-	_, _ = conn.Write([]byte{0, 0, 1, 0}) // a 256-byte body follows, slowly
+	// A 256-byte body follows, slowly.
+	if _, err := conn.Write([]byte{0, 0, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
 	closed := make(chan time.Duration, 1)
 	go func() {
 		var b [1]byte
-		_, _ = conn.Read(b[:])
+		_, _ = conn.Read(b[:]) //nolint:errcheck // the read only waits for the server to close; the elapsed time is the result
 		closed <- time.Since(begin)
 	}()
 	tick := time.NewTicker(50 * time.Millisecond)
@@ -1064,7 +1106,7 @@ func TestTrickleCannotExtendDeadline(t *testing.T) {
 			}
 			return
 		case <-tick.C:
-			_, _ = conn.Write([]byte{' '})
+			_, _ = conn.Write([]byte{' '}) //nolint:errcheck // the server may have closed the connection already; the closed case ends the test
 		case <-time.After(3 * time.Second):
 			t.Fatal("connection still open after 3s of trickling")
 		}
@@ -1082,13 +1124,17 @@ func TestCrossUIDImpostor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })  //nolint:errcheck // best-effort cleanup; files made by the other uid can block removal
 	if err := os.Chmod(dir, 0o777); err != nil { //nolint:gosec // the other uid must bind here and reach the binary copy
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "imp.sock")
 	stdin := startImpostor(t, copyTestBinary(t, dir), path, nobody)
-	defer func() { _ = stdin.Close() }() // ends the impostor
+	defer func() { // ends the impostor
+		if err := stdin.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
 
 	// The fixture is sound: the same ack is trusted when the uid matches.
 	if _, err := NewClient(path, nobody).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
@@ -1116,7 +1162,10 @@ func startImpostor(t *testing.T, bin, path string, uid uint32) io.WriteCloser {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = stdin.Close(); _ = cmd.Wait() })
+	t.Cleanup(func() {
+		_ = stdin.Close() //nolint:errcheck // the test may have closed stdin already
+		_ = cmd.Wait()    //nolint:errcheck // the impostor's exit status is not under test
+	})
 	sc := bufio.NewScanner(out)
 	for sc.Scan() {
 		if strings.HasPrefix(sc.Text(), "LISTENING") {
@@ -1147,16 +1196,16 @@ func TestHelperImpostor(t *testing.T) {
 				return
 			}
 			go func() {
-				defer func() { _ = c.Close() }()
+				defer func() { _ = c.Close() }() //nolint:errcheck // the helper process ends soon after; the parent asserts the outcome
 				if _, err := readFrame(c); err == nil {
-					_, _ = c.Write(frameOf(`{"v":3,"type":"ack","body":{"protected":false}}`))
+					_, _ = c.Write(frameOf(`{"v":3,"type":"ack","body":{"protected":false}}`)) //nolint:errcheck // the parent asserts the outcome of a failed reply
 				}
 			}()
 		}
 	}()
 	fmt.Println("LISTENING")
-	_, _ = io.Copy(io.Discard, os.Stdin) // until the parent closes stdin
-	_ = ln.Close()
+	_, _ = io.Copy(io.Discard, os.Stdin) //nolint:errcheck // waits for the parent to close stdin; the error does not change the exit
+	_ = ln.Close()                       //nolint:errcheck // the process exits next
 }
 
 // errOf drops the ack of a Report, for a test that checks only the error.

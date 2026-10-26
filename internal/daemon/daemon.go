@@ -170,7 +170,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	var debounce <-chan time.Time
 	changes := d.cfg.Platform.Inventory.Changes()
 
-	_ = l.reconcile(ctx, "start") // the phase holds the outcome
+	_ = l.reconcile(ctx, "start") //nolint:errcheck // the phase holds the outcome
 	for {
 		l.armExpiry(expiry)
 		warm.sync(ctx, l)
@@ -181,7 +181,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			req(ctx, l)
 			if l.recheck {
 				l.recheck = false
-				_ = l.reconcile(ctx, "ruleset changed") // the phase holds the outcome
+				_ = l.reconcile(ctx, "ruleset changed") //nolint:errcheck // the phase holds the outcome
 			}
 		case <-changes:
 			if debounce == nil {
@@ -189,9 +189,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		case <-debounce:
 			debounce = nil
-			_ = l.reconcile(ctx, "interfaces") // the phase holds the outcome
+			_ = l.reconcile(ctx, "interfaces") //nolint:errcheck // the phase holds the outcome
 		case <-heal.C:
-			_ = l.reconcile(ctx, "self-heal") // the phase holds the outcome
+			_ = l.reconcile(ctx, "self-heal") //nolint:errcheck // the phase holds the outcome
 		case <-expiry.C:
 			l.expire(ctx)
 		}

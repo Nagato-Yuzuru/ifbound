@@ -93,19 +93,20 @@ func faultScenario(t *testing.T, failAt int, mode fault) int {
 		}
 		return err
 	}
-	_ = report("web", obs("www.example.net", "203.0.113.1", "203.0.113.2"))
-	_ = report("ads", obs("x.ads.example", "3fff::1"))
+	// An injected fault fails a report; checkAcked judges only the acked ones.
+	_ = report("web", obs("www.example.net", "203.0.113.1", "203.0.113.2")) //nolint:errcheck // an injected fault can fail the report
+	_ = report("ads", obs("x.ads.example", "3fff::1"))                      //nolint:errcheck // an injected fault can fail the report
 	time.Sleep(40 * time.Minute)
-	_ = report("web", obs("example.com", "203.0.113.2", "203.0.113.3"))
-	_ = report("ads", obs("y.ads.example", "3fff::2")) // live when ads leaves
-	time.Sleep(21 * time.Minute)                       // 203.0.113.1 and 3fff::1 expire
+	_ = report("web", obs("example.com", "203.0.113.2", "203.0.113.3")) //nolint:errcheck // an injected fault can fail the report
+	_ = report("ads", obs("y.ads.example", "3fff::2"))                  //nolint:errcheck // an injected fault can fail the report; live when ads leaves
+	time.Sleep(21 * time.Minute)                                        // 203.0.113.1 and 3fff::1 expire
 	synctest.Wait()
 	inv.Set(en0, utun0)
 	time.Sleep(daemon.InterfaceDebounce)
 	synctest.Wait()
 	acks.remove("ads")
-	_ = a.d.Reconfigure(t.Context(), parse(t, configV2))
-	_ = report("mail", obs("mail.example.org", "192.0.2.25"))
+	_ = a.d.Reconfigure(t.Context(), parse(t, configV2))      //nolint:errcheck // an injected fault can fail the reconfigure
+	_ = report("mail", obs("mail.example.org", "192.0.2.25")) //nolint:errcheck // an injected fault can fail the report
 	heal()
 	heal()
 	recovered := mode == transient && fired.Load()

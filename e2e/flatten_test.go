@@ -64,7 +64,11 @@ func startFlattenStack(t *testing.T) *flattenStack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
 	sock := filepath.Join(dir, "s")
 	srv, err := ipc.Listen(ipc.ServerConfig{Path: sock, Handler: s, AllowedUIDs: []uint32{0}})
 	if err != nil {
@@ -90,7 +94,7 @@ func startFlattenStack(t *testing.T) *flattenStack {
 	if err != nil {
 		t.Fatalf("start CoreDNS: %v", err)
 	}
-	t.Cleanup(func() { _ = inst.Stop() })
+	t.Cleanup(func() { _ = inst.Stop() }) //nolint:errcheck // the test result does not depend on a clean stop
 	s.plugin = inst.Servers()[0].LocalAddr().(*net.UDPAddr).AddrPort()
 
 	r := macresolver.New(macresolver.Dir, macresolver.Scutil{})
@@ -187,7 +191,7 @@ func queryRecord(t *testing.T, name string, qtype uint16) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 	defer cancel()
-	out, _ := exec.CommandContext(ctx, "/usr/bin/dns-sd", "-Q", name, dns.TypeToString[qtype]).Output() // killed at the deadline by design
+	out, _ := exec.CommandContext(ctx, "/usr/bin/dns-sd", "-Q", name, dns.TypeToString[qtype]).Output() //nolint:errcheck // dns-sd runs until the deadline kills it, so it always returns an error; the caller reads the output
 	return string(out)
 }
 
@@ -396,7 +400,7 @@ func startZoneDNS(t *testing.T) *zoneDNS {
 		m := new(dns.Msg).SetReply(q)
 		m.RecursionAvailable = true
 		m.Answer, m.Ns = z.answer(q.Question[0])
-		_ = w.WriteMsg(m) // a lost reply makes the lookup in the test fail
+		_ = w.WriteMsg(m) //nolint:errcheck // a lost reply makes the lookup in the test fail
 	}), NotifyStartedFunc: func() { close(started) }}
 	done := make(chan error, 1)
 	go func() { done <- srv.ActivateAndServe() }()
@@ -406,7 +410,7 @@ func startZoneDNS(t *testing.T) *zoneDNS {
 		t.Fatalf("DNS server stopped at start: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = srv.Shutdown() // the test result does not depend on a clean stop
+		_ = srv.Shutdown() //nolint:errcheck // the test result does not depend on a clean stop
 		<-done             //nolint:errcheck // wait for the server goroutine to exit; its error after Shutdown is not under test
 	})
 	return z

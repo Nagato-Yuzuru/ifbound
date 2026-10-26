@@ -27,7 +27,11 @@ func shortSocket(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
 	return filepath.Join(dir, "s")
 }
 
@@ -125,8 +129,10 @@ func rawRoundTrip(t *testing.T, path string, payload []byte) map[string]json.Raw
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	defer func() { _ = conn.Close() }() //nolint:errcheck // the server closes first; this call only frees the descriptor
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
 	frame := make([]byte, 4+len(payload))
 	binary.BigEndian.PutUint32(frame, uint32(len(payload))) //nolint:gosec // test payloads are small
 	copy(frame[4:], payload)
@@ -354,13 +360,17 @@ func fakeServer(t *testing.T, reply func(body map[string]json.RawMessage) string
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ln.Close() })
+	t.Cleanup(func() {
+		if err := ln.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	go func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer func() { _ = conn.Close() }()
+		defer func() { _ = conn.Close() }() //nolint:errcheck // the peer may have closed first
 		var hdr [4]byte
 		if _, err := io.ReadFull(conn, hdr[:]); err != nil {
 			return
@@ -372,10 +382,13 @@ func fakeServer(t *testing.T, reply func(body map[string]json.RawMessage) string
 		var env struct {
 			Body map[string]json.RawMessage `json:"body"`
 		}
-		_ = json.Unmarshal(payload, &env)
+		if err := json.Unmarshal(payload, &env); err != nil {
+			t.Errorf("decoding request: %v", err)
+			return
+		}
 		out := []byte(reply(env.Body))
 		frame := binary.BigEndian.AppendUint32(nil, uint32(len(out))) //nolint:gosec // test replies are small
-		_, _ = conn.Write(append(frame, out...))
+		_, _ = conn.Write(append(frame, out...))                      //nolint:errcheck // the client side asserts on a failed reply
 	}()
 	return path
 }

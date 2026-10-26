@@ -128,7 +128,7 @@ func Listen(cfg ServerConfig) (*Server, error) {
 	}
 	s, err := bind(cfg)
 	if err != nil {
-		_ = lock.Close() // releases the flock; the bind error is the one to report
+		_ = lock.Close() //nolint:errcheck // releases the flock; the bind error is the one to report
 		return nil, err
 	}
 	s.lock = lock
@@ -143,7 +143,7 @@ func lockPath(path string) (*os.File, error) {
 		return nil, fmt.Errorf("opening lock file %s: %w", name, err)
 	}
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		_ = f.Close() // the lock error is the one to report
+		_ = f.Close() //nolint:errcheck // the lock error is the one to report
 		if errors.Is(err, unix.EWOULDBLOCK) {
 			return nil, fmt.Errorf("%w: %s", ErrAlreadyRunning, path)
 		}
@@ -175,13 +175,13 @@ func bind(cfg ServerConfig) (*Server, error) {
 	// Close must not unlink by name: a newer socket may own the path by then.
 	ln.(*net.UnixListener).SetUnlinkOnClose(false) //nolint:forcetypeassert // "unix" always gives *net.UnixListener
 	if err := os.Chmod(cfg.Path, socketMode); err != nil {
-		_ = ln.Close()          // the chmod error is the one to report
-		_ = os.Remove(cfg.Path) // the file is ours: bound just above
+		_ = ln.Close()          //nolint:errcheck // the chmod error is the one to report
+		_ = os.Remove(cfg.Path) //nolint:errcheck // the file is ours: bound just above
 		return nil, fmt.Errorf("setting mode of %s: %w", cfg.Path, err)
 	}
 	sock, err := os.Lstat(cfg.Path)
 	if err != nil {
-		_ = ln.Close() // the stat error is the one to report
+		_ = ln.Close() //nolint:errcheck // the stat error is the one to report
 		return nil, fmt.Errorf("inspecting %s: %w", cfg.Path, err)
 	}
 	s := newServer(ln, cfg)
@@ -228,12 +228,12 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.serving = true
 	s.cancel = cancel
 	s.mu.Unlock()
-	stop := context.AfterFunc(ctx, func() { _ = s.Close() }) // Close fails only if the listener is gone already
+	stop := context.AfterFunc(ctx, func() { _ = s.Close() }) //nolint:errcheck // Close fails only if the listener is gone already
 	defer stop()
 
 	var wg sync.WaitGroup
 	defer wg.Wait()
-	defer func() { _ = s.Close() }() // idempotent; closes live connections so wg.Wait returns
+	defer func() { _ = s.Close() }() //nolint:errcheck // idempotent; closes live connections so wg.Wait returns
 
 	var backoff time.Duration
 	for {
@@ -260,7 +260,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		backoff = 0
 		if !s.track(conn) {
 			<-s.slots
-			_ = conn.Close() // server is closing; nothing was read
+			_ = conn.Close() //nolint:errcheck // server is closing; nothing was read
 			continue
 		}
 		wg.Go(func() {
@@ -287,11 +287,11 @@ func (s *Server) Close() error {
 	}
 	err := s.ln.Close()
 	for c := range s.conns {
-		_ = c.Close() // unblocks the reader; the connection owner logs real errors
+		_ = c.Close() //nolint:errcheck // unblocks the reader; the connection owner logs real errors
 	}
 	s.removeOwnSocket()
 	if s.lock != nil {
-		_ = s.lock.Close() // releases the flock; the lock file stays on disk
+		_ = s.lock.Close() //nolint:errcheck // releases the flock; the lock file stays on disk
 	}
 	if err != nil {
 		return fmt.Errorf("closing listener: %w", err)
@@ -327,7 +327,7 @@ func (s *Server) untrack(c net.Conn) {
 	s.mu.Lock()
 	delete(s.conns, c)
 	s.mu.Unlock()
-	_ = c.Close() // may be closed by Close already
+	_ = c.Close() //nolint:errcheck // may be closed by Close already
 }
 
 // serveConn reads one request, replies once, and returns. One deadline
@@ -343,7 +343,7 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 		return
 	}
 	deadline := time.Now().Add(s.connTimeout)
-	_ = c.SetDeadline(deadline) // fails only on a closed conn; the read reports it
+	_ = c.SetDeadline(deadline) //nolint:errcheck // fails only on a closed conn; the read reports it
 	ctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 

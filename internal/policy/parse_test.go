@@ -570,7 +570,11 @@ func TestConstraintAliasing(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.Selectors()[0] = mustSel(t, "en1")
-	if want, _ := NewDenyVia(mustSel(t, "en0")); !d.Equal(want) {
+	want, err := NewDenyVia(mustSel(t, "en0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !d.Equal(want) {
 		t.Error("a caller changed the deny constraint through Selectors")
 	}
 }
@@ -581,7 +585,10 @@ func TestConstraintEqual(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	denyRev, _ := NewDenyVia(b, a)
+	denyRev, err := NewDenyVia(b, a)
+	if err != nil {
+		t.Fatal(err)
+	}
 	tests := []struct {
 		name string
 		x, y Constraint

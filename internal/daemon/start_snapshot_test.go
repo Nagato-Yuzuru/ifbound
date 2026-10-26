@@ -111,7 +111,7 @@ func checkRefusedSnapshot(t *testing.T, doc string) {
 	if w.Ruleset().ID() != ruleset || !slices.Equal(w.ResolverEntries(), entries) {
 		t.Error("the ruleset or the resolver entries changed")
 	}
-	if data, _ := os.ReadFile(snap); !bytes.Equal(data, []byte(doc)) {
+	if data, _ := os.ReadFile(snap); !bytes.Equal(data, []byte(doc)) { //nolint:errcheck // a failed read gives empty data, which fails this comparison
 		t.Errorf("the refused snapshot was overwritten: %s", data)
 	}
 }
@@ -150,7 +150,11 @@ func TestAliasOnlySnapshotAdoptsKernelEntries(t *testing.T) {
 				t.Errorf("adopted %s %s is not in the saved snapshot", e.p, e.a)
 			}
 		}
-		if saved, _ := os.ReadFile(snap); bytes.Contains(saved, []byte("aliases")) {
+		saved, err := os.ReadFile(snap)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(saved, []byte("aliases")) {
 			t.Errorf("the saved snapshot still has aliases: %s", saved)
 		}
 		rg.checkResolverEntries(true)

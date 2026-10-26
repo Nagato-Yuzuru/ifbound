@@ -37,10 +37,13 @@ func TestCrashBeforeRenameKeepsOldSnapshot(t *testing.T) {
 				t.Fatal("save did not reach the rename step")
 			}
 		}()
-		_ = b.Save(path)
+		_ = b.Save(path) //nolint:errcheck // the rename hook panics, so Save never returns
 	}()
 
-	temps, _ := filepath.Glob(path + tempInfix + "*")
+	temps, err := filepath.Glob(path + tempInfix + "*")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(temps) != 1 {
 		t.Fatalf("temporary files next to the snapshot: %v", temps)
 	}
@@ -62,7 +65,11 @@ func TestCrashBeforeRenameKeepsOldSnapshot(t *testing.T) {
 	if err := b.Save(path); err != nil {
 		t.Fatal(err)
 	}
-	if temps, _ = filepath.Glob(path + tempInfix + "*"); len(temps) != 0 {
+	temps, err = filepath.Glob(path + tempInfix + "*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(temps) != 0 {
 		t.Fatalf("leftover temporary files: %v", temps)
 	}
 }
@@ -99,7 +106,11 @@ func TestSaveRenamesFullTempInSameDir(t *testing.T) {
 	var data []byte
 	b.rename = func(o, n string) error {
 		from = o
-		data, _ = os.ReadFile(o)
+		var err error
+		data, err = os.ReadFile(o)
+		if err != nil {
+			t.Errorf("read temp file: %v", err)
+		}
 		if n != path {
 			t.Errorf("rename target %s, want %s", n, path)
 		}
@@ -111,7 +122,10 @@ func TestSaveRenamesFullTempInSameDir(t *testing.T) {
 	if filepath.Dir(from) != filepath.Dir(path) || !strings.HasPrefix(filepath.Base(from), "book.json.addrbook-tmp-") {
 		t.Fatalf("temp file %s", from)
 	}
-	final, _ := os.ReadFile(path)
+	final, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(data) == 0 || string(data) != string(final) {
 		t.Fatalf("temp content %q, final %q", data, final)
 	}

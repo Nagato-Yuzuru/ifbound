@@ -505,7 +505,7 @@ func TestServeDNSFailsClosed(t *testing.T) {
 		{
 			name: "next writes twice",
 			next: writeA(func(w dns.ResponseWriter, m *dns.Msg) (int, error) {
-				_ = w.WriteMsg(m) // the error is what the test checks through ServeDNS
+				_ = w.WriteMsg(m) //nolint:errcheck // the test checks this error through ServeDNS
 				return dns.RcodeSuccess, nil
 			}),
 			reporter: ack,
@@ -528,7 +528,7 @@ func TestServeDNSFailsClosed(t *testing.T) {
 				if err != nil {
 					return dns.RcodeServerFailure, err
 				}
-				_, _ = w.Write(buf) // the error is what the test checks through ServeDNS
+				_, _ = w.Write(buf) //nolint:errcheck // the test checks this error through ServeDNS
 				return dns.RcodeSuccess, nil
 			}),
 			reporter: ack,
@@ -581,7 +581,7 @@ func TestServeDNSDropsWriteAfterFailedReport(t *testing.T) {
 		return ipc.ErrRejected
 	})
 	h := &handler{key: testKey, next: next, reporter: rep, timeout: time.Second}
-	rec, rcode, _ := serve(t.Context(), h, "example.org.")
+	rec, rcode, _ := serve(t.Context(), h, "example.org.") //nolint:errcheck // the test checks the reply and the late-write error, not this one
 	if err := <-late; !errors.Is(err, errLateWrite) {
 		t.Errorf("late write error = %v, want %v", err, errLateWrite)
 	}

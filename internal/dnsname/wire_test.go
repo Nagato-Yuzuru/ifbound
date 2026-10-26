@@ -46,7 +46,7 @@ func badEscape(s string) bool {
 		if i+3 >= len(s) || !isDigit(s[i+2]) || !isDigit(s[i+3]) {
 			return true
 		}
-		if v, _ := strconv.Atoi(s[i+1 : i+4]); v > 255 {
+		if v, _ := strconv.Atoi(s[i+1 : i+4]); v > 255 { //nolint:errcheck // isDigit checked all three bytes above, so Atoi cannot fail
 			return true
 		}
 		i += 3
@@ -304,7 +304,7 @@ func TestCanonicalVsWire(t *testing.T) {
 		if !ok {
 			return
 		}
-		n, _ := dnsname.Parse(s)
+		n, _ := dnsname.Parse(s) //nolint:errcheck // checkAgainstWire already failed the test on any Parse error
 		j := join(labels)
 		if prev, seen := keyOf[n]; seen && prev != j {
 			t.Fatalf("key %q is shared by labels %s and %s", n, prev, j)
@@ -368,8 +368,8 @@ func FuzzCanonicalPair(f *testing.F) {
 		if !oka || !okb {
 			return
 		}
-		na, _ := dnsname.Parse(a)
-		nb, _ := dnsname.Parse(b)
+		na, _ := dnsname.Parse(a) //nolint:errcheck // checkAgainstWire already failed the test on any Parse error
+		nb, _ := dnsname.Parse(b) //nolint:errcheck // checkAgainstWire already failed the test on any Parse error
 		if (na == nb) != slices.Equal(la, lb) {
 			t.Fatalf("Parse(%q) = %q, Parse(%q) = %q; labels %q vs %q", a, na, b, nb, la, lb)
 		}

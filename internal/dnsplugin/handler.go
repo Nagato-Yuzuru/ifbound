@@ -314,7 +314,7 @@ func (x *exchange) complete(ctx context.Context, start string, m *dns.Msg) (*dns
 			return nil, fmt.Errorf("%w: reply for %s has rcode %s", errIncomplete, end, dns.RcodeToString[sub.Rcode])
 		}
 		next := merge(m, sub)
-		if again, pending, _ := pendingName(start, x.q.Qtype, next); pending && sameName(again, end) {
+		if again, pending, _ := pendingName(start, x.q.Qtype, next); pending && sameName(again, end) { //nolint:errcheck // the next pass of this loop runs pendingName on next and returns its error
 			return next, nil // NODATA without a SOA
 		}
 		m = next

@@ -188,7 +188,7 @@ func serveFuzzed(t *testing.T, in *dns.Msg, qname string, qtype uint16) (*dns.Ms
 		return ipc.Ack{Protected: true}, nil
 	})
 	h := &handler{key: testKey, next: fuzzUpstream{in}, reporter: rep, timeout: time.Second}
-	_, _ = h.ServeDNS(t.Context(), w, new(dns.Msg).SetQuestion(qname, qtype)) // a SERVFAIL writes nothing
+	_, _ = h.ServeDNS(t.Context(), w, new(dns.Msg).SetQuestion(qname, qtype)) //nolint:errcheck // the caller reads the reply the writer got, and a SERVFAIL writes nothing
 	return w.reply, reports
 }
 

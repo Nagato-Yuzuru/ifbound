@@ -597,12 +597,12 @@ func TestNoMethodRunsPfctlDisable(t *testing.T) {
 	rs := compileRS(t, testPolicies)
 	ctx := t.Context()
 	mustLoad(t, r, rs)
-	_ = r.b.AddEntries(ctx, "bing", pfx("192.0.2.1/32"))
-	_ = r.b.RemoveEntries(ctx, "bing", pfx("192.0.2.1/32"))
-	_ = r.b.DropTable(ctx, "doh")
-	_, _ = r.b.Read(ctx)
-	_, _ = r.b.LoadedID(ctx)
-	_ = r.b.Release(ctx)
+	_ = r.b.AddEntries(ctx, "bing", pfx("192.0.2.1/32"))    //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
+	_ = r.b.RemoveEntries(ctx, "bing", pfx("192.0.2.1/32")) //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
+	_ = r.b.DropTable(ctx, "doh")                           //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
+	_, _ = r.b.Read(ctx)                                    //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
+	_, _ = r.b.LoadedID(ctx)                                //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
+	_ = r.b.Release(ctx)                                    //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
 	for _, c := range r.k.calls {
 		if slices.Contains(c, "-d") || slices.Contains(c, "-F") && slices.Contains(c, "all") {
 			t.Errorf("forbidden pfctl call %v", c)

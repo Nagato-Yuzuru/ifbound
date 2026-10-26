@@ -65,7 +65,7 @@ func (m *pvMDNS) Resolve(ctx context.Context, name string) ([]netip.Addr, error)
 	n := strings.ToLower(strings.TrimSuffix(name, "."))
 	if ipc.IsProbe(n) && m.routed(n) {
 		rec := dnstest.NewRecorder(&test.ResponseWriter{})
-		_, _ = m.plugin.ServeDNS(ctx, rec, new(dns.Msg).SetQuestion(dns.Fqdn(n), dns.TypeA))
+		_, _ = m.plugin.ServeDNS(ctx, rec, new(dns.Msg).SetQuestion(dns.Fqdn(n), dns.TypeA)) //nolint:errcheck // this fake only triggers the probe; the test reads the probe state, not the reply
 	}
 	return nil, fmt.Errorf("resolve %s: %w", n, syslookup.ErrNotFound)
 }
@@ -113,7 +113,11 @@ func pvSocket(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
 	return filepath.Join(dir, "s.sock")
 }
 
@@ -161,15 +165,15 @@ func pvStack(t *testing.T, timeout time.Duration) (*handler, *pvCounter, *reconc
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ctx) }()
 	t.Cleanup(func() {
-		_ = srv.Close()
-		<-served //nolint:errcheck // wait for Serve to return; its error after Close is not under test
+		_ = srv.Close() //nolint:errcheck // a close error does not change what the test checks
+		<-served        //nolint:errcheck // wait for Serve to return; its error after Close is not under test
 	})
 	client := ipc.NewClient(path, pvUID())
 	h := &handler{key: testKey, next: pvAnswer(), reporter: client, probes: client, timeout: timeout}
 	mdns.plugin = h
 	// The warm-up of the daemon sends probes to the plugin, so Run starts
 	// after the plugin is set.
-	go func() { _ = d.Run(ctx) }() // ends with ctx
+	go func() { _ = d.Run(ctx) }() //nolint:errcheck // Run ends with ctx; the test reads the daemon status instead
 	for {
 		st, err := d.Status(ctx)
 		if err == nil && st.State == daemon.StateReady {

@@ -35,7 +35,8 @@ func converge(t *testing.T, r *rig) reconcile.Report {
 		Resolver:  reconciletest.NewWorld().Resolver(),
 		Inventory: reconciletest.NewInventory(modelIfaces...),
 	}
-	rep, _ := rec.Converge(t.Context(), reconcile.Inputs{
+	// Callers inject pfctl faults on purpose and judge the loaded state.
+	rep, _ := rec.Converge(t.Context(), reconcile.Inputs{ //nolint:errcheck // the injected fault makes it fail
 		Policies: cfg.Policies,
 		Book:     emptyBook{},
 		Listen:   netip.MustParseAddrPort("127.0.0.1:10053"),
@@ -119,7 +120,9 @@ func TestTopLevelForeignRuleIsAChange(t *testing.T) {
 // own, so the "pfctl -X" of that holder does not disable pf.
 func TestLoadTakesAReferenceWhenPfIsEnabled(t *testing.T) {
 	r := newRig(t)
-	_, _ = r.k.enableRef() // tool A: pfctl -E
+	if _, err := r.k.enableRef(); err != nil { // tool A: pfctl -E
+		t.Fatal(err)
+	}
 	other := r.k.refs[0]
 	mustLoad(t, r, compileRS(t, testPolicies))
 	if _, err := r.k.releaseRef(other); err != nil { // tool A: pfctl -X <token A>
@@ -312,8 +315,10 @@ func TestReleaseAfterRestart(t *testing.T) {
 func TestReleaseOfAStaleToken(t *testing.T) {
 	r := newRig(t)
 	mustLoad(t, r, compileRS(t, testPolicies))
-	r.k.enabled, r.k.refs = false, nil // pfctl -d by someone
-	_, _ = r.k.enableRef()             // another tool: pfctl -E
+	r.k.enabled, r.k.refs = false, nil         // pfctl -d by someone
+	if _, err := r.k.enableRef(); err != nil { // another tool: pfctl -E
+		t.Fatal(err)
+	}
 	first := r.b.Release(t.Context())
 	second := r.b.Release(t.Context())
 	if first != nil || second != nil {

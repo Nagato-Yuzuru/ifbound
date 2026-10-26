@@ -87,7 +87,7 @@ func TestProbeReportWaitsAtMostTheTimeout(t *testing.T) {
 		})}
 	begin := time.Now()
 
-	_, rcode, _ := serve(t.Context(), h, ipc.ProbePrefix+"0a1b.cdn.test.")
+	_, rcode, _ := serve(t.Context(), h, ipc.ProbePrefix+"0a1b.cdn.test.") //nolint:errcheck // the test checks the rcode; the error carries no more
 
 	if rcode != dns.RcodeNameError || deadline.Sub(begin) > 300*time.Millisecond+50*time.Millisecond {
 		t.Errorf("rcode %d, probe deadline %v after the start; want NXDOMAIN within the timeout", rcode, deadline.Sub(begin))
@@ -149,7 +149,7 @@ func TestProbesPassWhileEveryReportWaits(t *testing.T) {
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(context.Background()) }()
 	t.Cleanup(func() {
-		_ = srv.Close()
+		_ = srv.Close() //nolint:errcheck // Serve returns the close error below, and the test fails on it
 		if err := <-served; err != nil {
 			t.Errorf("Serve returned %v", err)
 		}
@@ -162,7 +162,7 @@ func TestProbesPassWhileEveryReportWaits(t *testing.T) {
 	var wg sync.WaitGroup
 	for i := range n {
 		wg.Go(func() {
-			_, rcode, _ := serve(t.Context(), h, fmt.Sprintf("r%d.test.", i))
+			_, rcode, _ := serve(t.Context(), h, fmt.Sprintf("r%d.test.", i)) //nolint:errcheck // the test counts the rcodes; the error carries no more
 			replies <- rcode
 		})
 	}

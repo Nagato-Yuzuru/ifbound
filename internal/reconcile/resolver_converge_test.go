@@ -434,7 +434,7 @@ func TestMacResolverNeverTouchesForeignFiles(t *testing.T) {
 		if err := m.r.Write(t.Context(), reconcile.ResolverEntry{Domain: dom, Server: listenA}); !errors.Is(err, macresolver.ErrConflict) {
 			t.Errorf("Write(%s) over a foreign file = %v, want ErrConflict", d, err)
 		}
-		_ = m.r.Remove(t.Context(), dom) // the error is not the contract; the file is
+		_ = m.r.Remove(t.Context(), dom) //nolint:errcheck // the error is not the contract; the file is
 	}
 	if after := m.foreign(t); !maps.Equal(after, before) {
 		t.Errorf("foreign files changed:\n%v\n->\n%v", before, after)
