@@ -407,7 +407,7 @@ func startZoneDNS(t *testing.T) *zoneDNS {
 	}
 	t.Cleanup(func() {
 		_ = srv.Shutdown() // the test result does not depend on a clean stop
-		<-done
+		<-done             //nolint:errcheck // wait for the server goroutine to exit; its error after Shutdown is not under test
 	})
 	return z
 }
