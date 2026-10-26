@@ -33,7 +33,11 @@ func socketPath(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Error(err)
+		}
+	})
 	return filepath.Join(dir, "s.sock")
 }
 
@@ -47,7 +51,7 @@ func startServerAt(t *testing.T, path string, h ipc.Handler) {
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(context.Background()) }()
 	t.Cleanup(func() {
-		_ = srv.Close()
+		_ = srv.Close() //nolint:errcheck // Serve returns the close error below, and the test fails on it
 		if err := <-served; err != nil {
 			t.Errorf("Serve returned %v", err)
 		}

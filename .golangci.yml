@@ -23,6 +23,8 @@ linters:
     - nolintlint
     - godox
   settings:
+    errcheck:
+      check-blank: true # a blank drop needs //nolint:errcheck with a reason; nolintlint enforces the reason
     godox:
       keywords: [XXX, BUG] # the non-canonical spellings of WARN and FIXME
     errorlint:

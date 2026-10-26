@@ -51,8 +51,8 @@ func TestHelperEMFILEServer(t *testing.T) {
 	}
 	release()
 	fmt.Println("RELEASED")
-	in.Scan() // QUIT
-	_ = srv.Close()
+	in.Scan()       // QUIT
+	_ = srv.Close() //nolint:errcheck // the child exits next; the parent checks the Serve result below
 	fmt.Println("SERVE-END", <-served)
 }
 
@@ -81,9 +81,9 @@ func exhaustDescriptors() (func(), error) {
 	}
 	return func() {
 		for _, f := range fill {
-			_ = f.Close()
+			_ = f.Close() //nolint:errcheck // frees a filler descriptor; nothing reads it
 		}
-		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &old)
+		_ = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &old) //nolint:errcheck // lowering was allowed, so the restore cannot be refused; the child exits next
 	}, nil
 }
 
@@ -150,14 +150,20 @@ func TestAcceptSurvivesRealEMFILE(t *testing.T) {
 	cancel()
 	keepConnecting(t, path, 2500*time.Millisecond) // lets the backoff reach its cap
 
-	_, _ = io.WriteString(stdin, "RELEASE\n")
+	if _, err := io.WriteString(stdin, "RELEASE\n"); err != nil {
+		t.Fatalf("writing RELEASE: %v", err)
+	}
 	m.waitFor(t, "RELEASED")
 	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
 		t.Errorf("Report after the pressure ended: %v", err)
 	}
-	_, _ = io.WriteString(stdin, "QUIT\n")
+	if _, err := io.WriteString(stdin, "QUIT\n"); err != nil {
+		t.Fatalf("writing QUIT: %v", err)
+	}
 	m.waitFor(t, "SERVE-END <nil>")
-	_ = cmd.Wait()
+	if err := cmd.Wait(); err != nil {
+		t.Errorf("helper exit: %v", err)
+	}
 
 	checkBackoff(t, stderr.String())
 }
@@ -169,7 +175,7 @@ func keepConnecting(t *testing.T, path string, d time.Duration) {
 	var pending []net.Conn
 	defer func() {
 		for _, c := range pending {
-			_ = c.Close()
+			_ = c.Close() //nolint:errcheck // the server may have dropped it already
 		}
 	}()
 	dialer := net.Dialer{Timeout: 100 * time.Millisecond}

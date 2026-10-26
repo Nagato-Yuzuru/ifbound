@@ -52,22 +52,22 @@ func NewUTUN(t testing.TB) *UTUN {
 	info := &unix.CtlInfo{}
 	copy(info.Name[:], utunControlName)
 	if err := unix.IoctlCtlInfo(fd, info); err != nil {
-		_ = unix.Close(fd) // the test fails on the ioctl error below
+		_ = unix.Close(fd) //nolint:errcheck // the test fails on the ioctl error below
 		t.Fatalf("resolve %s: %v", utunControlName, err)
 	}
 	// Unit 0 asks the kernel to choose the next free utunN.
 	if err := unix.Connect(fd, &unix.SockaddrCtl{ID: info.Id, Unit: 0}); err != nil {
-		_ = unix.Close(fd) // the test fails on the connect error below
+		_ = unix.Close(fd) //nolint:errcheck // the test fails on the connect error below
 		t.Fatalf("create utun: %v", err)
 	}
 	name, err := unix.GetsockoptString(fd, sysprotoControl, utunOptIfname)
 	if err != nil {
-		_ = unix.Close(fd) // the test fails on the getsockopt error below
+		_ = unix.Close(fd) //nolint:errcheck // the test fails on the getsockopt error below
 		t.Fatalf("read utun name: %v", err)
 	}
 	// A non-blocking descriptor joins the runtime poller, so read deadlines work.
 	if err := unix.SetNonblock(fd, true); err != nil {
-		_ = unix.Close(fd) // the test fails on the fcntl error below
+		_ = unix.Close(fd) //nolint:errcheck // the test fails on the fcntl error below
 		t.Fatalf("set %s non-blocking: %v", name, err)
 	}
 	u := &UTUN{Name: name, file: os.NewFile(uintptr(fd), name)}

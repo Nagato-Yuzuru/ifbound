@@ -153,7 +153,11 @@ func TestAdoptionSaveFailureKeepsStarting(t *testing.T) {
 		if err := os.Mkdir(dir, 0o500); err != nil { // the snapshot is missing and cannot be written
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) // let TempDir remove it
+		t.Cleanup(func() { // let TempDir remove it
+			if err := os.Chmod(dir, 0o700); err != nil {
+				t.Error(err)
+			}
+		})
 		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(dir, "s.json"), parse(t, configV1))
 		defer h.stop()
 
@@ -669,7 +673,11 @@ func TestObserveReturnsContextErrorWhileLoopIsBusy(t *testing.T) {
 			return nil
 		})
 		var wg sync.WaitGroup
-		wg.Go(func() { _ = h.d.Reconfigure(t.Context(), parse(t, configV2)) })
+		wg.Go(func() {
+			if err := h.d.Reconfigure(t.Context(), parse(t, configV2)); err != nil {
+				t.Errorf("Reconfigure = %v", err)
+			}
+		})
 		synctest.Wait() // the loop is now inside the Reconfigure write
 
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
@@ -805,7 +813,7 @@ func TestPermanentLoadFailureNeverAcks(t *testing.T) {
 			filepath.Join(t.TempDir(), "s.json"), parse(t, configV1))
 		defer h.stop()
 		fail.Store(true)
-		_ = h.d.Reconfigure(t.Context(), parse(t, configV2)) // fails: the load is rejected
+		_ = h.d.Reconfigure(t.Context(), parse(t, configV2)) //nolint:errcheck // the load is rejected, so it fails by design
 
 		for range 3 {
 			heal()
@@ -830,7 +838,7 @@ func TestRevertAfterFailedRemovalKeepsAddresses(t *testing.T) {
 			t.Fatal(err)
 		}
 		fail.Store(true)
-		_ = h.d.Reconfigure(t.Context(), parse(t, configV2)) // fails: ads stays loaded
+		_ = h.d.Reconfigure(t.Context(), parse(t, configV2)) //nolint:errcheck // it fails by design: ads stays loaded
 		fail.Store(false)
 
 		if err := h.d.Reconfigure(t.Context(), parse(t, configV1)); err != nil {

@@ -328,7 +328,7 @@ func (b *Backend) AddEntries(ctx context.Context, table policy.Name, entries []n
 		if _, err := b.pfctl(ctx, negated, "-a", Anchor, "-t", string(table), "-T", "delete", "-f", "-"); err != nil {
 			return fmt.Errorf("deleting negated entries of table %s: %w", table, err)
 		}
-		again, _ := entryLines(conflicts) // valid: the kernel printed them
+		again, _ := entryLines(conflicts) //nolint:errcheck // the entries are valid: the kernel printed them
 		left, err := b.add(ctx, table, again)
 		if err != nil {
 			return err

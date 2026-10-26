@@ -61,7 +61,7 @@ func startProbes(t *testing.T, h Handler, p ProbeHandler) *Client {
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(context.Background()) }()
 	t.Cleanup(func() {
-		_ = srv.Close()
+		_ = srv.Close() //nolint:errcheck // a test may close the server first; Serve's result is checked below
 		if err := <-served; err != nil {
 			t.Errorf("Serve returned %v", err)
 		}

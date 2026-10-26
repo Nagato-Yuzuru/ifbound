@@ -49,7 +49,7 @@ func (d *Daemon) probe(ctx context.Context, domain policy.Domain) error {
 		d.addProbe(w, name)
 		// Only the report of ifbound-dns counts, so the answer and the
 		// error tell nothing here.
-		_, _ = d.cfg.Lookup.Resolve(ctx, name)
+		_, _ = d.cfg.Lookup.Resolve(ctx, name) //nolint:errcheck // only the ifbound-dns report counts
 		select {
 		case <-w.seen:
 			return nil

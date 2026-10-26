@@ -111,11 +111,11 @@ func (b *AddrBook) Save(path string) error {
 		return fmt.Errorf("save addrbook: %w", err)
 	}
 	if err := writeSynced(tmp, data); err != nil {
-		_ = os.Remove(tmp.Name())
+		_ = os.Remove(tmp.Name()) //nolint:errcheck // best-effort cleanup; the next Save removes leftover temp files
 		return fmt.Errorf("save addrbook: %w", err)
 	}
 	if err := b.rename(tmp.Name(), path); err != nil {
-		_ = os.Remove(tmp.Name())
+		_ = os.Remove(tmp.Name()) //nolint:errcheck // best-effort cleanup; the next Save removes leftover temp files
 		return fmt.Errorf("save addrbook: %w", err)
 	}
 	if err := syncDir(dir); err != nil {

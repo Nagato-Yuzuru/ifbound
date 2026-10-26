@@ -156,8 +156,14 @@ func TestV2SnapshotLoadsWithAllEntriesAndTimes(t *testing.T) {
 	if err := b2.Save(out2); err != nil {
 		t.Fatal(err)
 	}
-	first, _ := os.ReadFile(out)
-	second, _ := os.ReadFile(out2)
+	first, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(out2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !bytes.Equal(first, second) {
 		t.Errorf("save -> load -> save changed the bytes:\n%s\n%s", first, second)
 	}
@@ -342,8 +348,14 @@ func roundTrip(t *testing.T, b *addrbook.AddrBook, dir string) {
 	if err := b2.Save(out2); err != nil {
 		t.Fatal(err)
 	}
-	first, _ := os.ReadFile(out)
-	second, _ := os.ReadFile(out2)
+	first, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(out2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !bytes.Equal(first, second) {
 		t.Fatalf("round trip changed the bytes:\n%s\n%s", first, second)
 	}

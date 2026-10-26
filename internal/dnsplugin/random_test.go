@@ -417,7 +417,7 @@ func serveProtected(t testing.TB, qname string, up *upstream) (*dns.Msg, map[net
 		return ipc.Ack{Protected: true}, nil
 	})
 	h := &handler{key: testKey, next: up, reporter: rep, timeout: 2 * time.Second}
-	rec, _, _ := serve(context.Background(), h, qname) // a SERVFAIL writes nothing
+	rec, _, _ := serve(context.Background(), h, qname) //nolint:errcheck // the caller reads the recorded reply, and a SERVFAIL writes nothing
 	return rec.Msg, reported
 }
 

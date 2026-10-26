@@ -42,7 +42,7 @@ func TestHarnessUTUNSeesEgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial %s: %v", peer, err)
 	}
-	t.Cleanup(func() { _ = conn.Close() }) // a UDP close error does not affect the result
+	t.Cleanup(func() { _ = conn.Close() }) //nolint:errcheck // a UDP close error does not affect the result
 	if _, err := conn.Write([]byte("ifbound")); err != nil {
 		t.Fatalf("send to %s: %v", peer, err)
 	}

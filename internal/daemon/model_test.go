@@ -456,7 +456,10 @@ func (r *omRun) pol(name string) (policy.Policy, bool) {
 // line is the ruleset line that refers to the table of p with its
 // constraint, as the platform compiler writes it.
 func omLine(p policy.Policy) []byte {
-	rs, _ := reconciletest.Compiler{}.Compile([]policy.Policy{p}, nil, reconcile.Accounts{})
+	rs, err := reconciletest.Compiler{}.Compile([]policy.Policy{p}, nil, reconcile.Accounts{})
+	if err != nil {
+		panic(err) // an empty line is a prefix of every body, so omRefers would match anything
+	}
 	return rs.Body()
 }
 
@@ -472,7 +475,7 @@ type omView struct {
 }
 
 func (r *omRun) view() omView {
-	st, _ := r.world.Backend().Read(context.Background()) // the fake never fails
+	st, _ := r.world.Backend().Read(context.Background()) //nolint:errcheck // the fake never fails
 	return omView{
 		tables: st.Tables,
 		body:   r.world.Ruleset().Body(),
@@ -600,9 +603,12 @@ func (b *omBackend) post(err error) {
 
 func (b *omBackend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 	b.pre(kLoad)
-	ifs, _ := b.r.inv.Interfaces(ctx)
+	ifs, _ := b.r.inv.Interfaces(ctx) //nolint:errcheck // the fake inventory never fails
 	b.r.mu.Lock()
-	want, _ := reconciletest.Compiler{}.Compile(b.r.pcfg.Policies, ifs, reconcile.Accounts{})
+	want, cerr := reconciletest.Compiler{}.Compile(b.r.pcfg.Policies, ifs, reconcile.Accounts{})
+	if cerr != nil {
+		b.r.violate("spec3: compile of the current config: %v", cerr)
+	}
 	if rs.ID() != want.ID() {
 		b.r.violate("spec3: Load of a ruleset that is not the one for the current config and interfaces")
 	}
@@ -1235,7 +1241,7 @@ func (r *omRun) reconfigure(cfg omCfg) {
 	r.taintLocked()
 	pc := r.pcfg
 	r.mu.Unlock()
-	_ = r.d.Reconfigure(context.Background(), pc) // the status check judges the outcome
+	_ = r.d.Reconfigure(context.Background(), pc) //nolint:errcheck // injected faults can fail it; the status check judges the outcome
 }
 
 func (r *omRun) setSaveFail(on bool) {
@@ -1328,7 +1334,10 @@ func (r *omRun) externalLoad(idx int) {
 		if err != nil {
 			r.t.Fatal(err)
 		}
-		rs, _ = reconciletest.Compiler{}.Compile(pc.Policies, nil, reconcile.Accounts{})
+		rs, err = reconciletest.Compiler{}.Compile(pc.Policies, nil, reconcile.Accounts{})
+		if err != nil {
+			r.t.Fatal(err)
+		}
 	}
 	r.world.ExternalLoad(rs.Body())
 	r.mu.Lock()
@@ -1343,7 +1352,11 @@ func omRunOps(t *testing.T, initial omCfg, ops []omOp) (viol []string, at int) {
 	at = -1
 	synctest.Test(t, func(t *testing.T) {
 		r := newOmRun(t, initial)
-		defer func() { _ = os.Chmod(r.dir, 0o700) }() // let TempDir cleanup remove it
+		defer func() { // let TempDir cleanup remove it
+			if err := os.Chmod(r.dir, 0o700); err != nil {
+				t.Error(err)
+			}
+		}()
 		r.start()
 		r.check("start")
 		r.statusCheck()
@@ -1400,7 +1413,9 @@ func newOmRun(t *testing.T, initial omCfg) *omRun {
 // recoverAndCheck clears every fault: the daemon must reach Ready with
 // every acked address protected.
 func (r *omRun) recoverAndCheck() {
-	_ = os.Chmod(r.dir, 0o700)
+	if err := os.Chmod(r.dir, 0o700); err != nil {
+		r.t.Error(err)
+	}
 	r.world.SetProblems(nil, nil)
 	r.mu.Lock()
 	r.failAt, r.failFrom, r.saveFail, r.voidOn, r.nonvoidOn = 0, 0, false, false, false

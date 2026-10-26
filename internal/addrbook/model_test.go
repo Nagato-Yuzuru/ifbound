@@ -265,7 +265,7 @@ func (w *oWorld) crashInSave() {
 				crashed = true
 			}
 		}()
-		_ = w.book.Save(w.path)
+		_ = w.book.Save(w.path) //nolint:errcheck // the rename hook panics, so Save never returns
 	}()
 	w.logf("save crashed before rename = %v", crashed)
 	w.crash()

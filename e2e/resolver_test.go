@@ -168,7 +168,7 @@ func startDNS(t *testing.T, answer netip.Addr) *testDNS {
 				})
 			}
 		}
-		_ = w.WriteMsg(m) // a lost reply makes the lookup in the test fail
+		_ = w.WriteMsg(m) //nolint:errcheck // a lost reply makes the lookup in the test fail
 	}), NotifyStartedFunc: func() { close(started) }}
 	done := make(chan error, 1)
 	go func() { done <- srv.ActivateAndServe() }()

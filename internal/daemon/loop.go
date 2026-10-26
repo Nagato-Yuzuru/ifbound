@@ -171,7 +171,7 @@ func (l *loop) armExpiry(t *time.Timer) {
 
 func (l *loop) expire(ctx context.Context) {
 	if len(l.book.Expire()) > 0 {
-		_ = l.reconcile(ctx, "expiry") // the phase holds the outcome
+		_ = l.reconcile(ctx, "expiry") //nolint:errcheck // the phase holds the outcome
 	}
 }
 

@@ -106,7 +106,11 @@ func checkChromiumName(t *testing.T, field string, host *string) {
 	t.Helper()
 	var want dnsname.Name
 	if host != nil && !dottedQuad.MatchString(*host) && chromeCompliant(*host) {
-		want, _ = dnsname.Parse(*host)
+		var err error
+		want, err = dnsname.Parse(*host)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	got, use := chromiumName(field)
 	_, _, idn := simpleHost(field)

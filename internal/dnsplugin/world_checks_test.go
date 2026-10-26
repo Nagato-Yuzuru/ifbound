@@ -343,7 +343,7 @@ func unchangedProblem(t clientTurn) string {
 		return fmt.Sprintf("%s %s: plugin wrote %d replies, rcode %d, err %v", t.qname, dns.TypeToString[t.qtype], t.writes, t.rcode, t.err)
 	case !bytes.Equal(zeroID(t.wire), zeroID(up)):
 		um := new(dns.Msg)
-		_ = um.Unpack(up)
+		_ = um.Unpack(up) //nolint:errcheck // this only formats a failure message; a partial message is still useful
 		return fmt.Sprintf("%s %s: reply differs from upstream\nupstream (%d bytes):\n%v\nclient (%d bytes):\n%v", t.qname, dns.TypeToString[t.qtype], len(up), um, len(t.wire), t.reply)
 	}
 	return ""
@@ -563,7 +563,7 @@ func fixedReplyDaemon(t *testing.T, reply string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() }) //nolint:errcheck // the test result does not depend on a clean close
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -571,13 +571,13 @@ func fixedReplyDaemon(t *testing.T, reply string) string {
 				return
 			}
 			go func() {
-				defer func() { _ = c.Close() }()
+				defer func() { _ = c.Close() }() //nolint:errcheck // the peer may have closed first
 				if _, err := readRawFrame(c); err != nil {
 					return
 				}
 				var v any
-				_ = json.Unmarshal([]byte(reply), &v)
-				_ = rawFrame(c, v)
+				_ = json.Unmarshal([]byte(reply), &v) //nolint:errcheck // a reply that is not JSON goes out as nil, which the client must reject too
+				_ = rawFrame(c, v)                    //nolint:errcheck // a lost reply makes the client call in the test fail
 			}()
 		}
 	}()

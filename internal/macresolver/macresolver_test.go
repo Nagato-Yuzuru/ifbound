@@ -398,7 +398,11 @@ func TestWriteErrorWhenDirectoryNotWritable(t *testing.T) {
 	if err := os.Mkdir(f.dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(f.dir, 0o755) }) // lets TempDir remove the tree
+	t.Cleanup(func() { // lets TempDir remove the tree
+		if err := os.Chmod(f.dir, 0o755); err != nil {
+			t.Error(err)
+		}
+	})
 	err := f.r.Write(t.Context(), reconcile.ResolverEntry{Domain: domain(t, "example.test"), Server: listen})
 	if !errors.Is(err, ErrCannotWrite) {
 		t.Errorf("Write = %v, want an error that wraps ErrCannotWrite", err)
@@ -414,7 +418,11 @@ func TestRemoveErrorWhenDirectoryNotWritable(t *testing.T) {
 	if err := os.Chmod(f.dir, 0o555); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(f.dir, 0o755) }) // lets TempDir remove the tree
+	t.Cleanup(func() { // lets TempDir remove the tree
+		if err := os.Chmod(f.dir, 0o755); err != nil {
+			t.Error(err)
+		}
+	})
 	err := f.r.Remove(t.Context(), domain(t, "example.test"))
 	if !errors.Is(err, ErrCannotWrite) {
 		t.Errorf("Remove = %v, want an error that wraps ErrCannotWrite", err)

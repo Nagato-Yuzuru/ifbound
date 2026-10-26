@@ -249,7 +249,7 @@ func (r *Resolver) replace(path string, data []byte, exists bool) error {
 		return classify(err)
 	}
 	if err := r.fill(tmp, data); err != nil {
-		_ = os.Remove(tmp.Name()) // the write error below is the cause; a left file is removed by the next write
+		_ = os.Remove(tmp.Name()) //nolint:errcheck // the write error below is the cause; a left file is removed by the next write
 		return classify(err)
 	}
 	if exists {
@@ -257,7 +257,7 @@ func (r *Resolver) replace(path string, data []byte, exists bool) error {
 	} else {
 		err = os.Link(tmp.Name(), path)
 	}
-	_ = os.Remove(tmp.Name()) // after a rename it is gone; after a link the name at path keeps the file; a left file is removed by the next write
+	_ = os.Remove(tmp.Name()) //nolint:errcheck // after a rename it is gone; after a link the name at path keeps the file; a left file is removed by the next write
 	if errors.Is(err, fs.ErrExist) {
 		return fmt.Errorf("%w: %s appeared during the write", ErrConflict, path)
 	}
@@ -343,9 +343,9 @@ func parseServer(d policy.Domain, data []byte) netip.AddrPort {
 		}
 		switch f[0] {
 		case "nameserver":
-			addr, _ = netip.ParseAddr(f[1]) // an invalid address fails the render check below
+			addr, _ = netip.ParseAddr(f[1]) //nolint:errcheck // an invalid address fails the render check below
 		case "port":
-			port, _ = strconv.ParseUint(f[1], 10, 16) // an invalid port fails the render check below
+			port, _ = strconv.ParseUint(f[1], 10, 16) //nolint:errcheck // an invalid port fails the render check below
 		}
 	}
 	s := netip.AddrPortFrom(addr, uint16(port))

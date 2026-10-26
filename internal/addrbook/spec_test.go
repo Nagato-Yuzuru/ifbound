@@ -349,12 +349,14 @@ func TestLoadStrictDecode(t *testing.T) {
 		var m map[string]any
 		must(t, json.Unmarshal([]byte(ok), &m))
 		delete(m, f)
-		bs, _ := json.Marshal(m)
+		bs, err := json.Marshal(m)
+		must(t, err)
 		docs["missing "+f] = `{"version":1,"entries":[` + string(bs) + `]}`
 		m2 := map[string]any{}
 		must(t, json.Unmarshal([]byte(ok), &m2))
 		m2[f] = nil
-		bs, _ = json.Marshal(m2)
+		bs, err = json.Marshal(m2)
+		must(t, err)
 		docs["null "+f] = `{"version":1,"entries":[` + string(bs) + `]}`
 	}
 	dir := t.TempDir()
@@ -430,7 +432,9 @@ func TestSaveRefusals(t *testing.T) {
 		if err := b.Save(filepath.Join(dir, "b.json")); !errors.Is(err, addrbook.ErrTimeRange) {
 			t.Fatalf("err = %v", err)
 		}
-		if ents, _ := os.ReadDir(dir); len(ents) != 0 {
+		ents, err := os.ReadDir(dir)
+		must(t, err)
+		if len(ents) != 0 {
 			t.Fatalf("files written: %v", ents)
 		}
 	})
@@ -459,10 +463,14 @@ func TestSaveRefusals(t *testing.T) {
 		if err := b.Save(link); !errors.Is(err, addrbook.ErrBadPath) {
 			t.Fatalf("err = %v", err)
 		}
-		if d, _ := os.ReadFile(target); string(d) != "keep" {
+		d, err := os.ReadFile(target)
+		must(t, err)
+		if string(d) != "keep" {
 			t.Fatal("symlink target overwritten")
 		}
-		if ents, _ := os.ReadDir(dir); len(ents) != 2 {
+		ents, err := os.ReadDir(dir)
+		must(t, err)
+		if len(ents) != 2 {
 			t.Fatalf("files written: %v", ents)
 		}
 		if !mustObserve(t, b, "p", 0, a1) {

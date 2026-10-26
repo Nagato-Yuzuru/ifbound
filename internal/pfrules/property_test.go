@@ -369,7 +369,7 @@ func selects(s policy.InterfaceSelector, iface string, inv []reconcile.Interface
 	case policy.InterfaceName:
 		return s.Name() == iface
 	case policy.InterfaceGlob:
-		ok, _ := path.Match(s.Pattern(), iface)
+		ok, _ := path.Match(s.Pattern(), iface) //nolint:errcheck // a bad pattern gives ok=false, which selects nothing
 		return ok && slices.ContainsFunc(inv, func(i reconcile.Interface) bool { return i.Name == iface })
 	case policy.InterfaceClass:
 		return slices.ContainsFunc(inv, func(i reconcile.Interface) bool { return i.Name == iface && i.Class == s.Class() })

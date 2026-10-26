@@ -248,7 +248,7 @@ func selected(sel policy.InterfaceSelector, ifaces []reconcile.Interface) ([]str
 			return nil, fmt.Errorf("%w: glob %q", errSelector, s.Pattern())
 		}
 		match = func(i reconcile.Interface) bool {
-			ok, _ := path.Match(s.Pattern(), i.Name) // the pattern is valid: checked above
+			ok, _ := path.Match(s.Pattern(), i.Name) //nolint:errcheck // the pattern is valid: checked above
 			return ok
 		}
 	case policy.InterfaceClass:

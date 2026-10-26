@@ -436,7 +436,7 @@ func entryJSON(mods ...func(map[string]any)) string {
 	for _, f := range mods {
 		f(m)
 	}
-	out, _ := json.Marshal(m)
+	out, _ := json.Marshal(m) //nolint:errcheck // the map holds only JSON-safe values, so Marshal cannot fail
 	return string(out)
 }
 
@@ -543,7 +543,11 @@ func TestSaveRefusesOutOfRangeTime(t *testing.T) {
 		if err := b.Save(path); !errors.Is(err, addrbook.ErrTimeRange) {
 			t.Fatalf("clock %v: err = %v", when, err)
 		}
-		if ents, _ := os.ReadDir(filepath.Dir(path)); len(ents) != 0 {
+		ents, err := os.ReadDir(filepath.Dir(path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(ents) != 0 {
 			t.Fatalf("clock %v: save wrote %v", when, ents)
 		}
 	}
@@ -563,7 +567,11 @@ func TestSaveRefusesSymlinkPath(t *testing.T) {
 	if err := b.Save(link); !errors.Is(err, addrbook.ErrBadPath) {
 		t.Fatalf("err = %v", err)
 	}
-	if got, _ := os.ReadFile(target); string(got) != "keep" {
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "keep" {
 		t.Fatal("save wrote through the symlink")
 	}
 }

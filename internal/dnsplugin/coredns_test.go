@@ -50,7 +50,11 @@ func startCoreDNS(t *testing.T, corefile, sock string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = inst.Stop() })
+	t.Cleanup(func() {
+		if err := inst.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
 	return inst.Servers()[0].LocalAddr().String()
 }
 
