@@ -162,7 +162,7 @@ func pvStack(t *testing.T, timeout time.Duration) (*handler, *pvCounter, *reconc
 	go func() { served <- srv.Serve(ctx) }()
 	t.Cleanup(func() {
 		_ = srv.Close()
-		<-served
+		<-served //nolint:errcheck // wait for Serve to return; its error after Close is not under test
 	})
 	client := ipc.NewClient(path, pvUID())
 	h := &handler{key: testKey, next: pvAnswer(), reporter: client, probes: client, timeout: timeout}
