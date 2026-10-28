@@ -3,6 +3,7 @@ package daemon_test
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"path/filepath"
 	"slices"
@@ -91,8 +92,13 @@ type harness struct {
 	world    *reconciletest.World
 	inv      *reconciletest.Inventory
 	snapshot string
-	d        *daemon.Daemon
-	stop     func()
+	// hosts is the host file of the daemon. It is next to the snapshot,
+	// so a restart on the same snapshot reads the same file.
+	hosts       string
+	hostsWrites int
+	logs        *capturedLogs
+	d           *daemon.Daemon
+	stop        func()
 }
 
 func newHarness(t *testing.T, cfgText string) *harness {
@@ -112,9 +118,13 @@ func start(t *testing.T, world *reconciletest.World, inv *reconciletest.Inventor
 func startOn(t *testing.T, world *reconciletest.World, be reconcile.Backend, inv *reconciletest.Inventory, snapshot string, cfg policy.Config) *harness {
 	t.Helper()
 	sys := &sysNet{world: world, listen: cfg.DNS.Listen}
+	hosts := filepath.Join(filepath.Dir(snapshot), "hosts")
+	logs := &capturedLogs{}
 	d := daemon.New(daemon.Config{
-		Policy:   cfg,
-		Snapshot: snapshot,
+		Policy:    cfg,
+		Snapshot:  snapshot,
+		HostsFile: hosts,
+		Logger:    slog.New(logs),
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
 			Backend:   be,
@@ -134,7 +144,7 @@ func startOn(t *testing.T, world *reconciletest.World, be reconcile.Backend, inv
 			t.Errorf("Run: %v", err)
 		}
 	}
-	return &harness{t: t, world: world, inv: inv, snapshot: snapshot, d: d, stop: stop}
+	return &harness{t: t, world: world, inv: inv, snapshot: snapshot, hosts: hosts, logs: logs, d: d, stop: stop}
 }
 
 func (h *harness) status() daemon.Status {

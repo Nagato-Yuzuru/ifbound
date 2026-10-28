@@ -739,6 +739,8 @@ func (r *omRun) start() {
 	r.d = daemon.New(daemon.Config{
 		Policy:   pc,
 		Snapshot: r.snap,
+		// No host file: the tests here do not depend on the host file of the machine.
+		HostsFile: filepath.Join(filepath.Dir(r.snap), "hosts"),
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
 			Backend:   &omBackend{in: r.world.Backend(), r: r},

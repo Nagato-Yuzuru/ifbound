@@ -233,8 +233,8 @@ func TestParse(t *testing.T) {
 			if h.Malformed != tt.malformed {
 				t.Errorf("Malformed = %d, want %d", h.Malformed, tt.malformed)
 			}
-			if h.Unrepresentable != unrepresentable[tt.name] {
-				t.Errorf("Unrepresentable = %d, want %d", h.Unrepresentable, unrepresentable[tt.name])
+			if len(h.Unrepresentable) != unrepresentable[tt.name] {
+				t.Errorf("Unrepresentable = %v, want %d lines", h.Unrepresentable, unrepresentable[tt.name])
 			}
 		})
 	}
@@ -282,6 +282,27 @@ func mustName(t *testing.T, s string) dnsname.Name {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// Unrepresentable gives the number of each line and its fields once,
+// also when several readers read the same field. mDNSResponder refuses
+// the empty label, so its field comes from Libinfo, after ".".
+func TestParseUnrepresentableLines(t *testing.T) {
+	t.Parallel()
+	in := "10.0.0.1 ok.example\n" +
+		"1.2.3.4 x..protected.example ok.example . x..protected.example\n" +
+		"# 5.6.7.8 .\n" +
+		"5.6.7.8 .\n"
+	h, err := Parse(strings.NewReader(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []Line{{Number: 2, Names: []string{".", "x..protected.example"}}, {Number: 4, Names: []string{"."}}}
+	if !slices.EqualFunc(h.Unrepresentable, want, func(a, b Line) bool {
+		return a.Number == b.Number && slices.Equal(a.Names, b.Names)
+	}) {
+		t.Fatalf("Unrepresentable = %+v, want %+v", h.Unrepresentable, want)
+	}
 }
 
 // A name of 256 octets in wire form is valid to mDNSResponder, but dnsname

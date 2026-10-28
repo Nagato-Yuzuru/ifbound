@@ -74,14 +74,26 @@ type Hosts struct {
 	// count is for information only.
 	Malformed int
 
-	// Unrepresentable counts the lines with a name that a reader can use
-	// but Name cannot represent: the root name, a name of 256 octets in
-	// wire form, a name that Libinfo or the Go resolver compares as a
-	// plain string but that is not a valid DNS name, or a name that
-	// chromiumIDNA refuses. A query for such a name gets an answer from
-	// the file that no Entry shows, so a count above zero is a possible
-	// leak.
-	Unrepresentable int
+	// Unrepresentable lists, in file order, the lines with a name that a
+	// reader can use but Name cannot represent: the root name, a name of
+	// 256 octets in wire form, a name that Libinfo or the Go resolver
+	// compares as a plain string but that is not a valid DNS name, or a
+	// name that chromiumIDNA refuses. A query for such a name gets an
+	// answer from the file that no Entry shows, so a line here is a
+	// possible leak.
+	Unrepresentable []Line
+}
+
+// Line is a line of the file with names that no Entry shows.
+type Line struct {
+	// Number is the line number. The first line is 1. Only a newline
+	// ends a line here, also for Chromium, which also ends a line at a CR.
+	Number int
+	// Names are the name fields, as the readers split them, without
+	// duplicates. One reader after the other adds its fields, so the
+	// order is not the line order. Each one is a field of the file, not
+	// a decoded name.
+	Names []string
 }
 
 // Parse reads a host file from r.
@@ -105,7 +117,7 @@ type Hosts struct {
 //   - When the first name is skipped, the next name is Name.
 //   - An interface name after "%" is not checked.
 //
-// Some names cannot be found. Hosts.Unrepresentable counts the lines
+// Some names cannot be found. Hosts.Unrepresentable lists the lines
 // that have them:
 //
 //   - A name of 256 octets in wire form, which mDNSResponder accepts.
@@ -190,23 +202,28 @@ func (v *view) flush(emit func(*dialect, []byte)) {
 
 type parser struct {
 	hosts Hosts
-	// lineUnused and lineUnrepresentable are true when a reader dropped
-	// a field of the current line, by kind.
-	lineUnused, lineUnrepresentable bool
-	fields                          []string
+	// line is the number of the current line.
+	line int
+	// lineUnused is true when a reader dropped a field of the current
+	// line. lineNames are the fields of the current line that a reader
+	// uses but Name cannot represent.
+	lineUnused bool
+	lineNames  []string
+	fields     []string
 	// seen holds the names of the current entry. Parse uses it for one
 	// entry at a time, so the duplicate check is linear in the line.
 	seen map[dnsname.Name]struct{}
 }
 
 func (p *parser) endLine() {
+	p.line++
 	if p.lineUnused {
 		p.hosts.Malformed++
 	}
-	if p.lineUnrepresentable {
-		p.hosts.Unrepresentable++
+	if len(p.lineNames) > 0 {
+		p.hosts.Unrepresentable = append(p.hosts.Unrepresentable, Line{Number: p.line, Names: p.lineNames})
 	}
-	p.lineUnused, p.lineUnrepresentable = false, false
+	p.lineUnused, p.lineNames = false, nil
 }
 
 // addChunk adds the entries of one chunk as d reads it. A comment or an
@@ -270,7 +287,9 @@ func (p *parser) entry(d *dialect, fields []string) (e Entry, addrOK bool) {
 			p.lineUnused = true
 			continue
 		case nameUnrepresentable:
-			p.lineUnrepresentable = true
+			if !slices.Contains(p.lineNames, f) {
+				p.lineNames = append(p.lineNames, f)
+			}
 			continue
 		default:
 			panic("hostsfile: unknown name use")

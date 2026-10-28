@@ -26,7 +26,7 @@ import (
 //
 // The residuals that Parse documents are counted and skipped: a name of
 // 256 octets, the root name, and a Libinfo name that dnsname cannot
-// represent. A file with a residual must count it in Unrepresentable.
+// represent. A file with a residual must list it in Unrepresentable.
 func TestParseMatchesMacOSReaders(t *testing.T) {
 	t.Parallel()
 	data, err := os.ReadFile("testdata/readers.txt")
@@ -138,12 +138,12 @@ func (c *readersCheck) libinfo(t *testing.T, a, field string) {
 }
 
 // unrepresentable counts a record whose name Name cannot represent. Parse
-// must count the file in Unrepresentable.
+// must list a line of the file in Unrepresentable.
 func (c *readersCheck) unrepresentable(t *testing.T) {
 	t.Helper()
 	c.residual++
-	if c.h.Unrepresentable == 0 {
-		t.Errorf("file %q: a reader uses a name that Name cannot represent, but Unrepresentable = 0", c.content)
+	if len(c.h.Unrepresentable) == 0 {
+		t.Errorf("file %q: a reader uses a name that Name cannot represent, but Unrepresentable is empty", c.content)
 	}
 }
 
