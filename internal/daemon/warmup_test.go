@@ -9,6 +9,7 @@ import (
 	"maps"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -187,6 +188,8 @@ func startWarm(t *testing.T, world *reconciletest.World, snapshot string, cfg po
 	d := daemon.New(daemon.Config{
 		Policy:   cfg,
 		Snapshot: snapshot,
+		// No host file: the tests here do not depend on the host file of the machine.
+		HostsFile: filepath.Join(filepath.Dir(snapshot), "hosts"),
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
 			Backend:   world.Backend(),

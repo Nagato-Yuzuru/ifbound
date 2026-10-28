@@ -294,6 +294,8 @@ func TestWarmUpWaitsForTheProbeAndRetriesLater(t *testing.T) {
 		d := daemon.New(daemon.Config{
 			Policy:   cfg,
 			Snapshot: filepath.Join(t.TempDir(), "addrbook.json"),
+			// No host file: the test does not depend on the host file of the machine.
+			HostsFile: filepath.Join(t.TempDir(), "hosts"),
 			Platform: reconcile.Reconciler{
 				Compiler: reconciletest.Compiler{}, Backend: w.Backend(), Resolver: w.Resolver(),
 				Inventory: reconciletest.NewInventory(rigEn0),

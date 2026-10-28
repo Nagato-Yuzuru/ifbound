@@ -1,16 +1,16 @@
 // Package reconcile makes the kernel enforcement and the system resolver
 // entries equal to the desired state.
 //
-// The desired state comes from the policies, the current interfaces, and
-// the learned addresses. Each convergence reads the actual state from the
+// The desired state comes from the policies, the current interfaces, the
+// learned addresses, and the host addresses. Each convergence reads the actual state from the
 // platform and writes only the difference, so it repairs any drift: a
 // crash halfway through an earlier pass, an external flush, or a
 // configuration change. A second pass with the same inputs writes
 // nothing.
 //
-// The write order is fail-closed. An address that a loaded rule blocks
-// stays in its table until it expires or its policy leaves the loaded
-// ruleset. See Reconciler.Converge.
+// The write order is fail-closed. A learned address that a loaded rule
+// blocks stays in its table until it expires or its policy leaves the
+// loaded ruleset. A host address stays while Inputs.Hosts has it. See Reconciler.Converge.
 //
 // This package defines the platform interfaces. The platform packages
 // implement them; the reconciletest package has fakes.
@@ -39,6 +39,10 @@ type Inputs struct {
 	Policies []policy.Policy
 	// Book gives the learned addresses of each policy.
 	Book AddrSource
+	// Hosts gives the addresses of each policy that the host file maps to
+	// a protected name. A nil map has none. Each address has no zone and
+	// is not IPv4-mapped, as in Book.
+	Hosts map[policy.Name][]netip.Addr
 	// Apexes are the domains that get a resolver entry: the apex list of
 	// the Matcher for Policies. The canary domain of Firefox also gets an
 	// entry, but only when another entry exists. See Reconciler.Converge.
@@ -167,8 +171,9 @@ func (r Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report)
 }
 
 // Adoptable returns the addresses in the kernel tables of the policies
-// that look learned: host entries that are not an IP destination of the
-// policy. A daemon that starts without a snapshot adopts them, so a lost
+// that look learned: single-address entries that are not an IP
+// destination of the policy. Host-file addresses look learned too; the
+// caller tells them apart. A daemon that starts without a snapshot adopts them, so a lost
 // snapshot keeps addresses blocked instead of unblocking them all.
 func (r Reconciler) Adoptable(ctx context.Context, policies []policy.Policy) (map[policy.Name][]netip.Addr, error) {
 	actual, err := r.Backend.Read(ctx)
@@ -320,6 +325,9 @@ func desiredTables(in Inputs) map[policy.Name]prefixSet {
 	for _, p := range in.Policies {
 		s := staticEntries(p)
 		for _, a := range in.Book.Addrs(p.Name) {
+			s[host(a)] = struct{}{}
+		}
+		for _, a := range in.Hosts[p.Name] {
 			s[host(a)] = struct{}{}
 		}
 		out[p.Name] = s

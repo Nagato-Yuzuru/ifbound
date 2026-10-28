@@ -16,6 +16,11 @@
 // the last convergence installed for the current configuration and
 // interfaces is still loaded. See State for when the daemon acknowledges.
 //
+// macOS answers a name from the host file before it asks DNS. Each
+// convergence first reads the host file again if it changed, and the
+// addresses of its entries for protected names go into the tables. See
+// Daemon.Run.
+//
 // When the daemon starts to ack reports, and after each configuration
 // change, it warms up: it resolves the listed names through the system
 // resolver, so that their addresses are blocked before an
@@ -78,6 +83,9 @@ type Config struct {
 	Policy policy.Config
 	// Snapshot is the path of the address book snapshot.
 	Snapshot string
+	// HostsFile is the path of the host file. Empty means
+	// DefaultHostsFile.
+	HostsFile string
 	// Platform converges the platform state. All its fields are required.
 	Platform reconcile.Reconciler
 	// Lookup sends the probe names and the warm-up names through the
@@ -139,6 +147,16 @@ func New(cfg Config) *Daemon {
 // file, makes the daemon adopt the learned-looking kernel entries and
 // save them before it leaves StateStarting. The self-heal timer retries
 // the load and the convergence until both succeed.
+//
+// Each convergence first checks the modification time and the size of
+// the host file, and reads it again when they changed. While the file
+// has an entry for a name that matches a policy, the table of the policy
+// holds the address of the entry; when the entry goes away, the next
+// convergence removes the address. A missing file has no entries. A
+// file that exists but cannot be read keeps the addresses of the last
+// good read and makes the state StateDegraded until a read succeeds. A
+// change takes effect at the next convergence, so for up to
+// SelfHealInterval a new host entry is not blocked.
 //
 // In StateReady and StateDegraded, Run resolves the names that the
 // configuration lists through Config.Lookup: each exact destination and

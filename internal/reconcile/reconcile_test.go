@@ -68,6 +68,7 @@ type fixture struct {
 	inv   *reconciletest.Inventory
 	rec   reconcile.Reconciler
 	book  *addrbook.AddrBook
+	hosts map[policy.Name][]netip.Addr
 	now   time.Time
 	cfg   policy.Config
 }
@@ -94,6 +95,7 @@ func (f *fixture) inputs() reconcile.Inputs {
 	return reconcile.Inputs{
 		Policies: f.cfg.Policies,
 		Book:     f.book,
+		Hosts:    f.hosts,
 		Apexes:   matcher.New(f.cfg.Policies).Apexes(),
 		Listen:   f.cfg.DNS.Listen,
 	}
@@ -304,6 +306,32 @@ func TestConvergeExpiryRemovesAddress(t *testing.T) {
 	if rep.Writes != 1 {
 		t.Errorf("writes = %d, want 1 (the removal)", rep.Writes)
 	}
+}
+
+// A host address is desired while the host file maps it, also when the
+// book has none. A host address that the book also has stays when the
+// host file drops it. A policy that is not configured gets no table.
+func TestConvergeHostAddresses(t *testing.T) {
+	f := installV1(t)
+	f.hosts = map[policy.Name][]netip.Addr{
+		"web":  {netip.MustParseAddr("203.0.113.1"), netip.MustParseAddr("203.0.113.9")},
+		"gone": {netip.MustParseAddr("203.0.113.7")},
+	}
+
+	rep := f.converge(t)
+
+	checkTables(t, f.world, tables{
+		"web": {"198.51.100.0/24", "192.0.2.10/32", "203.0.113.1/32", "203.0.113.9/32"},
+		"ads": {"2001:db8::/32", "3fff::1/128"},
+	})
+	if rep.Writes != 1 {
+		t.Errorf("writes = %d, want 1 (one table add)", rep.Writes)
+	}
+
+	f.hosts = nil
+	f.converge(t)
+
+	checkTables(t, f.world, tablesV1)
 }
 
 func TestConvergeRewritesResolverEntryWhenListenChanges(t *testing.T) {

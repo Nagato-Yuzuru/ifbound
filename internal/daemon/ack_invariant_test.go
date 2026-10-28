@@ -151,6 +151,8 @@ func newRig(t *testing.T, world *reconciletest.World, dir string, cfgText string
 	rg.d = daemon.New(daemon.Config{
 		Policy:   cfg,
 		Snapshot: rg.snap,
+		// No host file: the tests here do not depend on the host file of the machine.
+		HostsFile: filepath.Join(filepath.Dir(rg.snap), "hosts"),
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
 			Backend:   world.Backend(),

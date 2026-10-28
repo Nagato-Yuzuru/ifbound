@@ -32,6 +32,8 @@ type loop struct {
 	// the configuration that it started with.
 	gen uint64
 
+	hosts hostsState
+
 	phase phase
 	// recheck asks Run for a convergence after the current request. A
 	// report sets it when it finds a loaded ruleset that is not the
@@ -46,6 +48,10 @@ func newLoop(c Config) *loop {
 		log:      c.Logger,
 		retain:   c.Policy.AddrBook.Retain,
 		phase:    startingPhase("the snapshot is not loaded yet"),
+		hosts:    hostsState{path: c.HostsFile},
+	}
+	if l.hosts.path == "" {
+		l.hosts.path = DefaultHostsFile
 	}
 	l.book = l.newBook()
 	l.setConfig(c.Policy)
@@ -72,7 +78,11 @@ func (l *loop) policyNames() []policy.Name {
 // reconcile is the one path to the desired state. It never converges
 // before the snapshot is loaded: an empty book would remove every learned
 // address.
+//
+// The host file comes first: adoption must know which kernel entries are
+// host addresses.
 func (l *loop) reconcile(ctx context.Context, trigger string) error {
+	l.refreshHosts(ctx)
 	if !l.phase.loaded() {
 		book, err := l.loadBook(ctx)
 		if err != nil {
@@ -84,6 +94,7 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	rep, err := l.rec.Converge(ctx, reconcile.Inputs{
 		Policies: l.cfg.Policies,
 		Book:     l.book,
+		Hosts:    l.hosts.addrs,
 		Apexes:   l.apexes,
 		Listen:   l.cfg.DNS.Listen,
 	})
@@ -96,6 +107,9 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	if rep.Writes > 0 {
 		l.log.InfoContext(ctx, "enforcement changed",
 			slog.String("trigger", trigger), slog.Int("writes", rep.Writes), slog.Bool("complete", err == nil))
+	}
+	if p, ok := l.hosts.problem(); ok {
+		rep.Problems = append(rep.Problems, p)
 	}
 	l.setPhase(ctx, convergedPhase(rep, err))
 	return err
@@ -111,7 +125,9 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 // the snapshot holds addresses only of policies that the configuration
 // removed. This is broader than "the snapshot is empty", and it fails
 // closed: adoption adds entries that the tables already hold, and each
-// one expires after one retain period. Entries that expired while the
+// one expires after one retain period. After a good read of the host
+// file, its addresses are not adopted: they leave the tables with their
+// host entries. Before a good read, they are adopted. Entries that expired while the
 // daemon was down leave the book here.
 func (l *loop) loadBook(ctx context.Context) (*addrbook.AddrBook, error) {
 	book := l.newBook()
@@ -136,6 +152,17 @@ func (l *loop) adopt(ctx context.Context, book *addrbook.AddrBook) error {
 		return nil
 	}
 	for name, addrs := range found {
+		if l.hosts.read {
+			// The host file is their source of truth, not the snapshot.
+			hosts := l.hosts.addrs[name] // sorted
+			addrs = slices.DeleteFunc(addrs, func(a netip.Addr) bool {
+				_, found := slices.BinarySearchFunc(hosts, a, netip.Addr.Compare)
+				return found
+			})
+		}
+		if len(addrs) == 0 {
+			continue
+		}
 		// TTL 0: the entry gets a fresh retain period.
 		if _, err := book.Observe(name, addrs, 0); err != nil {
 			return fmt.Errorf("adopting kernel entries: %w", err)
