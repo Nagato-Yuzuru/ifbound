@@ -815,17 +815,20 @@ func (r *omRun) expectAdoptionLocked(now time.Time) {
 // computeAdoption derives what an adoption must save from the kernel
 // tables and the current config. The daemon writes nothing while it is
 // starting, so the tables are those of the restart, less external flushes.
+// Every table counts, also one of a policy that the config removed: its
+// removal is not installed while the daemon is starting. Only a
+// configured IP destination is not adopted.
 func (r *omRun) computeAdoption() {
 	{
 		v := r.view()
 		r.adoptExpect, r.adoptForbid = nil, nil
-		for _, p := range r.cfg {
-			for _, pf := range v.tables[policy.Name(p.Name)] {
+		for name, entries := range v.tables {
+			for _, pf := range entries {
 				if !pf.IsSingleIP() {
 					continue
 				}
-				k := omKey{p.Name, pf.Addr()}
-				if r.cfg.staticHost(p.Name, pf.Addr()) {
+				k := omKey{string(name), pf.Addr()}
+				if r.cfg.staticHost(k.P, pf.Addr()) {
 					r.adoptForbid = append(r.adoptForbid, k)
 				} else {
 					r.adoptExpect = append(r.adoptExpect, k)
@@ -1316,6 +1319,12 @@ func (r *omRun) forgetFlushedBeforeAdoptionLocked() {
 			delete(r.tracked, k)
 		}
 	}
+	// An entry of a removed policy is in the kernel only, too.
+	for k := range r.pending {
+		if !slices.Contains(v.tables[policy.Name(k.P)], omHost(k.A)) {
+			delete(r.pending, k)
+		}
+	}
 	r.adoptExpect = slices.DeleteFunc(r.adoptExpect, func(k omKey) bool {
 		return !slices.Contains(v.tables[policy.Name(k.P)], omHost(k.A))
 	})
@@ -1486,4 +1495,33 @@ func TestRandomOperationsNeverLeakAnAcknowledgedAddress(t *testing.T) {
 	}
 	t.Logf("entries acked inside the voiding-problem detection latency: %d", omVoidLatencyAcks)
 	t.Logf("coverage: %v", omStats)
+}
+
+// A lost snapshot and a failed save keep the daemon in StateStarting.
+// A configuration change then removes pc before its removal is
+// installed, so the kernel still blocks pc/198.18.0.4. When pc comes
+// back, the acknowledged address must still be in its table. Found by
+// the random test (seed 833 of 1000).
+func TestReplayAdoptionOfRemovedPolicy(t *testing.T) {
+	const (
+		onlyEn0   = 0
+		onlyUtun  = 1
+		denyTunnl = 2
+	)
+	initial := omCfg{{Name: "pc", To: []string{"b.example", "c.example", "2001:db8::/32"}, Via: denyTunnl}}
+	pa := omPol{Name: "pa", To: []string{"a.example"}, Via: onlyUtun}
+	ops := []omOp{
+		{Kind: "observeCancelMidway", Q: "c.example", Addrs: []string{"198.18.0.4"}, TTL: 2 * time.Hour},
+		{Kind: "saveFail", On: true},
+		{Kind: "crash", K: 2, DelSnap: true, Sub: &omOp{Kind: "reconfigure", Cfg: omCfg{
+			{Name: "pc", To: []string{"c.example", "198.51.100.0/24"}, Via: denyTunnl},
+			{Name: "pa", To: []string{"a.example"}, Via: onlyEn0},
+		}}},
+		{Kind: "failWrite", K: 1},
+		{Kind: "reconfigure", Cfg: omCfg{pa}},
+		{Kind: "reconfigure", Cfg: omCfg{{Name: "pc", To: []string{"*.s.example", "192.0.2.10"}, Via: denyTunnl}, pa}},
+	}
+	if viol, _ := omRunOps(t, initial, ops); len(viol) > 0 {
+		t.Errorf("violations: %q", viol)
+	}
 }

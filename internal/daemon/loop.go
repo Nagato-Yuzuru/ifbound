@@ -121,9 +121,11 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 // a lost snapshot then keeps addresses blocked for one retain period
 // instead of unblocking them.
 //
-// The rule looks at the configured policies only, so it also adopts when
-// the snapshot holds addresses only of policies that the configuration
-// removed. This is broader than "the snapshot is empty", and it fails
+// The trigger looks at the configured policies only, so it also adopts
+// when the snapshot holds addresses only of policies that the
+// configuration removed. Adoption reads every table, also the table of a
+// removed policy: its removal may not be installed yet, and a revert must
+// find its addresses. reconcile prunes them after the install. This is broader than "the snapshot is empty", and it fails
 // closed: adoption adds entries that the tables already hold, and each
 // one expires after one retain period. After a good read of the host
 // file, its addresses are not adopted: they leave the tables with their
