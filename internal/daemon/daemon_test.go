@@ -991,3 +991,42 @@ func TestExpiryTimerRemovesAddressAfterRetain(t *testing.T) {
 		}
 	})
 }
+
+// When the first Load at start fails, the tables can hold the snapshot
+// addresses with no loaded rule that refers to them. The state says so,
+// no report is acknowledged, and the next convergence installs the
+// ruleset.
+func TestFirstLoadFailureIsUnenforcedUntilRepaired(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		snapshot := filepath.Join(t.TempDir(), "addrbook.json")
+		writeSnapshot(t, snapshot, map[policy.Name]string{"web": "203.0.113.1"})
+		world := reconciletest.NewWorld()
+		var fail atomic.Bool
+		fail.Store(true)
+		h := startOn(t, world, loadFails{world.Backend(), &fail}, reconciletest.NewInventory(en0), snapshot, parse(t, configV1))
+		defer h.stop()
+
+		st := h.wantState(daemon.StateUnenforced)
+		if !slices.ContainsFunc(st.Reasons, func(r string) bool { return strings.Contains(r, "loading ruleset") }) {
+			t.Errorf("reasons = %q, want the load error", st.Reasons)
+		}
+		if !h.hasEntry("web", host("203.0.113.1")) || h.references("web") {
+			t.Fatalf("precondition: want the entry in a table that no loaded rule refers to; tables %v, referenced %v",
+				h.world.Tables(), h.world.Referenced())
+		}
+		if err := h.observe(obs("www.example.net", "203.0.113.2")); !errors.Is(err, daemon.ErrUnenforced) {
+			t.Errorf("Observe = %v, want ErrUnenforced", err)
+		}
+
+		fail.Store(false)
+		heal()
+
+		h.wantState(daemon.StateReady)
+		if !h.references("web") || !h.hasEntry("web", host("203.0.113.1")) {
+			t.Errorf("after repair: tables %v, referenced %v", h.world.Tables(), h.world.Referenced())
+		}
+		if err := h.observe(obs("www.example.net", "203.0.113.2")); err != nil {
+			t.Errorf("Observe after repair = %v, want an ack", err)
+		}
+	})
+}
