@@ -17,8 +17,8 @@ import (
 	"github.com/pelletier/go-toml/v2/unstable"
 )
 
-// The reasons that Parse reports. Each syntax or validation error is a
-// *FieldError that wraps one of them.
+// The reasons that Parse and Config.CheckUpstreams report. Each syntax
+// or validation error is a *FieldError that wraps one of them.
 var (
 	errSyntax         = errors.New("cannot decode")
 	errUnknownKey     = errors.New("unknown key")
@@ -44,6 +44,7 @@ var (
 	errUnknownClass   = errors.New("unknown interface class")
 	errScopeEmpty     = errors.New("scope must list at least one user or group: the policy would apply to no traffic")
 	errBadAccount     = errors.New("user or group name must be 1 to 32 bytes of [A-Za-z0-9_.-], starting with a letter or \"_\"")
+	errUnreachable    = errors.New("ifbound-dns can never reach an upstream")
 )
 
 // FieldError reports a configuration fault at one field. Field is the
