@@ -32,7 +32,8 @@ type loop struct {
 	// the configuration that it started with.
 	gen uint64
 
-	hosts hostsState
+	hosts    hostsState
+	accounts accountsState
 
 	phase phase
 	// recheck asks Run for a convergence after the current request. A
@@ -49,6 +50,7 @@ func newLoop(c Config) *loop {
 		retain:   c.Policy.AddrBook.Retain,
 		phase:    startingPhase("the snapshot is not loaded yet"),
 		hosts:    hostsState{path: c.HostsFile},
+		accounts: newAccountsState(c.Accounts),
 	}
 	if l.hosts.path == "" {
 		l.hosts.path = DefaultHostsFile
@@ -97,6 +99,7 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		Hosts:    l.hosts.addrs,
 		Apexes:   l.apexes,
 		Listen:   l.cfg.DNS.Listen,
+		Accounts: l.accounts.snap,
 	})
 	if rep.Installed != "" {
 		// No loaded rule refers to a removed policy now, and its table is
@@ -109,6 +112,9 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 			slog.String("trigger", trigger), slog.Int("writes", rep.Writes), slog.Bool("complete", err == nil))
 	}
 	if p, ok := l.hosts.problem(); ok {
+		rep.Problems = append(rep.Problems, p)
+	}
+	if p, ok := l.accountsProblem(); ok {
 		rep.Problems = append(rep.Problems, p)
 	}
 	l.setPhase(ctx, convergedPhase(rep, err))
@@ -209,6 +215,7 @@ func (l *loop) expire(ctx context.Context) {
 // removed policies until then; reconcile prunes them.
 func (l *loop) reconfigure(ctx context.Context, cfg policy.Config) error {
 	l.setConfig(cfg)
+	l.readAccounts(ctx)
 	return l.reconcile(ctx, "config")
 }
 

@@ -26,6 +26,11 @@
 // resolver, so that their addresses are blocked before an
 // application asks. A probe first proves that the lookups go to
 // ifbound-dns, and their reports take the normal path. See Daemon.Run.
+//
+// The ruleset limits a scoped policy to its users and groups by their
+// ids. The daemon reads these ids outside the loop, after the first
+// convergence, after each configuration change, and at each self-heal.
+// See Daemon.Run.
 package daemon
 
 import (
@@ -91,6 +96,11 @@ type Config struct {
 	// Lookup sends the probe names and the warm-up names through the
 	// system resolver. It is required.
 	Lookup SystemResolver
+	// Accounts looks up the ids of the users and groups of each scope.
+	// Nil means no reader: the daemon knows no account, so each scoped
+	// policy loses its scope and applies to all traffic (fail closed),
+	// and the state is StateDegraded.
+	Accounts AccountReader
 	// Logger receives state changes and enforcement changes. Nil discards
 	// them.
 	Logger *slog.Logger
@@ -169,6 +179,21 @@ func New(cfg Config) *Daemon {
 // leaves these two states or the configuration changes, and then starts
 // again under the new state or configuration. Its lookups that already
 // started run to their end. Run returns after every lookup has returned.
+//
+// Run reads the users and groups that the scopes name through
+// Config.Accounts after the first convergence, after each configuration
+// change, and at each self-heal. So a changed id takes up to
+// SelfHealInterval and the time of one read to apply. The read runs
+// outside the loop, and at most one read is in work. When it ends, a
+// convergence applies a changed snapshot. The first convergence uses no
+// accounts, so each scope is dropped until the first read ends. A name
+// that the host does not know drops the scope of its policy, so that
+// policy applies to all traffic. A name whose lookup fails keeps the id
+// of its last good lookup; without one, its scope is dropped. Each of
+// these makes the state StateDegraded, and so does a read that takes
+// longer than AccountReadTimeout. Run does not wait for a lookup that
+// hangs: the lookup goes on after Run returns, until its system call
+// returns, and its result is dropped.
 func (d *Daemon) Run(ctx context.Context) error {
 	if !d.started.CompareAndSwap(false, true) {
 		return ErrAlreadyRunning
@@ -189,6 +214,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	changes := d.cfg.Platform.Inventory.Changes()
 
 	_ = l.reconcile(ctx, "start") //nolint:errcheck // the phase holds the outcome
+	l.readAccounts(ctx)
 	for {
 		l.armExpiry(expiry)
 		warm.sync(ctx, l)
@@ -209,9 +235,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 			debounce = nil
 			_ = l.reconcile(ctx, "interfaces") //nolint:errcheck // the phase holds the outcome
 		case <-heal.C:
+			l.readAccounts(ctx)
 			_ = l.reconcile(ctx, "self-heal") //nolint:errcheck // the phase holds the outcome
 		case <-expiry.C:
 			l.expire(ctx)
+		case r := <-l.accounts.results:
+			if l.applyAccounts(ctx, r) {
+				_ = l.reconcile(ctx, "accounts") //nolint:errcheck // the phase holds the outcome
+			}
+		case <-l.accounts.timeout:
+			l.accountsOverdue(ctx)
+			_ = l.reconcile(ctx, "accounts") //nolint:errcheck // the phase holds the outcome
 		}
 	}
 }

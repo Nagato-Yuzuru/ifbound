@@ -117,6 +117,12 @@ func start(t *testing.T, world *reconciletest.World, inv *reconciletest.Inventor
 // startOn is start with a Backend that wraps the one of the World.
 func startOn(t *testing.T, world *reconciletest.World, be reconcile.Backend, inv *reconciletest.Inventory, snapshot string, cfg policy.Config) *harness {
 	t.Helper()
+	return startWith(t, world, be, inv, snapshot, cfg, nil)
+}
+
+// startWith is startOn with an account reader. accounts can be nil.
+func startWith(t *testing.T, world *reconciletest.World, be reconcile.Backend, inv *reconciletest.Inventory, snapshot string, cfg policy.Config, accounts daemon.AccountReader) *harness {
+	t.Helper()
 	sys := &sysNet{world: world, listen: cfg.DNS.Listen}
 	hosts := filepath.Join(filepath.Dir(snapshot), "hosts")
 	logs := &capturedLogs{}
@@ -126,12 +132,13 @@ func startOn(t *testing.T, world *reconciletest.World, be reconcile.Backend, inv
 		HostsFile: hosts,
 		Logger:    slog.New(logs),
 		Platform: reconcile.Reconciler{
-			Compiler:  reconciletest.Compiler{},
+			Compiler:  scopeCompiler{},
 			Backend:   be,
 			Resolver:  world.Resolver(),
 			Inventory: inv,
 		},
-		Lookup: sys,
+		Accounts: accounts,
+		Lookup:   sys,
 	})
 	sys.d = d
 	ctx, cancel := context.WithCancel(t.Context())
