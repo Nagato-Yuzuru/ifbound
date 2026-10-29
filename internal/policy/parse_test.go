@@ -49,8 +49,8 @@ func mustDomain(t *testing.T, s string) Domain {
 func TestParseExample(t *testing.T) {
 	const doc = `
 [dns]
-listen   = "127.0.0.1:53553"
-upstream = ["tls://1.1.1.1@cloudflare-dns.com", "tls://1.0.0.1@cloudflare-dns.com"]
+listen   = "127.0.0.1:10053"
+upstream = ["tls://9.9.9.9@dns.quad9.net", "tls://149.112.112.112@dns.quad9.net"]
 
 [addrbook]
 retain = "7d"
@@ -81,10 +81,10 @@ scope    = { users = ["_buildbot"] }
 	tun := InterfaceClass{class: ClassTunnel}
 	want := Config{
 		DNS: DNS{
-			Listen: netip.MustParseAddrPort("127.0.0.1:53553"),
+			Listen: netip.MustParseAddrPort("127.0.0.1:10053"),
 			Upstream: []Upstream{
-				{Addr: netip.MustParseAddrPort("1.1.1.1:853"), ServerName: Domain{s: "cloudflare-dns.com"}},
-				{Addr: netip.MustParseAddrPort("1.0.0.1:853"), ServerName: Domain{s: "cloudflare-dns.com"}},
+				{Addr: netip.MustParseAddrPort("9.9.9.9:853"), ServerName: Domain{s: "dns.quad9.net"}},
+				{Addr: netip.MustParseAddrPort("149.112.112.112:853"), ServerName: Domain{s: "dns.quad9.net"}},
 			},
 		},
 		AddrBook: AddrBook{Retain: 7 * 24 * time.Hour},
@@ -118,6 +118,12 @@ scope    = { users = ["_buildbot"] }
 	}
 	if !got.Policies[1].Constraint.Equal(NewOnlyVia()) || got.Policies[1].Constraint.Equal(want.Policies[2].Constraint) {
 		t.Error("Equal gives a wrong answer")
+	}
+	if err := got.CheckUpstreams(); err != nil {
+		t.Errorf("CheckUpstreams = %v, want nil", err)
+	}
+	if w := got.Warnings(); len(w) != 0 {
+		t.Errorf("warnings = %v, want none", w)
 	}
 }
 

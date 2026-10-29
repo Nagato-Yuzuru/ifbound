@@ -44,6 +44,7 @@ func checkInvariants(t *testing.T, cfg Config) {
 		checkConstraint(t, p)
 		checkScope(t, p)
 	}
+	checkUpstreamCheck(t, cfg)
 	// Round trip: render the config back to TOML; it must parse to the
 	// same value.
 	again, err := ParseBytes([]byte(render(cfg)))
@@ -53,6 +54,33 @@ func checkInvariants(t *testing.T, cfg Config) {
 	}
 	if !reflect.DeepEqual(cfg, again) {
 		t.Errorf("round trip changed the config\n got %#v\nwant %#v", again, cfg)
+	}
+}
+
+// checkUpstreamCheck checks CheckUpstreams against an independent
+// oracle: it fails exactly when a policy that allows no interface holds
+// an upstream address. So a config that passes the apply check has no
+// unreachable upstream.
+func checkUpstreamCheck(t *testing.T, cfg Config) {
+	t.Helper()
+	var blocked []string
+	for _, p := range cfg.Policies {
+		if c, ok := p.Constraint.(OnlyVia); !ok || len(c.Selectors()) > 0 {
+			continue
+		}
+		for _, d := range p.To {
+			for _, u := range cfg.DNS.Upstream {
+				a := u.Addr.Addr()
+				ip, isIP := d.(IPAddr)
+				c, isCIDR := d.(CIDR)
+				if isIP && ip.Addr() == a || isCIDR && c.Prefix().Contains(a) {
+					blocked = append(blocked, string(p.Name)+" blocks "+a.String())
+				}
+			}
+		}
+	}
+	if err := cfg.CheckUpstreams(); (err != nil) != (len(blocked) > 0) {
+		t.Errorf("CheckUpstreams = %v, but the oracle finds %q", err, blocked)
 	}
 }
 
@@ -233,7 +261,11 @@ func accountList(as []Account) string {
 func fuzzSeeds() []string {
 	return []string{
 		dnsTable,
-		policyDoc(`"a.com", "A.COM.", "*.a.com", "::ffff:1.2.3.4", "1.2.3.4", "::ffff:0:0/96", "0x7f000001"`, "only_via = []\n"),
+		// The upstream is IPv6, so the mapped prefix ::ffff:0:0/96 (all of
+		// IPv4) does not hold it, and the seed passes the apply check.
+		"[dns]\nupstream = [\"tls://[2001:db8::53]@a.b\"]\n" +
+			policyDoc(`"a.com", "A.COM.", "*.a.com", "::ffff:1.2.3.4", "1.2.3.4", "::ffff:0:0/96", "0x7f000001"`, "only_via = []\n")[len(dnsTable):],
+		policyDoc(`"1.1.1.0/24"`, "only_via = []\n"), // fails the apply check
 		policyDoc(`"a.com"`, "only_via = [\"en0\", \"en0\", \"utun*\", \"@tunnel\"]\n"),
 		policyDoc(`"203.0.113.77/24", "fe80::/10"`, "deny_via = [\"@hardware\"]\n"),
 		policyDoc(`"a.com"`, "deny_via = [\"en0\"]\nscope = { users = [\"_a\", \"_a\"], groups = [\"staff\"] }\n"),
