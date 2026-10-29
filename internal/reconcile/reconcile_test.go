@@ -473,9 +473,11 @@ func TestAdoptableReturnsLearnedLookingEntries(t *testing.T) {
 		// 192.0.2.10 is an IP destination; the /24 and /8 are not hosts.
 		"web": {netip.MustParseAddr("198.51.100.7"), netip.MustParseAddr("203.0.113.1")},
 		"ads": {netip.MustParseAddr("3fff::1")},
+		// A loaded rule can still refer to the table of a removed policy.
+		"gone": {netip.MustParseAddr("203.0.113.9")},
 	}
 	if !maps.EqualFunc(got, want, slices.Equal) {
-		t.Errorf("Adoptable = %v, want %v (no policy outside the configuration)", got, want)
+		t.Errorf("Adoptable = %v, want %v", got, want)
 	}
 }
 

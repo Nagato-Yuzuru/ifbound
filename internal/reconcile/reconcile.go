@@ -170,24 +170,31 @@ func (r Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report)
 	return nil
 }
 
-// Adoptable returns the addresses in the kernel tables of the policies
-// that look learned: single-address entries that are not an IP
-// destination of the policy. Host-file addresses look learned too; the
-// caller tells them apart. A daemon that starts without a snapshot adopts them, so a lost
-// snapshot keeps addresses blocked instead of unblocking them all.
+// Adoptable returns the addresses in the kernel tables that look
+// learned: single-address entries that are not an IP destination of the
+// policy of the table. It reads every table that ifbound manages, also
+// the table of a policy that policies does not have: until the removal
+// of that policy is installed, a loaded rule can still refer to its
+// table, and a revert of the configuration must find its addresses. A
+// daemon that starts without a snapshot adopts them, so a lost snapshot
+// keeps addresses blocked instead of unblocking them all. Host-file
+// addresses look learned too; the caller tells them apart.
 func (r Reconciler) Adoptable(ctx context.Context, policies []policy.Policy) (map[policy.Name][]netip.Addr, error) {
 	actual, err := r.Backend.Read(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("reading backend: %w", err)
 	}
-	out := make(map[policy.Name][]netip.Addr)
+	static := make(map[policy.Name]prefixSet, len(policies))
 	for _, p := range policies {
-		static := staticEntries(p)
-		for _, e := range actual.Tables[p.Name] {
-			if _, ok := static[e]; ok || !e.IsSingleIP() {
+		static[p.Name] = staticEntries(p)
+	}
+	out := make(map[policy.Name][]netip.Addr)
+	for name, entries := range actual.Tables {
+		for _, e := range entries {
+			if _, ok := static[name][e]; ok || !e.IsSingleIP() {
 				continue
 			}
-			out[p.Name] = append(out[p.Name], e.Addr())
+			out[name] = append(out[name], e.Addr())
 		}
 	}
 	return out, nil

@@ -130,8 +130,13 @@ func TestStartWithoutSnapshotAdoptsKernelEntries(t *testing.T) {
 		if got := h.saved("web"); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("203.0.113.1")}) {
 			t.Errorf("snapshot web = %v, want the adopted address only (not the IP destination)", got)
 		}
-		if got := h.saved("gone"); len(got) != 0 {
-			t.Errorf("adopted %v from a table outside the configuration", got)
+		// The table of a policy outside the configuration is adopted too,
+		// and it goes away once the installed ruleset no longer refers to it.
+		if got := h.saved("gone"); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("203.0.113.9")}) {
+			t.Errorf("snapshot gone = %v, want the adopted address", got)
+		}
+		if _, ok := h.world.Tables()["gone"]; ok {
+			t.Error("the table of a policy outside the configuration stays after the install")
 		}
 
 		// Adoption gives a fresh retain period, and then the entry expires.
