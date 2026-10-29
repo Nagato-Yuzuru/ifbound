@@ -13,6 +13,10 @@
 //   - deny_via: a quick block on the denied interfaces. When no current
 //     interface is denied, no rule.
 //
+// An interface with an uncertain class (reconcile.Uncertain) is in each
+// deny_via class that it can have, and in no only_via class. A name or a
+// glob selects it as any other interface.
+//
 // The anchor rule refers to an empty sub-anchor "tag.<policy>" below the
 // ifbound anchor. pfctl does not accept an empty inline anchor ("{ }"),
 // so the ruleset only refers to the sub-anchor, and the kernel creates it
@@ -144,7 +148,7 @@ func policyRules(p policy.Policy, ifaces []reconcile.Interface, accounts reconci
 	var rules []string
 	switch c := p.Constraint.(type) {
 	case policy.OnlyVia:
-		allowed, err := resolve(c.Selectors(), ifaces)
+		allowed, err := resolve(c.Selectors(), ifaces, hasClass)
 		if err != nil {
 			return nil, "", err
 		}
@@ -163,7 +167,7 @@ func policyRules(p policy.Policy, ifaces []reconcile.Interface, accounts reconci
 		if len(sels) == 0 {
 			return nil, "", fmt.Errorf("%w: deny_via without an interface", errConstraint)
 		}
-		denied, err := resolve(sels, ifaces)
+		denied, err := resolve(sels, ifaces, mayHaveClass)
 		if err != nil {
 			return nil, "", err
 		}
@@ -219,10 +223,11 @@ func ownerMatches(s policy.Scope, accounts reconcile.Accounts) ([]string, []stri
 }
 
 // resolve returns the sorted names of the interfaces that sels select.
-func resolve(sels []policy.InterfaceSelector, ifaces []reconcile.Interface) ([]string, error) {
+// A class selector selects the interfaces for which inClass is true.
+func resolve(sels []policy.InterfaceSelector, ifaces []reconcile.Interface, inClass classTest) ([]string, error) {
 	var names []string
 	for _, sel := range sels {
-		n, err := selected(sel, ifaces)
+		n, err := selected(sel, ifaces, inClass)
 		if err != nil {
 			return nil, err
 		}
@@ -232,10 +237,24 @@ func resolve(sels []policy.InterfaceSelector, ifaces []reconcile.Interface) ([]s
 	return slices.Compact(names), nil
 }
 
+// classTest reports whether a class selector selects an interface.
+type classTest func(reconcile.Interface, policy.Class) bool
+
+// hasClass is the classTest of only_via: an interface with an uncertain
+// class is not allowed.
+func hasClass(i reconcile.Interface, c policy.Class) bool { return i.Class == c }
+
+// mayHaveClass is the classTest of deny_via: an interface that can have
+// the class is denied.
+func mayHaveClass(i reconcile.Interface, c policy.Class) bool {
+	return i.Class == c || slices.Contains(i.Possible(), c)
+}
+
 // selected returns the names of the interfaces that one selector selects.
 // A name selects itself. A glob or a class selects only from ifaces, and
-// it fails when it selects an interface whose name pf cannot take.
-func selected(sel policy.InterfaceSelector, ifaces []reconcile.Interface) ([]string, error) {
+// it fails when it selects an interface whose name pf cannot take. A
+// class selects the interfaces for which inClass is true.
+func selected(sel policy.InterfaceSelector, ifaces []reconcile.Interface, inClass classTest) ([]string, error) {
 	var match func(reconcile.Interface) bool
 	switch s := sel.(type) {
 	case policy.InterfaceName:
@@ -257,7 +276,7 @@ func selected(sel policy.InterfaceSelector, ifaces []reconcile.Interface) ([]str
 		default:
 			return nil, fmt.Errorf("%w: class %d", errSelector, s.Class())
 		}
-		match = func(i reconcile.Interface) bool { return i.Class == s.Class() }
+		match = func(i reconcile.Interface) bool { return inClass(i, s.Class()) }
 	default:
 		return nil, fmt.Errorf("%w: %T", errSelector, sel)
 	}

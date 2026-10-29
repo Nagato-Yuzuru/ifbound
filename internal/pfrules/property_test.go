@@ -53,15 +53,29 @@ var (
 type world struct {
 	policies []policy.Policy
 	ifaces   []reconcile.Interface
+	// classes holds the classes that each interface in ifaces was built
+	// with, so that the oracle does not read them back through the
+	// reconcile.Interface code under test.
+	classes  map[string]ifaceClasses
 	accounts reconcile.Accounts
+}
+
+// ifaceClasses is the certain class of an interface, or the classes that
+// it was built with by reconcile.Uncertain. possible can hold the zero
+// Class, which is not a class.
+type ifaceClasses struct {
+	certain  policy.Class
+	possible []policy.Class
 }
 
 func randomWorld(t testing.TB, r *rand.Rand) world {
 	t.Helper()
-	w := world{accounts: reconcile.Accounts{Users: map[string]uint32{}, Groups: map[string]uint32{}}}
+	w := world{classes: map[string]ifaceClasses{}, accounts: reconcile.Accounts{Users: map[string]uint32{}, Groups: map[string]uint32{}}}
 	for _, name := range ifacePool {
 		if r.IntN(2) == 0 {
-			w.ifaces = append(w.ifaces, reconcile.Interface{Name: name, Class: classPool[r.IntN(len(classPool))]})
+			i, c := randomInterface(r, name)
+			w.ifaces = append(w.ifaces, i)
+			w.classes[name] = c
 		}
 	}
 	for name, id := range userIDs {
@@ -84,6 +98,17 @@ func randomWorld(t testing.TB, r *rand.Rand) world {
 		w.policies = append(w.policies, policy.Policy{Name: name, Constraint: randomConstraint(t, r), Scope: randomScope(t, r)})
 	}
 	return w
+}
+
+// randomInterface returns an interface with a certain class, no class,
+// or one or two possible classes, and the classes that it is built with.
+func randomInterface(r *rand.Rand, name string) (reconcile.Interface, ifaceClasses) {
+	if r.IntN(3) == 0 {
+		possible := []policy.Class{classPool[r.IntN(len(classPool))], classPool[r.IntN(len(classPool))]}
+		return reconcile.Uncertain(name, possible...), ifaceClasses{possible: possible}
+	}
+	c := classPool[r.IntN(len(classPool))]
+	return reconcile.Interface{Name: name, Class: c}, ifaceClasses{certain: c}
 }
 
 func (w world) compile() (reconcile.Ruleset, error) {
@@ -297,6 +322,8 @@ func pfOwnerMatches(r evalRule, p packet) bool {
 //   - A packet is blocked when a policy whose table holds the destination
 //     and whose scope holds the owner does not allow the interface.
 //   - A glob or a class selects only the interfaces in the inventory.
+//   - A deny_via class also selects the interfaces that can have it; an
+//     only_via class selects only the interfaces that have it for certain.
 //   - A scope with an unknown name is dropped.
 //   - An ID above the pf number limit stands for every ID above it.
 //   - A scope holds only TCP and UDP packets with a socket owner.
@@ -309,11 +336,11 @@ func wantBlocks(w world, p packet) bool {
 		if !p.inTable[string(pol.Name)] {
 			continue
 		}
+		_, only := pol.Constraint.(policy.OnlyVia)
 		var hit bool
 		for _, s := range pol.Constraint.Selectors() {
-			hit = hit || selects(s, p.iface, w.ifaces)
+			hit = hit || selects(s, p.iface, w.classes, !only)
 		}
-		_, only := pol.Constraint.(policy.OnlyVia)
 		if p.fragment {
 			if only || hit {
 				return true
@@ -364,15 +391,18 @@ func resolveIDs(as []policy.Account, ids map[string]uint32) ([]uint32, bool) {
 	return out, true
 }
 
-func selects(s policy.InterfaceSelector, iface string, inv []reconcile.Interface) bool {
+// selects reports whether s selects iface in the inventory inv. deny
+// tells that s is a selector of deny_via.
+func selects(s policy.InterfaceSelector, iface string, inv map[string]ifaceClasses, deny bool) bool {
+	c, inInventory := inv[iface]
 	switch s := s.(type) {
 	case policy.InterfaceName:
 		return s.Name() == iface
 	case policy.InterfaceGlob:
 		ok, _ := path.Match(s.Pattern(), iface) //nolint:errcheck // a bad pattern gives ok=false, which selects nothing
-		return ok && slices.ContainsFunc(inv, func(i reconcile.Interface) bool { return i.Name == iface })
+		return ok && inInventory
 	case policy.InterfaceClass:
-		return slices.ContainsFunc(inv, func(i reconcile.Interface) bool { return i.Name == iface && i.Class == s.Class() })
+		return inInventory && (c.certain == s.Class() || deny && slices.Contains(c.possible, s.Class()))
 	default:
 		panic(fmt.Sprintf("unknown selector %T", s))
 	}

@@ -26,6 +26,10 @@ var noTunnels = []reconcile.Interface{
 	{Name: "lo0"},
 }
 
+// pppHost is hostIfaces with a ppp interface whose class is not certain:
+// it can be a PPPoE uplink or an L2TP tunnel.
+var pppHost = append(slices.Clone(hostIfaces), reconcile.Uncertain("ppp0", policy.ClassHardware, policy.ClassTunnel))
+
 // hostAccounts is the account snapshot of the tests. nobody has the ID
 // -2, as on macOS, which pfctl does not take as a number. alias shares the
 // uid of _buildbot.
@@ -209,6 +213,59 @@ block return-icmp(port-unr, port-unr) out quick to <"any"> ! tagged "ifbound.any
 		config: "",
 		ifaces: hostIfaces,
 		want:   "",
+	},
+	{
+		name:   "uncertain class: deny_via @hardware denies it",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\ndeny_via = [\"@hardware\"]\n",
+		ifaces: pppHost,
+		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "en0" "en1" "ppp0" } to <"p">
+`,
+	},
+	{
+		name:   "uncertain class: deny_via @tunnel denies it",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\ndeny_via = [\"@tunnel\"]\n",
+		ifaces: pppHost,
+		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "ppp0" "utun4" "utun5" } to <"p">
+`,
+	},
+	{
+		name:   "uncertain class: only_via @tunnel does not allow it",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"@tunnel\"]\n",
+		ifaces: pppHost,
+		want: `table <"p"> persist
+anchor "tag.p" out on { "utun4" "utun5" } to <"p"> tag "ifbound.p"
+block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
+`,
+	},
+	{
+		name:   "uncertain class: only_via @hardware does not allow it",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"@hardware\"]\n",
+		ifaces: pppHost,
+		want: `table <"p"> persist
+anchor "tag.p" out on { "en0" "en1" } to <"p"> tag "ifbound.p"
+block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
+`,
+	},
+	{
+		name:   "uncertain class: a name or a glob in only_via allows it",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"@tunnel\", \"ppp0\"]\n[[policy]]\nname = \"q\"\nto = [\"b.com\"]\nonly_via = [\"ppp*\"]\n",
+		ifaces: pppHost,
+		want: `table <"p"> persist
+table <"q"> persist
+anchor "tag.p" out on { "ppp0" "utun4" "utun5" } to <"p"> tag "ifbound.p"
+block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
+anchor "tag.q" out on { "ppp0" } to <"q"> tag "ifbound.q"
+block return-icmp(port-unr, port-unr) out quick to <"q"> ! tagged "ifbound.q"
+`,
+	},
+	{
+		name:   "uncertain class: deny_via of a class that it cannot have",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\ndeny_via = [\"@tunnel\"]\n",
+		ifaces: []reconcile.Interface{{Name: "en0", Class: policy.ClassHardware}, reconcile.Uncertain("x0", policy.ClassHardware)},
+		want: `table <"p"> persist
+`,
 	},
 	{
 		name:   "RFC example: one policy per constraint form, one with scope",

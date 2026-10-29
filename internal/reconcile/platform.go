@@ -19,12 +19,56 @@ import (
 // Every call that takes a context honors it and finishes in bounded time.
 // The daemon calls them from one goroutine and waits for each one.
 
-// Interface is one network interface in an inventory snapshot.
+// Interface is one network interface in an inventory snapshot. Its class
+// is certain, uncertain, or absent:
+//
+//   - Class holds a class that is certain.
+//   - Uncertain makes an interface whose properties do not show its
+//     class. The interface can have one of the possible classes, or no
+//     class. Possible returns them.
+//   - The zero Class without possible classes means no class.
+//
+// A Compiler uses an uncertain class in the safe direction of each
+// constraint: a class in deny_via selects an interface that can have the
+// class, and a class in only_via selects only an interface that has the
+// class for certain.
 type Interface struct {
 	Name string
-	// Class is the zero Class when the interface is in no known class.
+	// Class is the zero Class when the class is not certain.
 	Class policy.Class
+	// possible is used only while Class is zero, so a certain class
+	// never has possible classes next to it.
+	possible classSet
 }
+
+// Uncertain returns an interface that can have each of classes, or no
+// class. It ignores the zero Class, which is not a class.
+func Uncertain(name string, classes ...policy.Class) Interface {
+	var s classSet
+	for _, c := range classes {
+		s |= 1 << c
+	}
+	return Interface{Name: name, possible: s &^ 1}
+}
+
+// Possible returns the possible classes of i in ascending order. It
+// returns nil when i has a certain class or no class.
+func (i Interface) Possible() []policy.Class {
+	if i.Class != 0 {
+		return nil
+	}
+	var out []policy.Class
+	for c := range policy.Class(64) {
+		if i.possible&(1<<c) != 0 {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// classSet holds class c as bit c. Every known class is below 64. A
+// larger value is not a class, and its shift sets no bit.
+type classSet uint64
 
 // Accounts is a snapshot of the user and group accounts of the host. A
 // platform reader fills it. The zero Accounts knows no account.
@@ -77,7 +121,11 @@ func (r Ruleset) Problems() []Problem { return slices.Clone(r.problems) }
 //     the next convergence compiles it in. That window is accepted.
 //   - When the Compiler cannot make a part of a policy hold as written,
 //     it either fails, or it writes a stricter rule and reports the fault
-//     in Ruleset.Problems. It never writes a weaker rule.
+//     in Ruleset.Problems. It never writes a weaker rule. An uncertain
+//     class is not such a fault: the Compiler writes the stricter rule
+//     that the Interface documentation gives and reports no Problem,
+//     because the class of such an interface stays uncertain for as
+//     long as the interface exists.
 type Compiler interface {
 	// Compile uses accounts for the account names in a scope.
 	Compile(policies []policy.Policy, ifaces []Interface, accounts Accounts) (Ruleset, error)

@@ -356,7 +356,7 @@ func (Compiler) Compile(policies []policy.Policy, ifaces []reconcile.Interface, 
 		b = fmt.Appendf(b, "table %s %#v %#v\n", p.Name, p.Constraint, p.Scope)
 	}
 	for _, i := range ifaces {
-		b = fmt.Appendf(b, "iface %s %s\n", i.Name, i.Class)
+		b = fmt.Appendf(b, "iface %s %s %v\n", i.Name, i.Class, i.Possible())
 	}
 	return reconcile.NewRuleset(b), nil
 }
