@@ -81,19 +81,25 @@ type ServerConfig struct {
 	Logger *slog.Logger
 }
 
-// Server accepts connections on a unix socket. Create it with Listen, run it
-// with Serve, and stop it with Close or by cancelling the Serve context.
-// Each connection carries one request and one reply.
+// Server accepts connections on a unix socket. Create it with Listen,
+// ListenStatus, or ListenAdmin, run it with Serve, and stop it with Close
+// or by cancelling the Serve context. Each connection carries one request
+// and one reply.
 type Server struct {
 	ln      net.Listener
-	handler Handler
-	probes  ProbeHandler
-	allowed map[uint32]struct{}
+	admit   uidCheck
+	routes  map[string]route
+	version int
+	cut     func(reason string) string
+	peerLvl slog.Level
 	log     *slog.Logger
-	slots   chan struct{}
+	// slots bounds the connections served at once. A test in this
+	// package may replace it before Serve.
+	slots chan struct{}
 
-	// connTimeout is the one deadline for a connection. Listen sets the
-	// production value; a test in this package may shorten it before Serve.
+	// connTimeout is the one deadline for a connection. The spec of the
+	// socket sets the production value; a test in this package may shorten
+	// it before Serve.
 	connTimeout time.Duration
 
 	path string      // empty when the server does not own a file
@@ -122,11 +128,77 @@ func Listen(cfg ServerConfig) (*Server, error) {
 	if cfg.Handler == nil {
 		return nil, errNilHandler
 	}
-	lock, err := lockPath(cfg.Path)
+	return listenSpec(cfg.Path, reportSpec(cfg))
+}
+
+// uidCheck reports whether a peer uid may pass.
+type uidCheck func(uid uint32) bool
+
+func anyUID(uint32) bool { return true }
+
+// uidIn admits exactly the uids in the list. An empty list admits no uid.
+func uidIn(uids []uint32) uidCheck {
+	set := make(map[uint32]struct{}, len(uids))
+	for _, uid := range uids {
+		set[uid] = struct{}{}
+	}
+	return func(uid uint32) bool {
+		_, ok := set[uid]
+		return ok
+	}
+}
+
+// route serves one message type. A nil error becomes an ack that carries
+// body; a nil body gives an ack without a body. An error becomes a
+// rejection. ctx ends at the connection deadline.
+type route func(ctx context.Context, req envelope) (body any, err error)
+
+// spec holds the settings that make a Server one kind of socket.
+type spec struct {
+	mode    os.FileMode   // of the socket file
+	conns   int           // the connection slots
+	timeout time.Duration // the one deadline for a connection
+	version int           // of every request and reply
+	admit   uidCheck      // runs before the server reads a frame
+	routes  map[string]route
+	// cut bounds the reason of a rejection.
+	cut func(reason string) string
+	// peerLvl is the log level of the events that a peer can cause, such
+	// as a failed write of the reply. A socket that every local user can
+	// open logs them at Debug, so a peer cannot flood the log.
+	peerLvl slog.Level
+	log     *slog.Logger
+}
+
+// reportSpec is the spec of the socket that ifbound-dns reports to.
+func reportSpec(cfg ServerConfig) spec {
+	return spec{
+		mode:    socketMode,
+		conns:   maxConns,
+		timeout: connTimeout,
+		version: protocolVersion,
+		admit:   uidIn(cfg.AllowedUIDs),
+		routes: map[string]route{
+			typeObserve: func(ctx context.Context, req envelope) (any, error) {
+				return observe(ctx, cfg.Handler, req)
+			},
+			typeProbe: func(_ context.Context, req envelope) (any, error) {
+				return probe(cfg.Probes, req)
+			},
+		},
+		cut:     cutReason,
+		peerLvl: slog.LevelWarn,
+		log:     cfg.Logger,
+	}
+}
+
+// listenSpec takes the lock for path, then binds the socket of sp.
+func listenSpec(path string, sp spec) (*Server, error) {
+	lock, err := lockPath(path)
 	if err != nil {
 		return nil, err
 	}
-	s, err := bind(cfg)
+	s, err := bind(path, sp)
 	if err != nil {
 		_ = lock.Close() //nolint:errcheck // releases the flock; the bind error is the one to report
 		return nil, err
@@ -152,62 +224,65 @@ func lockPath(path string) (*os.File, error) {
 	return f, nil
 }
 
-// bind removes a stale socket at cfg.Path, binds, and sets the mode. The
-// caller holds the lock.
-func bind(cfg ServerConfig) (*Server, error) {
-	fi, err := os.Lstat(cfg.Path)
+// bind removes a stale socket at path, binds, and sets the mode of sp.
+// The caller holds the lock.
+func bind(path string, sp spec) (*Server, error) {
+	fi, err := os.Lstat(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 	case err != nil:
-		return nil, fmt.Errorf("inspecting %s: %w", cfg.Path, err)
+		return nil, fmt.Errorf("inspecting %s: %w", path, err)
 	case fi.Mode().Type() != os.ModeSocket:
-		return nil, fmt.Errorf("%w: %s", ErrNotSocket, cfg.Path)
+		return nil, fmt.Errorf("%w: %s", ErrNotSocket, path)
 	default:
-		if err := os.Remove(cfg.Path); err != nil {
-			return nil, fmt.Errorf("removing stale socket %s: %w", cfg.Path, err)
+		if err := os.Remove(path); err != nil {
+			return nil, fmt.Errorf("removing stale socket %s: %w", path, err)
 		}
 	}
 	var lc net.ListenConfig
-	ln, err := lc.Listen(context.Background(), "unix", cfg.Path) // binding does not block; no caller context to honor
+	ln, err := lc.Listen(context.Background(), "unix", path) // binding does not block; no caller context to honor
 	if err != nil {
-		return nil, fmt.Errorf("listening on %s: %w", cfg.Path, err)
+		return nil, fmt.Errorf("listening on %s: %w", path, err)
 	}
 	// Close must not unlink by name: a newer socket may own the path by then.
 	ln.(*net.UnixListener).SetUnlinkOnClose(false) //nolint:forcetypeassert // "unix" always gives *net.UnixListener
-	if err := os.Chmod(cfg.Path, socketMode); err != nil {
-		_ = ln.Close()          //nolint:errcheck // the chmod error is the one to report
-		_ = os.Remove(cfg.Path) //nolint:errcheck // the file is ours: bound just above
-		return nil, fmt.Errorf("setting mode of %s: %w", cfg.Path, err)
+	if err := os.Chmod(path, sp.mode); err != nil {
+		_ = ln.Close()      //nolint:errcheck // the chmod error is the one to report
+		_ = os.Remove(path) //nolint:errcheck // the file is ours: bound just above
+		return nil, fmt.Errorf("setting mode of %s: %w", path, err)
 	}
-	sock, err := os.Lstat(cfg.Path)
+	sock, err := os.Lstat(path)
 	if err != nil {
 		_ = ln.Close() //nolint:errcheck // the stat error is the one to report
-		return nil, fmt.Errorf("inspecting %s: %w", cfg.Path, err)
+		return nil, fmt.Errorf("inspecting %s: %w", path, err)
 	}
-	s := newServer(ln, cfg)
-	s.path = cfg.Path
+	s := serverOf(ln, sp)
+	s.path = path
 	s.sock = sock
 	return s, nil
 }
 
+// newServer returns a report server on ln that owns no socket file.
 func newServer(ln net.Listener, cfg ServerConfig) *Server {
-	allowed := make(map[uint32]struct{}, len(cfg.AllowedUIDs))
-	for _, uid := range cfg.AllowedUIDs {
-		allowed[uid] = struct{}{}
-	}
-	logger := cfg.Logger
+	return serverOf(ln, reportSpec(cfg))
+}
+
+func serverOf(ln net.Listener, sp spec) *Server {
+	logger := sp.log
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
 	return &Server{
 		ln:      ln,
-		handler: cfg.Handler,
-		probes:  cfg.Probes,
-		allowed: allowed,
+		admit:   sp.admit,
+		routes:  sp.routes,
+		version: sp.version,
+		cut:     sp.cut,
+		peerLvl: sp.peerLvl,
 		log:     logger,
-		slots:   make(chan struct{}, maxConns),
+		slots:   make(chan struct{}, sp.conns),
 
-		connTimeout: connTimeout,
+		connTimeout: sp.timeout,
 		conns:       make(map[net.Conn]struct{}),
 	}
 }
@@ -335,10 +410,10 @@ func (s *Server) untrack(c net.Conn) {
 func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 	uid, err := peerUID(c)
 	if err != nil {
-		s.log.Warn("peer credentials unavailable", "err", err)
+		s.log.Log(ctx, s.peerLvl, "peer credentials unavailable", "err", err)
 		return
 	}
-	if _, ok := s.allowed[uid]; !ok {
+	if !s.admit(uid) {
 		s.log.Warn("peer uid not allowed", "uid", uid)
 		return
 	}
@@ -353,7 +428,7 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 	case err == nil:
 		reply = s.dispatch(ctx, req)
 	case errors.Is(err, ErrFrameTooLarge), errors.Is(err, ErrProtocol):
-		reply = rejectEnvelope(err.Error())
+		reply = s.reject(err.Error())
 	default:
 		if !errors.Is(err, io.EOF) {
 			s.log.Debug("reading request failed", "err", err)
@@ -361,51 +436,56 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 		return
 	}
 	if err := writeFrame(c, reply); err != nil {
-		s.log.Warn("writing reply failed", "err", err)
+		s.log.Log(ctx, s.peerLvl, "writing reply failed", "err", err)
 	}
 }
 
 func (s *Server) dispatch(ctx context.Context, req envelope) envelope {
-	if req.Version != protocolVersion {
-		return rejectEnvelope(fmt.Sprintf("unsupported version %d", req.Version))
+	if req.Version != s.version {
+		return s.reject(fmt.Sprintf("unsupported version %d", req.Version))
 	}
-	switch req.Type {
-	case typeObserve:
-		return s.observe(ctx, req)
-	case typeProbe:
-		return s.probe(req)
-	default:
-		return rejectEnvelope(fmt.Sprintf("unknown message type %q", req.Type))
+	serve, ok := s.routes[req.Type]
+	if !ok {
+		return s.reject(fmt.Sprintf("unknown message type %q", req.Type))
 	}
+	body, err := serve(ctx, req)
+	if err != nil {
+		return s.reject(err.Error())
+	}
+	return envelopeIn(s.version, typeAck, body)
 }
 
-func (s *Server) observe(ctx context.Context, req envelope) envelope {
+func (s *Server) reject(reason string) envelope {
+	return envelopeIn(s.version, typeReject, rejectBody{Reason: s.cut(reason)})
+}
+
+func observe(ctx context.Context, h Handler, req envelope) (any, error) {
 	obs, timeout, err := decodeObserve(req.Body)
 	if err != nil {
-		return rejectEnvelope(err.Error())
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	ack, err := s.handler.Observe(ctx, obs)
+	ack, err := h.Observe(ctx, obs)
 	if err != nil {
-		return rejectEnvelope(err.Error())
+		return nil, err
 	}
-	return envelopeOf(typeAck, ackBody{Protected: &ack.Protected})
+	return ackBody{Protected: &ack.Protected}, nil
 }
 
-func (s *Server) probe(req envelope) envelope {
-	if s.probes == nil {
-		return rejectEnvelope(errNoProbes.Error())
+func probe(p ProbeHandler, req envelope) (any, error) {
+	if p == nil {
+		return nil, errNoProbes
 	}
 	var b probeBody
 	if err := json.Unmarshal(req.Body, &b); err != nil {
-		return rejectEnvelope(fmt.Sprintf("malformed probe body: %v", err))
+		return nil, fmt.Errorf("malformed probe body: %w", err)
 	}
 	if b.QName == "" || len(b.QName) > MaxQNameLen {
-		return rejectEnvelope(fmt.Errorf("%w: length %d", errInvalidQName, len(b.QName)).Error())
+		return nil, fmt.Errorf("%w: length %d", errInvalidQName, len(b.QName))
 	}
-	s.probes.ProbeSeen(b.QName)
-	return envelopeOf(typeAck, nil)
+	p.ProbeSeen(b.QName)
+	return nil, nil
 }
 
 func decodeObserve(raw []byte) (Observation, time.Duration, error) {
