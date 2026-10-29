@@ -1,0 +1,33 @@
+name: model
+
+on:
+  # The default run of the model test checks 100 seeds. A defect that only
+  # some seeds find can pass a PR, so each night checks 1000 new seeds.
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # CI does not start a VM, so it does not need tart.
+  MISE_DISABLE_TOOLS: tart
+
+jobs:
+  daemon:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+      # The seed range moves with the run number. A failure prints its seed,
+      # and -model.first with that seed reproduces it.
+      - run: >-
+          go test -count=1 -timeout 25m ./internal/daemon
+          -run TestRandomOperationsNeverLeakAnAcknowledgedAddress
+          -args -model.seeds=1000 -model.first=$(( RUN_NUMBER * 1000 + 1 ))
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
