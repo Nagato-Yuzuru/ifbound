@@ -1,0 +1,59 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# This file sets only the values that differ from the CodeRabbit defaults.
+
+language: en-US
+tone_instructions: >-
+  Write in Simplified Technical English (ASD-STE100 style). Use short
+  sentences, active voice, and one meaning per word. Be concise.
+
+reviews:
+  profile: chill
+  poem: true
+  # The repository has one maintainer.
+  suggested_reviewers: false
+  path_filters:
+    - "!LICENSES/**"
+    - "!**/testdata/fuzz/**"
+    - "!go.sum"
+    - "!mise.lock"
+  path_instructions:
+    - path: "internal/**"
+      instructions: >-
+        The daemon runs as root and edits pf rules and DNS resolver state on
+        macOS. Look for privilege, input validation, and cleanup errors on
+        failure paths.
+    - path: ".github/workflows/**"
+      instructions: >-
+        Pin each action to a full commit SHA with a version comment. Set
+        persist-credentials to false on checkout. Grant the least permissions.
+  auto_review:
+    ignore_usernames:
+      - renovate[bot]
+  pre_merge_checks:
+    # The pr-title workflow checks the Conventional Commits format.
+    title:
+      mode: "off"
+    docstrings:
+      mode: "off"
+  tools:
+    # The ci workflow runs these tools at the versions in mise.toml.
+    golangci-lint:
+      enabled: false
+    actionlint:
+      enabled: false
+
+chat:
+  art: true
+
+knowledge_base:
+  learnings:
+    scope: local
+  # Git and GitHub must not reference the issue tracker.
+  linear:
+    usage: disabled
+  jira:
+    usage: disabled
+
+issue_enrichment:
+  auto_enrich:
+    enabled: true
