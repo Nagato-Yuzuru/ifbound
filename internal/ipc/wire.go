@@ -1,9 +1,10 @@
-// Package ipc carries DNS observations from ifbound-dns to ifboundd.
+// Package ipc carries DNS observations from ifbound-dns to ifboundd, and
+// the requests of the CLI to ifboundd.
 //
 // ifbound-dns reports each DNS answer and waits for an ack before it replies
 // to the application. Every failure is an error for the client, so the caller
-// can turn it into SERVFAIL. The server accepts a connection only from an
-// allowed peer uid and treats all input as untrusted.
+// can turn it into SERVFAIL. The report server accepts a connection only from
+// an allowed peer uid. Every server treats all input as untrusted.
 //
 // The wire format is a 4-byte big-endian length followed by a JSON envelope.
 // The envelope has a protocol version and a message type. New message types
@@ -15,6 +16,14 @@
 // name is protected. Thus a change that a peer of the old version would
 // misread increments the version. Version 3 added the protected flag to
 // the ack of an observation.
+//
+// The CLI uses two more sockets, with the same frame and their own protocol
+// version. The status socket (ListenStatus) is open to every local user and
+// serves only Status. The admin socket (ListenAdmin) is open only to root and
+// serves Status and Apply. Each socket has its own listener and its own
+// connection slots: connections on one socket never take a slot of another.
+// The handlers are not separate: they share the daemon, so the cost of a
+// Status handler can still delay the work of the other handlers.
 package ipc
 
 import (
@@ -48,9 +57,14 @@ const (
 	maxReasonLen = 256
 
 	protocolVersion = 3
+	// controlVersion is the protocol version of the status socket and the
+	// admin socket. It changes independently of protocolVersion.
+	controlVersion = 1
 
 	typeObserve = "observe"
 	typeProbe   = "probe"
+	typeStatus  = "status"
+	typeApply   = "apply"
 	typeAck     = "ack"
 	typeReject  = "reject"
 )
@@ -94,10 +108,16 @@ type rejectBody struct {
 	Reason string `json:"reason"`
 }
 
-// envelopeOf builds an envelope from one of this package's own body types.
-// Those types always marshal, so a failure is a programming error.
+// envelopeOf builds an envelope of the report protocol. See envelopeIn.
 func envelopeOf(typ string, body any) envelope {
-	env := envelope{Version: protocolVersion, Type: typ}
+	return envelopeIn(protocolVersion, typ, body)
+}
+
+// envelopeIn builds an envelope of the protocol version from one of this
+// package's own body types. Those types always marshal, so a failure is a
+// programming error. A nil body gives an envelope without a body.
+func envelopeIn(version int, typ string, body any) envelope {
+	env := envelope{Version: version, Type: typ}
 	if body == nil {
 		return env
 	}
@@ -109,11 +129,13 @@ func envelopeOf(typ string, body any) envelope {
 	return env
 }
 
-func rejectEnvelope(reason string) envelope {
+// cutReason bounds the reason of a rejection on the report socket to
+// maxReasonLen bytes.
+func cutReason(reason string) string {
 	if len(reason) > maxReasonLen {
 		reason = strings.ToValidUTF8(reason[:maxReasonLen], "")
 	}
-	return envelopeOf(typeReject, rejectBody{Reason: reason})
+	return reason
 }
 
 func writeFrame(w io.Writer, env envelope) error {

@@ -14,8 +14,9 @@ var (
 	// ErrUnavailable means the client could not reach ifboundd or lost the
 	// connection before it got a reply.
 	ErrUnavailable = errors.New("ipc: server unavailable")
-	// ErrRejected means ifboundd refused the observation.
-	ErrRejected = errors.New("ipc: observation rejected")
+	// ErrRejected means ifboundd refused the request. The error text has
+	// the reason.
+	ErrRejected = errors.New("ipc: request rejected")
 )
 
 // DefaultTimeout bounds a Report call whose context has no deadline.
@@ -131,13 +132,19 @@ func (c *Client) roundTrip(ctx context.Context, req envelope) (json.RawMessage, 
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 	defer func() { _ = conn.Close() }() //nolint:errcheck // read-only use after the reply; nothing to flush
+	return exchangeOn(ctx, conn, c.serverUID, protocolVersion, req)
+}
 
+// exchangeOn sends req on conn and returns the body of the ack. The
+// server must run as serverUID, and its reply must have the given
+// protocol version.
+func exchangeOn(ctx context.Context, conn net.Conn, serverUID uint32, version int, req envelope) (json.RawMessage, error) {
 	uid, err := peerUID(conn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
-	if uid != c.serverUID {
-		return nil, fmt.Errorf("%w: server runs as uid %d, want %d", ErrUnavailable, uid, c.serverUID)
+	if uid != serverUID {
+		return nil, fmt.Errorf("%w: server runs as uid %d, want %d", ErrUnavailable, uid, serverUID)
 	}
 
 	// The context is the only source of deadlines. This keeps the context
@@ -152,7 +159,7 @@ func (c *Client) roundTrip(ctx context.Context, req envelope) (json.RawMessage, 
 	if err != nil {
 		return nil, wrapIO(err)
 	}
-	return interpretReply(reply)
+	return interpretReply(reply, version)
 }
 
 func newObserveEnvelope(ctx context.Context, o Observation) envelope {
@@ -185,10 +192,10 @@ func wrapIO(err error) error {
 }
 
 // interpretReply returns the body of an ack, and an error for every
-// other reply. A reply of another version is an error also when it is an
-// ack: its body can mean something else.
-func interpretReply(env envelope) (json.RawMessage, error) {
-	if env.Version != protocolVersion {
+// other reply. A reply of another version than version is an error also
+// when it is an ack: its body can mean something else.
+func interpretReply(env envelope, version int) (json.RawMessage, error) {
+	if env.Version != version {
 		return nil, fmt.Errorf("%w: reply version %d", ErrProtocol, env.Version)
 	}
 	switch env.Type {
