@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand/v2"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
+	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
 // Flags and types as a macOS 27 host reports them.
@@ -33,45 +35,80 @@ const (
 
 // Families of other drivers (IFNET_FAMILY_* in net/kpi_interface.h of xnu).
 const (
-	familyLoopback = 1
 	familyEthernet = 2
-	familyPPP      = 6
 	familySTF      = 12
+	familyFirewire = 13
 	familyCellular = 15
 )
+
+// flagsCellular are the flags of pdp_ip and of rd in cellular mode
+// (bsd/net/if_redirect.c of xnu).
+const flagsCellular = unix.IFF_UP | unix.IFF_POINTOPOINT | unix.IFF_RUNNING | unix.IFF_MULTICAST
+
+// The expected classes, without a name.
+var (
+	tunnel    = reconcile.Interface{Class: policy.ClassTunnel}
+	hardware  = reconcile.Interface{Class: policy.ClassHardware}
+	uncertain = reconcile.Uncertain("", policy.ClassHardware, policy.ClassTunnel)
+	noClass   = reconcile.Interface{}
+)
+
+// sameClass reports whether a and b have the same certain class and the
+// same possible classes.
+func sameClass(a, b reconcile.Interface) bool {
+	return a.Class == b.Class && slices.Equal(a.Possible(), b.Possible())
+}
+
+func describe(i reconcile.Interface) string {
+	return fmt.Sprintf("class %v, possible %v", i.Class, i.Possible())
+}
 
 func TestClassify(t *testing.T) {
 	tests := []struct {
 		name string
 		l    link
-		want policy.Class
+		want reconcile.Interface // without a name
 	}{
-		{"utun is a tunnel", link{"utun3", flagsUTUN, unix.IFT_OTHER, familyUTUN}, policy.ClassTunnel},
-		{"utun that is down is a tunnel", link{"utun4", unix.IFF_POINTOPOINT, unix.IFT_OTHER, familyUTUN}, policy.ClassTunnel},
-		{"ipsec is a tunnel", link{"ipsec0", flagsUTUN, unix.IFT_OTHER, familyIPSEC}, policy.ClassTunnel},
-		{"gif is a tunnel", link{"gif0", flagsGIF, unix.IFT_GIF, familyGIF}, policy.ClassTunnel},
-		{"Wi-Fi is hardware", link{"en0", flagsEther, unix.IFT_ETHER, familyEthernet}, policy.ClassHardware},
-		{"Ethernet that is down is hardware", link{"en7", unix.IFF_BROADCAST, unix.IFT_ETHER, familyEthernet}, policy.ClassHardware},
-		{"VLAN is hardware", link{"vlan0", flagsEther, unix.IFT_L2VLAN, 5}, policy.ClassHardware},
-		{"bond is hardware", link{"bond0", flagsEther, unix.IFT_IEEE8023ADLAG, 14}, policy.ClassHardware},
-		{"bridge is hardware", link{"bridge0", flagsEther, unix.IFT_BRIDGE, familyEthernet}, policy.ClassHardware},
-		// Not sure: no class.
-		{"loopback", link{"lo0", flagsLoop, unix.IFT_LOOP, familyLoopback}, 0},
-		{"ppp can be PPPoE", link{"ppp0", flagsPPP, unix.IFT_PPP, familyPPP}, 0},
-		{"stf", link{"stf0", 0, unix.IFT_STF, familySTF}, 0},
-		{"pktap", link{"pktap0", unix.IFF_UP, unix.IFT_PKTAP, familyLoopback}, 0},
+		{"utun is a tunnel", link{"utun3", flagsUTUN, unix.IFT_OTHER, familyUTUN}, tunnel},
+		{"utun that is down is a tunnel", link{"utun4", unix.IFF_POINTOPOINT, unix.IFT_OTHER, familyUTUN}, tunnel},
+		{"ipsec is a tunnel", link{"ipsec0", flagsUTUN, unix.IFT_OTHER, familyIPSEC}, tunnel},
+		{"gif is a tunnel", link{"gif0", flagsGIF, unix.IFT_GIF, familyGIF}, tunnel},
+		{"Wi-Fi is hardware", link{"en0", flagsEther, unix.IFT_ETHER, familyEthernet}, hardware},
+		{"Ethernet that is down is hardware", link{"en7", unix.IFF_BROADCAST, unix.IFT_ETHER, familyEthernet}, hardware},
+		{"VLAN is hardware", link{"vlan0", flagsEther, unix.IFT_L2VLAN, 5}, hardware},
+		{"bond is hardware", link{"bond0", flagsEther, unix.IFT_IEEE8023ADLAG, 14}, hardware},
+		{"bridge is hardware", link{"bridge0", flagsEther, unix.IFT_BRIDGE, familyEthernet}, hardware},
+		// Sends no packet out of the host: no class.
+		{"loopback", link{"lo0", flagsLoop, unix.IFT_LOOP, familyLoopback}, noClass},
+		{"pktap", link{"pktap0", unix.IFF_UP, unix.IFT_PKTAP, familyLoopback}, noClass},
+		// ppp can be PPPoE (hardware) or L2TP (tunnel). A ppp property
+		// wins over the properties of a certain class.
+		{"ppp is uncertain", link{"ppp0", flagsPPP, unix.IFT_PPP, familyPPP}, uncertain},
+		{"ppp family alone", link{"ppp1", flagsPPP, unix.IFT_OTHER, familyPPP}, uncertain},
+		{"ppp type alone", link{"ppp2", flagsPPP, unix.IFT_PPP, 0}, uncertain},
+		{"ppp family with an Ethernet type", link{"x5", flagsEther, unix.IFT_ETHER, familyPPP}, uncertain},
+		{"ppp type with a tunnel family", link{"x6", flagsPPP, unix.IFT_PPP, familyUTUN}, uncertain},
+		// Every other interface is uncertain.
+		{"stf", link{"stf0", 0, unix.IFT_STF, familySTF}, uncertain},
+		{"cellular", link{"pdp_ip0", flagsCellular, unix.IFT_CELLULAR, familyCellular}, uncertain},
+		{"redirect in cellular mode", link{"rd0", flagsCellular, unix.IFT_CELLULAR, familyCellular}, uncertain},
+		{"FireWire", link{"fw0", flagsEther, unix.IFT_IEEE1394, familyFirewire}, uncertain},
+		{"loopback type of another family", link{"x7", flagsLoop, unix.IFT_LOOP, familyEthernet}, uncertain},
+		{"pktap type of another family", link{"x8", unix.IFF_UP, unix.IFT_PKTAP, 0}, uncertain},
+		{"loopback family of another type", link{"x9", flagsLoop, unix.IFT_OTHER, familyLoopback}, uncertain},
 		// IFT_OTHER is the type of every interface without a better one.
-		{"IFT_OTHER point-to-point of another family", link{"wwan0", flagsUTUN, unix.IFT_OTHER, familyCellular}, 0},
-		{"IFT_OTHER point-to-point without a family", link{"x0", flagsUTUN, unix.IFT_OTHER, 0}, 0},
-		{"tunnel family that is not point-to-point", link{"x1", flagsEther, unix.IFT_OTHER, familyUTUN}, 0},
-		{"Ethernet type that is point-to-point", link{"x2", flagsUTUN, unix.IFT_ETHER, familyEthernet}, 0},
-		{"bridge that is point-to-point", link{"x3", flagsUTUN, unix.IFT_BRIDGE, familyEthernet}, 0},
-		{"unknown type", link{"x4", flagsEther, 0xfd, familyEthernet}, 0},
+		{"IFT_OTHER point-to-point of another family", link{"wwan0", flagsUTUN, unix.IFT_OTHER, familyCellular}, uncertain},
+		{"IFT_OTHER point-to-point without a family", link{"x0", flagsUTUN, unix.IFT_OTHER, 0}, uncertain},
+		{"tunnel family that is not point-to-point", link{"x1", flagsEther, unix.IFT_OTHER, familyUTUN}, uncertain},
+		{"Ethernet type that is point-to-point", link{"x2", flagsUTUN, unix.IFT_ETHER, familyEthernet}, uncertain},
+		{"bridge that is point-to-point", link{"x3", flagsUTUN, unix.IFT_BRIDGE, familyEthernet}, uncertain},
+		{"unknown type", link{"x4", flagsEther, 0xfd, familyEthernet}, uncertain},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := classify(tt.l); got != tt.want {
-				t.Errorf("classify(%+v) = %v, want %v", tt.l, got, tt.want)
+			got := classify(tt.l)
+			if got.Name != tt.l.name || !sameClass(got, tt.want) {
+				t.Errorf("classify(%+v) = %q with %s, want %s", tt.l, got.Name, describe(got), describe(tt.want))
 			}
 		})
 	}
@@ -84,11 +121,13 @@ func TestClassComesFromPropertiesNotName(t *testing.T) {
 	tests := []struct {
 		name string
 		l    link // without a name
-		want policy.Class
+		want reconcile.Interface
 	}{
-		{"VPN utun", link{flags: flagsUTUN, typ: unix.IFT_OTHER, family: familyUTUN}, policy.ClassTunnel},
-		{"Wi-Fi or Ethernet", link{flags: flagsEther, typ: unix.IFT_ETHER, family: familyEthernet}, policy.ClassHardware},
-		{"loopback", link{flags: flagsLoop, typ: unix.IFT_LOOP, family: familyLoopback}, 0},
+		{"VPN utun", link{flags: flagsUTUN, typ: unix.IFT_OTHER, family: familyUTUN}, tunnel},
+		{"Wi-Fi or Ethernet", link{flags: flagsEther, typ: unix.IFT_ETHER, family: familyEthernet}, hardware},
+		{"ppp", link{flags: flagsPPP, typ: unix.IFT_PPP, family: familyPPP}, uncertain},
+		{"cellular", link{flags: flagsCellular, typ: unix.IFT_CELLULAR, family: familyCellular}, uncertain},
+		{"loopback", link{flags: flagsLoop, typ: unix.IFT_LOOP, family: familyLoopback}, noClass},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -105,8 +144,8 @@ func TestClassComesFromPropertiesNotName(t *testing.T) {
 				t.Fatalf("Interfaces returned %d interfaces, want %d", len(got), len(names))
 			}
 			for _, i := range got {
-				if i.Class != tt.want {
-					t.Errorf("class of %q = %v, want %v for the same properties", i.Name, i.Class, tt.want)
+				if !sameClass(i, tt.want) {
+					t.Errorf("class of %q = %s, want %s for the same properties", i.Name, describe(i), describe(tt.want))
 				}
 			}
 		})
@@ -178,8 +217,8 @@ func TestSystemInterfacesMatchIfconfig(t *testing.T) {
 		switch {
 		case strings.HasPrefix(g.Name, "utun") && g.Class != policy.ClassTunnel:
 			t.Errorf("host %s has class %v, want %v", g.Name, g.Class, policy.ClassTunnel)
-		case g.Name == "lo0" && g.Class != 0:
-			t.Errorf("host lo0 has class %v, want no class", g.Class)
+		case g.Name == "lo0" && !sameClass(g, noClass):
+			t.Errorf("host lo0 has %s, want no class", describe(g))
 		}
 	}
 	if !slices.Equal(names, want) {

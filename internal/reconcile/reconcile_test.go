@@ -256,6 +256,27 @@ func TestConvergeRecompilesOnInterfaceChange(t *testing.T) {
 	}
 }
 
+// TestConvergeRecompilesOnPossibleClassChange changes only the possible
+// classes of an interface. The ruleset must change with them.
+func TestConvergeRecompilesOnPossibleClassChange(t *testing.T) {
+	f := newFixture(t, configV1)
+	none := reconcile.Interface{Name: "ppp0"}
+	uncertain := reconcile.Uncertain("ppp0", policy.ClassHardware, policy.ClassTunnel)
+	f.inv.Set(en0, none)
+	f.converge(t)
+	before := f.world.Ruleset().ID()
+
+	f.inv.Set(en0, uncertain)
+	rep := f.converge(t)
+
+	if got, want := f.world.Ruleset().ID(), f.compiled(t, en0, uncertain); got != want || got == before {
+		t.Errorf("loaded ruleset = %q, want %q, not the ruleset before the change", got, want)
+	}
+	if rep.Writes != 1 {
+		t.Errorf("writes = %d, want 1 (the load)", rep.Writes)
+	}
+}
+
 func TestConvergeConfigChangeAddsAndRemovesPolicy(t *testing.T) {
 	f := installV1(t)
 	f.reconfigure(t, configV2)

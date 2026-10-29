@@ -20,14 +20,41 @@
 //     IFT_IEEE8023ADLAG (bond), or IFT_BRIDGE. macOS gives the same type
 //     to virtual Ethernet interfaces, for example feth and the vmenet
 //     interfaces of virtual machines, so they are in @hardware too.
-//   - No class: the loopback interface and all other interfaces, for
-//     example ppp, stf, and pktap. A ppp interface can be a VPN (L2TP) or
-//     a direct link (PPPoE), and its properties do not show which one. A
-//     class never takes an interface that it is not sure of, so an
-//     only_via class never allows a wrong interface. A deny_via class
-//     does not deny such an interface: deny_via = ["@hardware"] does not
-//     block the ppp interface of a PPPoE uplink. A policy can select such
-//     an interface by name or glob.
+//   - No class: an interface that sends no packet out of the host. Only
+//     two interfaces are in this list, each with the family loopback and
+//     one type. The loopback interface (lo0, type IFT_LOOP) gives each
+//     packet back to the input of the host (lo_output in bsd/net/if_loop.c
+//     of xnu). pktap (type IFT_PKTAP) is a capture interface, and its
+//     output drops each packet (pktap_if_output in bsd/net/pktap.c). No
+//     class selects these interfaces.
+//   - @hardware or @tunnel, not certain: every other interface. Its
+//     properties do not show its class, so both classes are possible
+//     (reconcile.Uncertain): deny_via = ["@hardware"] and deny_via =
+//     ["@tunnel"] both block it, and an only_via class never allows it. A
+//     policy can allow it by name or glob.
+//
+// Examples of an uncertain class:
+//
+//   - ppp (the family ppp or the type IFT_PPP) can be a VPN (L2TP) or a
+//     direct link (PPPoE). This rule comes before the @tunnel and
+//     @hardware rules, so a ppp property always makes the class
+//     uncertain.
+//   - stf (6to4) sends IPv6 packets inside IPv4 packets to a public relay.
+//     That is a tunnel but not a VPN, so only_via = ["@tunnel"] must not
+//     allow it.
+//   - The cellular interface pdp_ip, and the redirect interface rd. rd
+//     sends its packets to a delegate interface, which can be a cellular,
+//     Ethernet, utun, or ipsec interface (bsd/net/if_redirect.c), and pf
+//     sees only rd.
+//   - An interface with a combination of the properties above that this
+//     package does not know, or with an unknown type or family, for
+//     example FireWire or an interface of a driver outside xnu. A block
+//     rule on an interface that sends no packet blocks nothing.
+//
+// The uncertain class changes no rule for lo0, and none for the bridge
+// and vmenet interfaces of virtual machines: lo0 has no class, and the
+// others are @hardware. A rule blocks only the packets to the
+// destinations of its policy.
 //
 // Changes come from a routing socket (AF_ROUTE). macOS has no
 // RTM_IFANNOUNCE message. It sends RTM_IFINFO when the flags of an
@@ -78,9 +105,11 @@ const rcvBuf = 1 << 20
 
 // Interface families (IFNET_FAMILY_* in net/kpi_interface.h of xnu).
 const (
-	familyGIF   = 10
-	familyUTUN  = 17
-	familyIPSEC = 18
+	familyLoopback = 1
+	familyPPP      = 6
+	familyGIF      = 10
+	familyUTUN     = 17
+	familyIPSEC    = 18
 )
 
 // siocgiftype is SIOCGIFTYPE, _IOWR('i', 159, struct ifreq) in
@@ -120,7 +149,10 @@ func newInventory(list func() ([]link, error)) *Inventory {
 
 // Interfaces implements reconcile.IfInventory. It returns every interface
 // of the host, also the interfaces that are down, sorted by name. An
-// interface in no class has the zero Class. The error wraps errList when
+// interface has a certain class when its properties show the class, no
+// class when it sends no packet out of the host, and both classes as
+// possible classes in all other cases (see the package documentation).
+// The error wraps errList when
 // the kernel cannot give the list, or the type and family of an
 // interface in it.
 func (i *Inventory) Interfaces(context.Context) ([]reconcile.Interface, error) {
@@ -130,7 +162,7 @@ func (i *Inventory) Interfaces(context.Context) ([]reconcile.Interface, error) {
 	}
 	out := make([]reconcile.Interface, 0, len(links))
 	for _, l := range links {
-		out = append(out, reconcile.Interface{Name: l.name, Class: classify(l)})
+		out = append(out, classify(l))
 	}
 	slices.SortFunc(out, func(a, b reconcile.Interface) int { return strings.Compare(a.Name, b.Name) })
 	return out, nil
@@ -257,17 +289,25 @@ func changes(msg []byte) bool {
 	}
 }
 
-// classify returns the class of an interface by the rules in the package
-// documentation, or the zero Class.
-func classify(l link) policy.Class {
+// classify returns the interface l with its class by the rules in the
+// package documentation: a certain class, no class, or both classes as
+// possible classes. A link that the rules do not know gets the possible
+// classes, so that each constraint blocks more (fail closed).
+func classify(l link) reconcile.Interface {
 	p2p := l.flags&unix.IFF_POINTOPOINT != 0
 	switch {
+	// The ppp rule comes first: a ppp link that also has the properties
+	// of a certain class stays uncertain.
+	case l.family == familyPPP || l.typ == unix.IFT_PPP:
+		return reconcile.Uncertain(l.name, policy.ClassHardware, policy.ClassTunnel)
 	case p2p && slices.Contains([]int{familyUTUN, familyIPSEC, familyGIF}, l.family):
-		return policy.ClassTunnel
+		return reconcile.Interface{Name: l.name, Class: policy.ClassTunnel}
 	case !p2p && slices.Contains([]int{unix.IFT_ETHER, unix.IFT_L2VLAN, unix.IFT_IEEE8023ADLAG, unix.IFT_BRIDGE}, l.typ):
-		return policy.ClassHardware
+		return reconcile.Interface{Name: l.name, Class: policy.ClassHardware}
+	case l.family == familyLoopback && (l.typ == unix.IFT_LOOP || l.typ == unix.IFT_PKTAP):
+		return reconcile.Interface{Name: l.name}
 	default:
-		return 0
+		return reconcile.Uncertain(l.name, policy.ClassHardware, policy.ClassTunnel)
 	}
 }
 
