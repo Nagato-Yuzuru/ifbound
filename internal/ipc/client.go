@@ -14,6 +14,12 @@ var (
 	// ErrUnavailable means the client could not reach ifboundd or lost the
 	// connection before it got a reply.
 	ErrUnavailable = errors.New("ipc: server unavailable")
+	// ErrNoReply means the client sent the whole request and got no reply:
+	// the connection was lost, or the context ended while the client
+	// waited. The server can have acted on the request. An error with
+	// ErrNoReply also has ErrUnavailable, unless the context ended. An
+	// error from before the send never has ErrNoReply.
+	ErrNoReply = errors.New("ipc: request sent, no reply")
 	// ErrRejected means ifboundd refused the request. The error text has
 	// the reason.
 	ErrRejected = errors.New("ipc: request rejected")
@@ -157,7 +163,11 @@ func exchangeOn(ctx context.Context, conn net.Conn, serverUID uint32, version in
 	}
 	reply, err := readFrame(conn)
 	if err != nil {
-		return nil, wrapIO(err)
+		err = wrapIO(err)
+		if errors.Is(err, ErrUnavailable) {
+			err = fmt.Errorf("%w: %w", ErrNoReply, err)
+		}
+		return nil, err
 	}
 	return interpretReply(reply, version)
 }

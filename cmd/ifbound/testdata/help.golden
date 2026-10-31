@@ -1,0 +1,17 @@
+Bind destinations to network interfaces
+
+Usage:
+  ifbound [flags]
+  ifbound [command]
+
+Available Commands:
+  apply       Send a configuration file to ifboundd and print the new status
+  completion  Generate the autocompletion script for the specified shell
+  help        Help about a command
+  version     Print the version of ifbound and of ifboundd
+
+Flags:
+  -h, --help      help for ifbound
+  -v, --version   version for ifbound
+
+Use "ifbound [command] --help" for more information about a command.
