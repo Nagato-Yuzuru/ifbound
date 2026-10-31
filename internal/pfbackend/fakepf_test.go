@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var errExit = errors.New("exit status 1")
@@ -21,7 +22,12 @@ var errExit = errors.New("exit status 1")
 type fakePF struct {
 	enabled bool
 	tokens  []string
-	next    int
+	// born holds the creation time of each token; free holds the
+	// released values, which pf gives again, last released first.
+	born map[string]time.Time
+	free []string
+	now  func() time.Time
+	next int
 	// anchors maps an anchor path to its rule lines. It holds the ifbound
 	// anchor, its sub-anchors, and the other anchors.
 	anchors map[string][]string
@@ -52,6 +58,8 @@ func newFakePF() *fakePF {
 		main:   []string{`scrub-anchor "com.apple/*" all fragment reassemble`, `anchor "com.apple/*" all`},
 		nat:    map[string][]string{"": {`nat-anchor "com.apple/*" all`, `rdr-anchor "com.apple/*" all`}},
 		tables: make(map[string]map[netip.Prefix]bool),
+		born:   make(map[string]time.Time),
+		now:    time.Now,
 		ifaces: []string{"ALL", "en0", "lo0", "utun0"},
 		states: make(map[netip.Addr]bool),
 	}
@@ -80,9 +88,15 @@ func (f *fakePF) run(stdin []byte, args []string) (Output, error) {
 		return out("No ALTQ support in kernel\nALTQ related functions disabled\nStatus: " + status + " for 0 days 00:00:01           Debug: Urgent\n\nState Table\n"), nil
 	case a == "-E":
 		f.enabled = true
-		f.next++
-		tok := strconv.Itoa(1000 + f.next)
+		var tok string
+		if n := len(f.free); n > 0 {
+			tok, f.free = f.free[n-1], f.free[:n-1]
+		} else {
+			f.next++
+			tok = strconv.Itoa(1000 + f.next)
+		}
 		f.tokens = append(f.tokens, tok)
+		f.born[tok] = f.now()
 		return Output{Stderr: []byte("No ALTQ support in kernel\nALTQ related functions disabled\npf enabled\nToken : " + tok + "\n")}, nil
 	case len(args) == 2 && args[0] == "-X":
 		i := slices.Index(f.tokens, args[1])
@@ -93,8 +107,11 @@ func (f *fakePF) run(stdin []byte, args []string) (Output, error) {
 			return Output{Stderr: []byte("pfctl: pf: token invalid\n")}, errExit
 		}
 		f.tokens = slices.Delete(f.tokens, i, i+1)
+		f.free = append(f.free, args[1])
 		f.enabled = len(f.tokens) > 0
 		return Output{}, nil
+	case a == "-s References":
+		return out(showReferences(f.tokens, f.born, f.now())), nil
 	case a == "-sr":
 		return out(strings.Join(f.main, "\n") + "\n"), nil
 	case a == "-sn":
@@ -140,6 +157,9 @@ func (f *fakePF) anchor(path string, rest []string, stdin []byte) (Output, error
 		return out(f.listAnchors(path, r == "-sA -v")), nil
 	case r == "-F rules":
 		f.anchors[path] = nil
+		return Output{}, nil
+	case r == "-F Tables":
+		clear(f.tables)
 		return Output{}, nil
 	case r == "-sT":
 		return out(strings.Join(slices.Sorted(maps.Keys(f.tables)), "\n") + "\n"), nil
@@ -320,4 +340,20 @@ func (f *fakePF) callsOf(want ...string) [][]string {
 		}
 	}
 	return got
+}
+
+// showReferences prints the references as "pfctl -s References" does on
+// macOS 27. TIMESTAMP is the age of the reference.
+func showReferences(tokens []string, born map[string]time.Time, now time.Time) string {
+	if len(tokens) == 0 {
+		return "No pf starter references held\n"
+	}
+	var b strings.Builder
+	b.WriteString("TOKENS:\nPID      Process Name                 TOKEN                    TIMESTAMP\n")
+	for i, tok := range tokens {
+		age := int64(now.Sub(born[tok]).Seconds())
+		fmt.Fprintf(&b, "%-8d %-28s %-24s %d days %02d:%02d:%02d\n", 700+i, "pfctl", tok,
+			age/86400, age/3600%24, age/60%60, age%60)
+	}
+	return b.String()
 }

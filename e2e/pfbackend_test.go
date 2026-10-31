@@ -24,7 +24,8 @@ import (
 )
 
 // These tests load the ifbound anchor into the pf of the host. Each test
-// flushes the anchor and gives back the pf token at the end.
+// unloads the Backend at the end: it gives back the pf token and flushes
+// the anchor.
 
 type testClock struct{ t time.Time }
 
@@ -41,11 +42,8 @@ func newPfBackend(t *testing.T) (*pfbackend.Backend, *testClock) {
 		// t.Context is already canceled when cleanups run.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if out, err := exec.CommandContext(ctx, pfbackend.Path, "-a", pfbackend.Anchor, "-F", "all").CombinedOutput(); err != nil {
-			t.Errorf("flush %s: %v: %s", pfbackend.Anchor, err, out)
-		}
-		if err := b.Release(ctx); err != nil {
-			t.Errorf("Release: %v", err)
+		if err := b.Unload(ctx); err != nil {
+			t.Errorf("Unload: %v", err)
 		}
 	})
 	return b, c
@@ -414,10 +412,10 @@ func TestPfBackendRepairsNegatedEntryInsideAPrefix(t *testing.T) {
 	}
 }
 
-// TestPfBackendReleaseAfterRestart checks that a new Backend on the same
+// TestPfBackendUnloadAfterRestart checks that a new Backend on the same
 // pf (a restarted daemon) reads the token of ifbound from the anchor, and
-// that Release gives it back.
-func TestPfBackendReleaseAfterRestart(t *testing.T) {
+// that Unload gives it back.
+func TestPfBackendUnloadAfterRestart(t *testing.T) {
 	b, _ := newPfBackend(t)
 	before := references(t)
 	load(t, b, compilePolicies(t, policyA))
@@ -426,11 +424,11 @@ func TestPfBackendReleaseAfterRestart(t *testing.T) {
 	}
 	again := pfbackend.New(pfbackend.Exec{Path: pfbackend.Path}, time.Now, slog.New(slog.DiscardHandler))
 	readState(t, again)
-	if err := again.Release(t.Context()); err != nil {
-		t.Fatalf("Release by the restarted Backend: %v", err)
+	if err := again.Unload(t.Context()); err != nil {
+		t.Fatalf("Unload by the restarted Backend: %v", err)
 	}
 	if got := references(t); !slices.Equal(got, before) {
-		t.Errorf("references after Release = %v, want %v", got, before)
+		t.Errorf("references after Unload = %v, want %v", got, before)
 	}
 }
 
