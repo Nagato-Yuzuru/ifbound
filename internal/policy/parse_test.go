@@ -302,6 +302,7 @@ func TestParseRejects(t *testing.T) {
 		{"syntax error", "[dns\n", "", errSyntax},
 		// [dns].
 		{"no upstream", "[dns]\n", "dns.upstream", errUpstreamEmpty},
+		{"sixteen upstreams", "[dns]\nupstream = [" + strings.Repeat("\"tls://1.1.1.1@a.b\", ", 16) + "]\n", "dns.upstream", errUpstreamMany},
 		{"non-tls upstream", "[dns]\nupstream = [\"udp://1.1.1.1@a.b\"]\n", "dns.upstream[0]", errUpstreamForm},
 		{"upstream without server name", "[dns]\nupstream = [\"tls://1.1.1.1\"]\n", "dns.upstream[0]", errUpstreamForm},
 		{"upstream hostname", "[dns]\nupstream = [\"tls://dns.example@a.b\"]\n", "dns.upstream[0]", errBadAddress},
@@ -624,5 +625,15 @@ func TestConstraintConstructors(t *testing.T) {
 	a, b := NewOnlyVia(mustSel(t, "en0")), NewOnlyVia(mustSel(t, "en0"))
 	if !a.Equal(b) || a.Equal(NewOnlyVia(mustSel(t, "en1"))) {
 		t.Error("Equal gives a wrong answer")
+	}
+}
+
+func TestParseAcceptsFifteenUpstreams(t *testing.T) {
+	cfg, err := ParseBytes([]byte("[dns]\nupstream = [" + strings.Repeat("\"tls://1.1.1.1@a.b\", ", 15) + "]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(cfg.DNS.Upstream); got != 15 {
+		t.Errorf("upstreams = %d, want 15", got)
 	}
 }

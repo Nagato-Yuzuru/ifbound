@@ -1,0 +1,11 @@
+.:5353 {
+	bind ::1
+	errors {
+		consolidate 1m ".*"
+	}
+	ifbound "/var/run/ifbound/report.sock"
+	cache
+	forward . tls://127.0.0.1%dot.test:8853 {
+		tls "/tmp/ca.pem"
+	}
+}
