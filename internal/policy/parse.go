@@ -24,6 +24,7 @@ var (
 	errUnknownKey     = errors.New("unknown key")
 	errPolicyShape    = errors.New("must be an array of tables: use [[policy]]")
 	errUpstreamEmpty  = errors.New("must list at least one upstream")
+	errUpstreamMany   = errors.New("must list at most 15 upstreams: the CoreDNS forward plugin accepts no more")
 	errUpstreamForm   = errors.New("must have the form tls://<ip>[:port]@<server-name>")
 	errBadAddress     = errors.New("invalid address")
 	errNotLoopback    = errors.New("listen address must be a loopback address (127.0.0.0/8 or ::1): the resolver entries send protected lookups to it, and any other address can bypass ifbound-dns")
@@ -388,6 +389,10 @@ func (raw rawConfig) validate() (Config, error) {
 	return cfg, nil
 }
 
+// maxUpstreams is the number of upstreams that the CoreDNS forward plugin
+// accepts. A [dns] with more could not start ifbound-dns.
+const maxUpstreams = 15
+
 func (d rawDNS) validate() (DNS, error) {
 	listen := DefaultListen
 	if d.Listen != nil {
@@ -407,6 +412,9 @@ func (d rawDNS) validate() (DNS, error) {
 	}
 	if len(d.Upstream) == 0 {
 		return DNS{}, at("upstream", errUpstreamEmpty)
+	}
+	if len(d.Upstream) > maxUpstreams {
+		return DNS{}, at("upstream", errUpstreamMany)
 	}
 	out := DNS{Listen: ap}
 	for i, s := range d.Upstream {
