@@ -40,6 +40,7 @@ func newTest(t *testing.T) (*Backend, *fakePF, *clock) {
 	t.Helper()
 	f := newFakePF()
 	c := &clock{t: time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)}
+	f.now = c.now
 	return New(f, c.now, slog.New(slog.DiscardHandler)), f, c
 }
 
@@ -153,8 +154,8 @@ func TestLoadEnablesPfWithRateLimit(t *testing.T) {
 	if err := b.Load(t.Context(), rs); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if !f.enabled || b.token != "1001" {
-		t.Fatalf("after Load: enabled %v, token %q; want enabled with token 1001", f.enabled, b.token)
+	if !f.enabled || !slices.Equal(values(b), []string{"1001"}) {
+		t.Fatalf("after Load: enabled %v, tokens %v; want enabled with token 1001", f.enabled, values(b))
 	}
 
 	f.enabled, f.tokens = false, nil // pfctl -d drops every token
@@ -170,8 +171,8 @@ func TestLoadEnablesPfWithRateLimit(t *testing.T) {
 	if err := b.Load(t.Context(), rs); err != nil {
 		t.Fatalf("Load after the interval: %v", err)
 	}
-	if !f.enabled || b.token != "1002" {
-		t.Errorf("after the second enable: enabled %v, token %q; want enabled with token 1002", f.enabled, b.token)
+	if !f.enabled || !slices.Equal(values(b), []string{"1002"}) {
+		t.Errorf("after the second enable: enabled %v, tokens %v; want enabled with token 1002", f.enabled, values(b))
 	}
 }
 
@@ -184,8 +185,8 @@ func TestLoadTakesItsOwnReference(t *testing.T) {
 		if err := b.Load(t.Context(), compile(t, testConfig)); err != nil {
 			t.Fatalf("Load: %v", err)
 		}
-		if !slices.Equal(f.tokens, []string{"77", want}) || b.token != want {
-			t.Errorf("after Load: tokens %v, token of ifbound %q; want [77 %s] and %s", f.tokens, b.token, want, want)
+		if !slices.Equal(f.tokens, []string{"77", want}) || !slices.Equal(values(b), []string{want}) {
+			t.Errorf("after Load: tokens %v, tokens of ifbound %v; want [77 %s] and %s", f.tokens, values(b), want, want)
 		}
 	}
 	if calls := f.callsOf("-d"); len(calls) != 0 {
@@ -440,20 +441,29 @@ func TestPfctlFailure(t *testing.T) {
 	}
 }
 
-func TestRelease(t *testing.T) {
+// values returns the token values that the Backend holds.
+func values(b *Backend) []string {
+	var out []string
+	for _, t := range b.tokens {
+		out = append(out, t.value)
+	}
+	return out
+}
+
+func TestReleaseToken(t *testing.T) {
 	b, f, c := newTest(t)
-	if err := b.Release(t.Context()); err != nil || len(f.calls) != 0 {
-		t.Fatalf("Release without a token: error %v, calls %v; want nothing", err, f.calls)
+	if err := b.release(t.Context()); err != nil || len(f.calls) != 0 {
+		t.Fatalf("release without a token: error %v, calls %v; want nothing", err, f.calls)
 	}
 	if err := b.Load(t.Context(), compile(t, testConfig)); err != nil {
 		t.Fatal(err)
 	}
-	f.tokens = append(f.tokens, "other")
-	if err := b.Release(t.Context()); err != nil {
-		t.Fatalf("Release: %v", err)
+	f.tokens = append(f.tokens, "77")
+	if err := b.release(t.Context()); err != nil {
+		t.Fatalf("release: %v", err)
 	}
-	if !slices.Equal(f.tokens, []string{"other"}) || !f.enabled {
-		t.Errorf("after Release: tokens %v, enabled %v; want the other token only, pf enabled", f.tokens, f.enabled)
+	if !slices.Equal(f.tokens, []string{"77"}) || !f.enabled {
+		t.Errorf("after release: tokens %v, enabled %v; want the other token only, pf enabled", f.tokens, f.enabled)
 	}
 
 	f.enabled, f.tokens = false, nil
@@ -462,24 +472,52 @@ func TestRelease(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.enabled, f.tokens = false, nil // pfctl -d drops every token
-	if err := b.Release(t.Context()); err != nil {
-		t.Errorf("Release after pf was disabled: %v", err)
+	before := len(f.callsOf("-X"))
+	if err := b.release(t.Context()); err != nil {
+		t.Errorf("release after pf was disabled: %v", err)
 	}
-	if b.token != "" {
-		t.Errorf("token after Release = %q, want none", b.token)
+	if len(b.tokens) != 0 {
+		t.Errorf("tokens after release = %v, want none", b.tokens)
+	}
+	if calls := f.callsOf("-X"); len(calls) != before {
+		t.Errorf("release after pf was disabled ran %v", calls)
 	}
 
 	c.t = c.t.Add(EnableInterval)
 	if err := b.Load(t.Context(), compile(t, testConfig)); err != nil {
 		t.Fatal(err)
 	}
-	f.tokens = []string{"other"} // pfctl -d, then pfctl -E by another tool
-	if err := b.Release(t.Context()); err != nil || b.token != "" {
-		t.Errorf("Release of a stale token: error %v, token %q; want nil and none", err, b.token)
-	}
 	f.fail = func(args []string) bool { return slices.Contains(args, "-X") }
-	b.token = "other"
-	if err := b.Release(t.Context()); !errors.Is(err, errPfctl) || b.token != "other" {
-		t.Errorf("Release with a failing pfctl: error %v, token %q; want errPfctl and the token kept", err, b.token)
+	held := slices.Clone(b.tokens)
+	if err := b.release(t.Context()); !errors.Is(err, errPfctl) || !slices.Equal(b.tokens, held) {
+		t.Errorf("release with a failing pfctl: error %v, tokens %v; want errPfctl and %v kept", err, b.tokens, held)
+	}
+}
+
+// pf gives a released value again. A token whose value another process
+// holds now, with another creation time, is not the token of ifbound.
+func TestReleaseLeavesAReusedValue(t *testing.T) {
+	b, f, c := newTest(t)
+	if err := b.Load(t.Context(), compile(t, testConfig)); err != nil {
+		t.Fatal(err)
+	}
+	mine := b.tokens[0]
+	f.tokens, f.free = nil, []string{mine.value} // pfctl -d drops it
+	c.t = c.t.Add(time.Minute)
+	f.enabled = true
+	if _, err := f.Run(t.Context(), nil, "-E"); err != nil { // another tool gets the same value
+		t.Fatal(err)
+	}
+	if !slices.Equal(f.tokens, []string{mine.value}) {
+		t.Fatalf("the other tool got %v, want the reused value %s", f.tokens, mine.value)
+	}
+	if err := b.release(t.Context()); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if calls := f.callsOf("-X"); len(calls) != 0 {
+		t.Errorf("release ran %v: the value belongs to another process now", calls)
+	}
+	if !f.enabled || !slices.Equal(f.tokens, []string{mine.value}) {
+		t.Errorf("after release: enabled %v tokens %v; want the reference of the other tool", f.enabled, f.tokens)
 	}
 }

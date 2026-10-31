@@ -1,7 +1,7 @@
 package pfbackend_test
 
 // Tests of the pf Backend through its public methods (New, the
-// reconcile.Backend methods, and Release), against the kernel model in
+// reconcile.Backend methods, and Unload), against the kernel model in
 // kernel_test.go. The expected values come from the contract in
 // internal/reconcile/platform.go and from pf.conf(5).
 
@@ -90,6 +90,7 @@ func newRig(t *testing.T) *rig {
 	t.Helper()
 	k := newKernel()
 	clk := &modelClock{t: time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC)}
+	k.now = clk.now
 	w := &warnings{}
 	t.Cleanup(func() {
 		if k.disables != 0 {
@@ -543,17 +544,17 @@ func TestLoadEnablesPfAndKeepsTheToken(t *testing.T) {
 		t.Errorf("no warning logged when the Backend enabled pf")
 	}
 	tok := r.k.refs[0]
-	if err := r.b.Release(t.Context()); err != nil {
-		t.Fatalf("Release: %v", err)
+	if err := r.b.Unload(t.Context()); err != nil {
+		t.Fatalf("Unload: %v", err)
 	}
 	if got := r.k.callsWith("-X", tok); len(got) != 1 {
-		t.Errorf("Release ran %v, want one pfctl -X %s", got, tok)
+		t.Errorf("Unload ran %v, want one pfctl -X %s", got, tok)
 	}
 	if r.k.enabled {
-		t.Errorf("pf is still enabled after Release of the only reference")
+		t.Errorf("pf is still enabled after Unload gave back the only reference")
 	}
-	if err := r.b.Release(t.Context()); err != nil {
-		t.Errorf("a second Release = %v, want nil", err)
+	if err := r.b.Unload(t.Context()); err != nil {
+		t.Errorf("a second Unload = %v, want nil", err)
 	}
 }
 
@@ -582,13 +583,19 @@ func TestEnableIsRateLimited(t *testing.T) {
 	}
 }
 
-func TestReleaseWithoutTokenRunsNothing(t *testing.T) {
+func TestUnloadWithoutTokenGivesNothingBack(t *testing.T) {
 	r := newRig(t)
-	if err := r.b.Release(t.Context()); err != nil {
-		t.Errorf("Release without a token = %v, want nil", err)
+	if _, err := r.k.enableRef(); err != nil { // another tool: pfctl -E
+		t.Fatal(err)
 	}
-	if len(r.k.calls) != 0 {
-		t.Errorf("Release without a token ran %v", r.k.calls)
+	if err := r.b.Unload(t.Context()); err != nil {
+		t.Errorf("Unload without a token = %v, want nil", err)
+	}
+	if got := r.k.callsWith("-X"); len(got) != 0 {
+		t.Errorf("Unload without a token ran %v", got)
+	}
+	if !r.k.enabled || len(r.k.refs) != 1 {
+		t.Errorf("after Unload: enabled %v refs %v; want the other reference", r.k.enabled, r.k.refs)
 	}
 }
 
@@ -602,7 +609,7 @@ func TestNoMethodRunsPfctlDisable(t *testing.T) {
 	_ = r.b.DropTable(ctx, "doh")                           //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
 	_, _ = r.b.Read(ctx)                                    //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
 	_, _ = r.b.LoadedID(ctx)                                //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
-	_ = r.b.Release(ctx)                                    //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
+	_ = r.b.Unload(ctx)                                     //nolint:errcheck // the test inspects the recorded pfctl calls, not the results
 	for _, c := range r.k.calls {
 		if slices.Contains(c, "-d") || slices.Contains(c, "-F") && slices.Contains(c, "all") {
 			t.Errorf("forbidden pfctl call %v", c)
