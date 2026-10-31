@@ -103,12 +103,20 @@ var rigAddrPool = []string{"192.0.2.1", "192.0.2.2", "2001:db8::5", "::ffff:198.
 
 var rigTTLs = []time.Duration{0, time.Minute, 2 * time.Hour}
 
-// rigLookup is a system resolver that never routes a probe name to
-// ifbound-dns. Only the warm-up uses it; a report must never need it.
-type rigLookup struct{ calls atomic.Int64 }
+// rigLookup is the system resolver of the rig, together with
+// ifbound-dns: a probe name that an applied entry routes to ifbound-dns
+// reaches the daemon. The answer is always "no such name", so the
+// warm-up learns nothing.
+type rigLookup struct {
+	world  *reconciletest.World
+	listen netip.AddrPort
+	d      *daemon.Daemon
+}
 
 func (l *rigLookup) Resolve(_ context.Context, name string) ([]netip.Addr, error) {
-	l.calls.Add(1)
+	if ipc.IsProbe(name) && routes(l.world.AppliedResolverEntries(), name, l.listen) {
+		l.d.ProbeSeen(name)
+	}
 	return nil, fmt.Errorf("resolve %s: %w", name, syslookup.ErrNotFound)
 }
 
@@ -143,14 +151,11 @@ type rig struct {
 
 func newRig(t *testing.T, world *reconciletest.World, dir string, cfgText string) *rig {
 	t.Helper()
-	cfg, err := policy.ParseBytes([]byte(cfgText))
-	if err != nil {
-		t.Fatalf("parse config: %v", err)
-	}
-	rg := &rig{t: t, world: world, inv: reconciletest.NewInventory(rigEn0), dir: dir, snap: filepath.Join(dir, "addrbook.json"), lookup: &rigLookup{}, stats: map[string]int{}}
+	rg := &rig{t: t, world: world, inv: reconciletest.NewInventory(rigEn0), dir: dir, snap: filepath.Join(dir, "addrbook.json"), lookup: &rigLookup{world: world, listen: rigCfg(t, cfgText).DNS.Listen}, stats: map[string]int{}}
 	rg.d = daemon.New(daemon.Config{
-		Policy:   cfg,
-		Snapshot: rg.snap,
+		ConfigPath: storeConfig(t, t.TempDir(), cfgText),
+		ConfigGID:  -1,
+		Snapshot:   rg.snap,
 		// No host file: the tests here do not depend on the host file of the machine.
 		HostsFile: filepath.Join(filepath.Dir(rg.snap), "hosts"),
 		Platform: reconcile.Reconciler{
@@ -161,6 +166,7 @@ func newRig(t *testing.T, world *reconciletest.World, dir string, cfgText string
 		},
 		Lookup: rg.lookup,
 	})
+	rg.lookup.d = rg.d
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- rg.d.Run(ctx) }()
@@ -177,8 +183,12 @@ func newRig(t *testing.T, world *reconciletest.World, dir string, cfgText string
 	return rg
 }
 
+// status waits until the loop blocks, so that the published Status
+// covers every pass that the last event started, such as the repair
+// after a report that found the ruleset changed.
 func (rg *rig) status() daemon.Status {
 	rg.t.Helper()
+	synctest.Wait()
 	st, err := rg.d.Status(context.Background())
 	if err != nil {
 		rg.t.Fatalf("Status: %v", err)

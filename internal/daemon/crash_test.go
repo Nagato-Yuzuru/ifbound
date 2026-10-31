@@ -84,7 +84,7 @@ func faultScenario(t *testing.T, failAt int, mode fault) int {
 		return nil
 	})
 
-	a := start(t, world, inv, snapshot, parse(t, configV1))
+	a := start(t, world, inv, snapshot, configV1)
 	report := func(name policy.Name, o ipc.Observation) error {
 		acks.observed(name, o)
 		err := a.observe(o)
@@ -122,7 +122,7 @@ func faultScenario(t *testing.T, failAt int, mode fault) int {
 	a.stop()
 
 	world.SetBeforeWrite(nil)
-	b := start(t, world, inv, snapshot, parse(t, configV2))
+	b := start(t, world, inv, snapshot, configV2)
 	defer b.stop()
 	b.wantState(daemon.StateReady)
 	checkRecovered(t, world, acks)
