@@ -43,7 +43,7 @@ func TestStartLoadsSnapshotAndInstallsEnforcement(t *testing.T) {
 		snapshot := filepath.Join(t.TempDir(), "addrbook.json")
 		writeSnapshot(t, snapshot, map[policy.Name]string{"web": "203.0.113.1", "gone": "203.0.113.9"})
 
-		h := start(t, reconciletest.NewWorld(), reconciletest.NewInventory(en0), snapshot, parse(t, configV1))
+		h := start(t, reconciletest.NewWorld(), reconciletest.NewInventory(en0), snapshot, configV1)
 		defer h.stop()
 
 		st := h.wantState(daemon.StateReady)
@@ -63,7 +63,7 @@ func TestStartPrunesRemovedPoliciesAfterInstall(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		snapshot := filepath.Join(t.TempDir(), "addrbook.json")
 		writeSnapshot(t, snapshot, map[policy.Name]string{"web": "203.0.113.1", "gone": "203.0.113.9"})
-		h := start(t, reconciletest.NewWorld(), reconciletest.NewInventory(en0), snapshot, parse(t, configV1))
+		h := start(t, reconciletest.NewWorld(), reconciletest.NewInventory(en0), snapshot, configV1)
 		defer h.stop()
 
 		// A new address makes the daemon save the book.
@@ -83,7 +83,7 @@ func TestSnapshotLoadErrorKeepsStartingUntilRepaired(t *testing.T) {
 		if err := os.WriteFile(snapshot, []byte("not json"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		h := start(t, reconciletest.NewWorld(), reconciletest.NewInventory(en0), snapshot, parse(t, configV1))
+		h := start(t, reconciletest.NewWorld(), reconciletest.NewInventory(en0), snapshot, configV1)
 		defer h.stop()
 
 		st := h.wantState(daemon.StateStarting)
@@ -120,7 +120,7 @@ func TestStartWithoutSnapshotAdoptsKernelEntries(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(t.TempDir(), "addrbook.json"), parse(t, configV1))
+		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(t.TempDir(), "addrbook.json"), configV1)
 		defer h.stop()
 
 		h.wantState(daemon.StateReady)
@@ -163,7 +163,7 @@ func TestAdoptionSaveFailureKeepsStarting(t *testing.T) {
 				t.Error(err)
 			}
 		})
-		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(dir, "s.json"), parse(t, configV1))
+		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(dir, "s.json"), configV1)
 		defer h.stop()
 
 		st := h.wantState(daemon.StateStarting)
@@ -199,7 +199,7 @@ func TestEntryThatExpiredWhileDownNeverReachesATable(t *testing.T) {
 			}
 		})
 
-		h := start(t, world, reconciletest.NewInventory(en0), snapshot, parse(t, configV1))
+		h := start(t, world, reconciletest.NewInventory(en0), snapshot, configV1)
 		defer h.stop()
 
 		h.wantState(daemon.StateReady)
@@ -213,7 +213,7 @@ func TestFailedFirstConvergenceIsUnenforced(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		world := reconciletest.NewWorld()
 		world.SetBeforeWrite(func(int) error { return reconciletest.ErrInjected })
-		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(t.TempDir(), "s.json"), parse(t, configV1))
+		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(t.TempDir(), "s.json"), configV1)
 		defer h.stop()
 
 		h.wantState(daemon.StateUnenforced)
@@ -231,7 +231,7 @@ func TestVoidingProblemAtStartIsUnenforced(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		world := reconciletest.NewWorld()
 		world.SetProblems([]reconcile.Problem{pfDisabled}, nil)
-		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(t.TempDir(), "s.json"), parse(t, configV1))
+		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(t.TempDir(), "s.json"), configV1)
 		defer h.stop()
 
 		st := h.wantState(daemon.StateUnenforced)
@@ -524,7 +524,7 @@ func TestObserveNotAckedWhenSaveFails(t *testing.T) {
 		if err := os.Mkdir(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		h := start(t, reconciletest.NewWorld(), reconciletest.NewInventory(en0), filepath.Join(dir, "s.json"), parse(t, configV1))
+		h := start(t, reconciletest.NewWorld(), reconciletest.NewInventory(en0), filepath.Join(dir, "s.json"), configV1)
 		defer h.stop()
 		h.wantState(daemon.StateReady)
 		if err := os.Remove(dir); err != nil {
@@ -628,7 +628,7 @@ func TestForeignRulesetIsUnenforcedWhileRepairFails(t *testing.T) {
 		world := reconciletest.NewWorld()
 		var fail atomic.Bool
 		h := startOn(t, world, loadFails{world.Backend(), &fail}, reconciletest.NewInventory(en0),
-			filepath.Join(t.TempDir(), "s.json"), parse(t, configV1))
+			filepath.Join(t.TempDir(), "s.json"), configV1)
 		defer h.stop()
 		fail.Store(true) // the repair cannot load the ruleset
 		h.world.ExternalLoad([]byte("pass all\n"))
@@ -815,7 +815,7 @@ func TestPermanentLoadFailureNeverAcks(t *testing.T) {
 		world := reconciletest.NewWorld()
 		var fail atomic.Bool
 		h := startOn(t, world, loadFails{world.Backend(), &fail}, reconciletest.NewInventory(en0),
-			filepath.Join(t.TempDir(), "s.json"), parse(t, configV1))
+			filepath.Join(t.TempDir(), "s.json"), configV1)
 		defer h.stop()
 		fail.Store(true)
 		_ = h.d.Reconfigure(t.Context(), parse(t, configV2)) //nolint:errcheck // the load is rejected, so it fails by design
@@ -837,7 +837,7 @@ func TestRevertAfterFailedRemovalKeepsAddresses(t *testing.T) {
 		world := reconciletest.NewWorld()
 		var fail atomic.Bool
 		h := startOn(t, world, loadFails{world.Backend(), &fail}, reconciletest.NewInventory(en0),
-			filepath.Join(t.TempDir(), "s.json"), parse(t, configV1))
+			filepath.Join(t.TempDir(), "s.json"), configV1)
 		defer h.stop()
 		if err := h.observe(obs("x.ads.example", "3fff::1")); err != nil {
 			t.Fatal(err)
@@ -1008,7 +1008,7 @@ func TestFirstLoadFailureIsUnenforcedUntilRepaired(t *testing.T) {
 		world := reconciletest.NewWorld()
 		var fail atomic.Bool
 		fail.Store(true)
-		h := startOn(t, world, loadFails{world.Backend(), &fail}, reconciletest.NewInventory(en0), snapshot, parse(t, configV1))
+		h := startOn(t, world, loadFails{world.Backend(), &fail}, reconciletest.NewInventory(en0), snapshot, configV1)
 		defer h.stop()
 
 		st := h.wantState(daemon.StateUnenforced)

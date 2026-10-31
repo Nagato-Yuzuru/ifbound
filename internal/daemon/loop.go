@@ -2,35 +2,87 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/netip"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
+	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
+	"github.com/Nagato-Yuzuru/ifbound/internal/layout"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
+)
+
+// errNoConfig is the error of a convergence while the daemon has no
+// configuration.
+var errNoConfig = errors.New("daemon: no configuration")
+
+// reasonNotLoaded is the reason of StateStarting before the first load of
+// the snapshot.
+const reasonNotLoaded = "the snapshot is not loaded yet"
+
+// storeFunc stores a configuration as configstore.Store does.
+type storeFunc func(path string, data []byte, gid int) (policy.Config, configstore.Digest, error)
+
+// selfTest is the state of the self-test for one configuration.
+type selfTest uint8
+
+const (
+	// selfTestNone: the configuration lists no name, so no query goes
+	// to ifbound-dns, and there is nothing to test.
+	selfTestNone selfTest = iota
+	// selfTestNotRun: no warm-up pass under the configuration has ended,
+	// and no probe reached ifbound-dns.
+	selfTestNotRun
+	// selfTestFailed: a warm-up pass ended, and no probe reached
+	// ifbound-dns.
+	selfTestFailed
+	// selfTestPassed: a probe reached ifbound-dns under the
+	// configuration.
+	selfTestPassed
 )
 
 // loop is the state that only the Run goroutine touches.
 type loop struct {
 	rec      reconcile.Reconciler
 	snapshot string
+	store    string // the path of the stored configuration
+	storeGID int
+	storeFn  storeFunc
 	log      *slog.Logger
-	retain   time.Duration // the retain of every book, fixed at creation
+	// pub receives the status that Daemon.Status returns.
+	pub *atomic.Pointer[Status]
+	// retain is the retain of every book. The first configuration fixes
+	// it.
+	retain time.Duration
 
-	// book is empty in StateStarting. A complete load replaces it.
+	// book is nil until the first complete load of the snapshot. The
+	// daemon never converges without it: an empty book would remove every
+	// learned address.
 	book *addrbook.AddrBook
 
-	cfg     policy.Config
-	matcher *matcher.Matcher
-	apexes  []policy.Domain
+	// configured is false until the daemon has a configuration. Until
+	// then it does not converge.
+	configured bool
+	cfg        policy.Config
+	digest     configstore.Digest
+	matcher    *matcher.Matcher
+	apexes     []policy.Domain
+	// upstream is the error of the upstream check for cfg, or nil.
+	upstream error
+	warnings []policy.Warning
 	// gen counts the configuration changes. A warm-up runs only under
 	// the configuration that it started with.
 	gen uint64
+
+	// selfTest is the self-test of cfg.
+	selfTest selfTest
 
 	hosts    hostsState
 	accounts accountsState
@@ -42,31 +94,65 @@ type loop struct {
 	recheck bool
 }
 
-func newLoop(c Config) *loop {
+func newLoop(c Config, store storeFunc, pub *atomic.Pointer[Status]) *loop {
 	l := &loop{
 		rec:      c.Platform,
 		snapshot: c.Snapshot,
+		store:    c.ConfigPath,
+		storeGID: c.ConfigGID,
+		storeFn:  store,
 		log:      c.Logger,
-		retain:   c.Policy.AddrBook.Retain,
-		phase:    startingPhase("the snapshot is not loaded yet"),
+		pub:      pub,
+		phase:    startingPhase(reasonNotLoaded),
 		hosts:    hostsState{path: c.HostsFile},
 		accounts: newAccountsState(c.Accounts),
+		matcher:  matcher.New(nil),
 	}
 	if l.hosts.path == "" {
-		l.hosts.path = DefaultHostsFile
+		l.hosts.path = layout.Default().HostsFile
 	}
-	l.book = l.newBook()
-	l.setConfig(c.Policy)
 	return l
+}
+
+// publish makes the current status the one that Daemon.Status returns.
+func (l *loop) publish() {
+	st := l.status()
+	l.pub.Store(&st)
 }
 
 func (l *loop) newBook() *addrbook.AddrBook { return addrbook.New(l.retain, time.Now) }
 
-func (l *loop) setConfig(cfg policy.Config) {
-	l.cfg = cfg
+// loadStored loads the stored configuration at start. A configuration
+// that does not load leaves the daemon without one: it then keeps the
+// platform state that it finds and acknowledges nothing, until Apply
+// gives it a configuration. It does not try the load again: only Apply
+// changes the stored file.
+func (l *loop) loadStored(ctx context.Context) {
+	cfg, digest, err := configstore.Load(l.store)
+	if err != nil {
+		l.setPhase(ctx, unconfiguredPhase("the stored configuration did not load: "+err.Error()))
+		return
+	}
+	l.setConfig(cfg, digest)
+}
+
+// setConfig makes cfg the running configuration. digest is the digest of
+// its stored file, or zero when it is not stored.
+func (l *loop) setConfig(cfg policy.Config, digest configstore.Digest) {
+	if !l.configured {
+		l.configured = true
+		l.retain = cfg.AddrBook.Retain
+	}
+	l.cfg, l.digest = cfg, digest
 	l.gen++
 	l.matcher = matcher.New(cfg.Policies)
 	l.apexes = l.matcher.Apexes()
+	l.upstream = cfg.CheckUpstreams()
+	l.warnings = cfg.Warnings()
+	l.selfTest = selfTestNone
+	if len(warmUpNames(cfg)) > 0 {
+		l.selfTest = selfTestNotRun
+	}
 }
 
 func (l *loop) policyNames() []policy.Name {
@@ -82,10 +168,13 @@ func (l *loop) policyNames() []policy.Name {
 // address.
 //
 // The host file comes first: adoption must know which kernel entries are
-// host addresses.
+// host addresses. Without a configuration, it does nothing.
 func (l *loop) reconcile(ctx context.Context, trigger string) error {
+	if !l.configured {
+		return errNoConfig
+	}
 	l.refreshHosts(ctx)
-	if !l.phase.loaded() {
+	if l.book == nil {
 		book, err := l.loadBook(ctx)
 		if err != nil {
 			l.setPhase(ctx, startingPhase(err.Error()))
@@ -117,7 +206,20 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	if p, ok := l.accountsProblem(); ok {
 		rep.Problems = append(rep.Problems, p)
 	}
-	l.setPhase(ctx, convergedPhase(rep, err))
+	if l.upstream != nil {
+		// Only the stored file at start can fail the check: Apply refuses
+		// such a configuration. The check protects only DNS, so the
+		// daemon enforces the file.
+		rep.Problems = append(rep.Problems, reconcile.Problem{Text: "the configuration fails the upstream check: " + l.upstream.Error()})
+	}
+	p := convergedPhase(rep, err)
+	if st, ok := l.selfTestProblem(); ok && p.acks() {
+		// The warm-up, and so the self-test, runs only while the phase
+		// acks. In another phase the reason would only repeat that.
+		rep.Problems = append(rep.Problems, st)
+		p = convergedPhase(rep, err)
+	}
+	l.setPhase(ctx, p)
 	return err
 }
 
@@ -196,6 +298,10 @@ func (l *loop) setPhase(ctx context.Context, p phase) {
 }
 
 func (l *loop) armExpiry(t *time.Timer) {
+	if l.book == nil {
+		t.Stop()
+		return
+	}
 	next, ok := l.book.NextExpiry()
 	if !ok {
 		t.Stop()
@@ -205,18 +311,75 @@ func (l *loop) armExpiry(t *time.Timer) {
 }
 
 func (l *loop) expire(ctx context.Context) {
-	if len(l.book.Expire()) > 0 {
+	if l.book != nil && len(l.book.Expire()) > 0 {
 		_ = l.reconcile(ctx, "expiry") //nolint:errcheck // the phase holds the outcome
 	}
 }
 
 // reconfigure applies cfg. Until a convergence installs the ruleset of
-// cfg, the phase acknowledges nothing. The book keeps the entries of
-// removed policies until then; reconcile prunes them.
-func (l *loop) reconfigure(ctx context.Context, cfg policy.Config) error {
-	l.setConfig(cfg)
+// cfg, the phase acknowledges nothing. It publishes this phase with the
+// new digest before the convergence, so that Status tells the
+// configuration of the stored file also while the convergence runs. The
+// book keeps the entries of removed policies until then; reconcile
+// prunes them.
+func (l *loop) reconfigure(ctx context.Context, cfg policy.Config, digest configstore.Digest) error {
+	l.setConfig(cfg, digest)
+	l.setPhase(ctx, unenforcedPhase("the new configuration is not installed yet"))
+	l.publish()
 	l.readAccounts(ctx)
 	return l.reconcile(ctx, "config")
+}
+
+// apply stores data and then reconfigures. It does not start the store
+// after caller ends. configstore.Store has no step between its
+// temporary file and its rename for the check, so the check runs just
+// before the store. A refused or failed store changes nothing and
+// returns a zero Status. A store whose directory sync failed is in
+// place, so it applies, and its error wraps configstore.ErrNotDurable.
+func (l *loop) apply(ctx, caller context.Context, data []byte) (Status, error) {
+	if err := caller.Err(); err != nil {
+		return Status{}, fmt.Errorf("apply not started: %w", err)
+	}
+	cfg, digest, err := l.storeFn(l.store, data, l.storeGID)
+	if err != nil && !errors.Is(err, configstore.ErrNotDurable) {
+		return Status{}, err
+	}
+	if err != nil {
+		l.log.WarnContext(ctx, "the applied configuration is not durable", slog.Any("error", err))
+	}
+	_ = l.reconfigure(ctx, cfg, digest) //nolint:errcheck // the phase holds the outcome, and Status reports it
+	return l.status(), err
+}
+
+// selfTestResult takes the latest results of the warm-up. Only a result
+// for the running configuration counts, and a pass is final for it. It
+// reports whether the self-test changed.
+func (l *loop) selfTestResult(r warmResult) bool {
+	before := l.selfTest
+	switch {
+	case l.selfTest == selfTestNone || l.selfTest == selfTestPassed:
+	case r.proved == l.gen:
+		l.selfTest = selfTestPassed
+	case r.missed == l.gen:
+		l.selfTest = selfTestFailed
+	}
+	return l.selfTest != before
+}
+
+// selfTestProblem returns the Problem of the self-test, if there is one.
+// It does not void enforcement: without ifbound-dns, a protected name
+// does not resolve.
+func (l *loop) selfTestProblem() (reconcile.Problem, bool) {
+	switch l.selfTest {
+	case selfTestNotRun:
+		return reconcile.Problem{Text: "ifbound-dns not connected: no probe reached it yet"}, true
+	case selfTestFailed:
+		return reconcile.Problem{Text: "ifbound-dns not connected: no probe reached it; the self-test tries again at each self-heal"}, true
+	case selfTestNone, selfTestPassed:
+		return reconcile.Problem{}, false
+	default:
+		return reconcile.Problem{Text: "unknown self-test state"}, true
+	}
 }
 
 // observe handles one DNS report. The report is untrusted: only the
@@ -233,7 +396,7 @@ func (l *loop) reconfigure(ctx context.Context, cfg policy.Config) error {
 // it needs no platform call; the phase checks still apply.
 func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
 	switch {
-	case !l.phase.loaded():
+	case l.phase.state == StateStarting:
 		return ipc.Ack{}, ErrNotReady
 	case !l.phase.acks():
 		return ipc.Ack{}, ErrUnenforced
@@ -303,10 +466,14 @@ func canonical(addrs []netip.Addr) []netip.Addr {
 	return out
 }
 
+// status costs one map lookup per policy, so the loop can publish it at
+// each pass.
 func (l *loop) status() Status {
 	n := 0
-	for _, name := range l.policyNames() {
-		n += len(l.book.Addrs(name))
+	for _, p := range l.cfg.Policies {
+		if l.book != nil {
+			n += l.book.Len(p.Name)
+		}
 	}
 	return Status{
 		State:         l.phase.state,
@@ -314,5 +481,7 @@ func (l *loop) status() Status {
 		Policies:      len(l.cfg.Policies),
 		Addrs:         n,
 		RetainRestart: l.cfg.AddrBook.Retain != l.retain,
+		Config:        l.digest,
+		Warnings:      slices.Clone(l.warnings),
 	}
 }

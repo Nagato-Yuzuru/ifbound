@@ -155,6 +155,10 @@ func (b *AddrBook) Addrs(name policy.Name) []netip.Addr {
 	return out
 }
 
+// Len returns the number of addresses of one policy, as len(b.Addrs(name))
+// does, without a copy.
+func (b *AddrBook) Len(name policy.Name) int { return len(b.entries[name]) }
+
 // NextExpiry returns the first instant at which an entry is expired: one
 // nanosecond after the earliest expiry. Expire at that instant removes
 // the entry. The bool is false when the book is empty.

@@ -147,9 +147,14 @@ func pvStack(t *testing.T, timeout time.Duration) (*handler, *pvCounter, *reconc
 	}
 	world := reconciletest.NewWorld()
 	mdns := &pvMDNS{world: world, listen: cfg.DNS.Listen}
+	store := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(store, []byte(pvStackConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	d := daemon.New(daemon.Config{
-		Policy:   cfg,
-		Snapshot: filepath.Join(t.TempDir(), "addrbook.json"),
+		ConfigPath: store,
+		ConfigGID:  -1,
+		Snapshot:   filepath.Join(t.TempDir(), "addrbook.json"),
 		Platform: reconcile.Reconciler{
 			Compiler: reconciletest.Compiler{}, Backend: world.Backend(), Resolver: world.Resolver(),
 			Inventory: reconciletest.NewInventory(reconcile.Interface{Name: "en0", Class: policy.ClassHardware}),
