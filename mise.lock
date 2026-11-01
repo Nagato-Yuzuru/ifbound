@@ -2,6 +2,23 @@
 
 lockfile_version = 3
 
+[[tools."github:open-telemetry/weaver"]]
+version = "0.28.0"
+backend = "github:open-telemetry/weaver"
+specifiers = ["0.28.0"]
+
+[tools."github:open-telemetry/weaver"."platforms.linux-x64"]
+checksum = "sha256:9878e2d56ad82ae441b0b527377a4f6001ae19f4af362fb0a4d951884f59ab61"
+url = "https://github.com/open-telemetry/weaver/releases/download/v0.28.0/weaver-x86_64-unknown-linux-gnu.tar.xz"
+url_api = "https://api.github.com/repos/open-telemetry/weaver/releases/assets/641116864"
+provenance = "github-attestations"
+
+[tools."github:open-telemetry/weaver"."platforms.macos-arm64"]
+checksum = "sha256:b334b37372325f77374b461fd6a11d38bc050122832eb83a9732fcd6831a5ab1"
+url = "https://github.com/open-telemetry/weaver/releases/download/v0.28.0/weaver-aarch64-apple-darwin.tar.xz"
+url_api = "https://api.github.com/repos/open-telemetry/weaver/releases/assets/641116718"
+provenance = "github-attestations"
+
 [[tools.go]]
 version = "1.27.3"
 backend = "core:go"

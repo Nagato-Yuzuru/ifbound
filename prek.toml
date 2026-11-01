@@ -33,6 +33,15 @@ hooks = [
   ] },
   { id = "go-mod-tidy", name = "go mod tidy", language = "system", entry = "mise exec -- go mod tidy", pass_filenames = false, files = '(^|/)go\.(mod|sum)$|\.go$' },
   { id = "jactionlint", name = "jactionlint", language = "system", entry = "mise exec -- jactionlint", files = '^\.github/workflows/.*\.ya?ml$' },
+  # The registry in telemetry/ is the source of the log attribute names.
+  # Weaver reads the semconv dependency from a local archive. The
+  # telemetry:semconv task downloads it once.
+  { id = "weaver-check", name = "weaver registry check", language = "system", entry = "sh -c 'mise run -q telemetry:semconv && mise exec -- weaver registry check -r telemetry'", pass_filenames = false, files = '^telemetry/' },
+  # The templates read the v2 context, so the generate command needs --v2.
+  # The task fails when a generated file differs from the registry, is
+  # missing, or is new. The hook always runs, so that it also catches a
+  # commit that deletes a generated file.
+  { id = "weaver-generate", name = "weaver registry generate", language = "system", entry = "mise run -q telemetry:generate", pass_filenames = false, always_run = true },
 ]
 
 # Conventional Commits subject. git's own merge, revert, and autosquash subjects also pass.
