@@ -470,6 +470,27 @@ func TestAddEntriesEndsStatesToNewEntries(t *testing.T) {
 	}
 }
 
+// TestAddEntriesEndsStatesToHeldEntries checks the clause of the Backend
+// contract that the Reconciler uses after an interface change: AddEntries
+// ends the states to an entry that the table holds already.
+func TestAddEntriesEndsStatesToHeldEntries(t *testing.T) {
+	r := newRig(t)
+	mustLoad(t, r, compileRS(t, testPolicies))
+	held := pfx("198.51.100.3/32", "2001:db8::/64")
+	if err := r.b.AddEntries(t.Context(), "bing", held); err != nil {
+		t.Fatal(err)
+	}
+	r.k.states = []netip.Addr{netip.MustParseAddr("198.51.100.3"), netip.MustParseAddr("2001:db8::3")}
+	if err := r.b.AddEntries(t.Context(), "bing", held); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range []string{"198.51.100.3", "2001:db8::3"} {
+		if r.k.hasState(a) {
+			t.Errorf("a state to %s survives AddEntries of an entry that the table holds", a)
+		}
+	}
+}
+
 // Problems with Voids
 
 func TestVoidingProblems(t *testing.T) {

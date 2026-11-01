@@ -59,6 +59,11 @@ type Inputs struct {
 type Report struct {
 	// Writes is the number of platform writes that succeeded.
 	Writes int
+	// Narrowed lists, in the order of Inputs.Policies, the policies whose
+	// verdict on the interfaces narrowed and whose connection states this
+	// convergence ended for that reason, by a Load or by AddEntries. An
+	// end of states cannot be undone; the caller can log it.
+	Narrowed []policy.Name
 	// Installed is the ID of the ruleset that the Backend part loaded or
 	// found loaded, when that part completed without error. It is empty
 	// otherwise. A non-empty Installed means: the ruleset for the inputs
@@ -69,14 +74,34 @@ type Report struct {
 	Problems []Problem
 }
 
-// Reconciler converges the platform state. All fields are required. It
-// keeps no state between calls, but the platform parts are not safe for
-// concurrent use: call it from one goroutine.
+// Reconciler converges the platform state. All fields are required. The
+// platform parts are not safe for concurrent use: call it from one
+// goroutine, and use one Reconciler for one platform.
+//
+// Converge keeps one value between calls: the verdict of each policy on
+// the interfaces of its last convergence (see Converge). A copy of a
+// Reconciler does not use the verdicts of the original: its first
+// Converge starts again as a new Reconciler does, as strings.Builder
+// detects a copy. Thus a copy that gets other fields cannot skip an end
+// of states on the strength of a history that it did not write. Only
+// Converge uses the memory, so only Converge has a pointer receiver; the
+// other methods work on a copy, also on a composite literal.
 type Reconciler struct {
 	Compiler  Compiler
 	Backend   Backend
 	Resolver  SysResolver
 	Inventory IfInventory
+
+	mem *memory
+}
+
+// memory is the state that Converge keeps between calls.
+type memory struct {
+	// owner is the Reconciler that wrote the memory.
+	owner *Reconciler
+	// enforced is the verdict of each policy for which the kernel holds
+	// no state that the verdict blocks.
+	enforced map[policy.Name]verdict
 }
 
 // Converge makes the actual state equal to the desired state for in.
@@ -86,8 +111,32 @@ type Reconciler struct {
 //  1. Add the missing table entries. A new policy gets a full table
 //     before any rule refers to it.
 //  2. Load the compiled ruleset if its ID differs from the loaded one.
+//     Else, end the states of each policy that the new interfaces block
+//     on more interfaces (see below).
 //  3. Remove the entries that are no longer desired, then drop the tables
 //     of removed policies. The loaded ruleset no longer refers to them.
+//
+// pf states are floating: a connection that started on an allowed
+// interface can continue on an interface that the policy denies now. The
+// verdict of a policy tells for each current interface whether the
+// policy allows it; the Compiler gives the selection (see
+// Ruleset.Selected). The verdict of a policy narrows when an interface
+// joins the denied set (it appears, or the policy allowed it before), or
+// when an interface leaves the allowed set while the policy denies a
+// current interface. The states of such a policy must end.
+//
+// A Load ends the states of every table, so it ends these states too.
+// Without a Load (the ruleset text can stay the same, for example when a
+// selector names the interface), Converge calls AddEntries for each
+// narrowed policy with the entries that its table held before this pass:
+// AddEntries ends the states to them. Step 1 ended the states to the
+// other entries. So each state ends once, and without a Load a policy
+// whose verdict did not narrow keeps its states.
+//
+// A policy without an earlier verdict (the first Converge of a
+// Reconciler, for example after a restart of the daemon) narrows when it
+// denies a current interface: a state can have moved to that interface
+// while no Reconciler watched.
 //
 // The SysResolver part runs after it, also when the Backend part failed.
 // The desired entries are:
@@ -109,7 +158,7 @@ type Reconciler struct {
 //
 // The error joins the errors of both parts. The Report holds what was
 // done and seen; the next call continues from there.
-func (r Reconciler) Converge(ctx context.Context, in Inputs) (Report, error) {
+func (r *Reconciler) Converge(ctx context.Context, in Inputs) (Report, error) {
 	var rep Report
 	berr := r.convergeBackend(ctx, in, &rep)
 	rerr := r.convergeResolver(ctx, in, &rep)
@@ -144,7 +193,7 @@ func (r Reconciler) AddObserved(ctx context.Context, name policy.Name, addrs []n
 	return nil
 }
 
-func (r Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report) error {
+func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report) error {
 	ifaces, err := r.Inventory.Interfaces(ctx)
 	if err != nil {
 		return fmt.Errorf("reading interfaces: %w", err)
@@ -167,11 +216,19 @@ func (r Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report)
 	if err := r.addMissing(ctx, in.Policies, want, have, rep); err != nil {
 		return err
 	}
+	if r.mem == nil || r.mem.owner != r {
+		r.mem = &memory{owner: r}
+	}
+	cur := verdicts(in.Policies, ifaces, rs)
 	if actual.Ruleset != rs.ID() {
 		if err := r.Backend.Load(ctx, rs); err != nil {
 			return fmt.Errorf("loading ruleset: %w", err)
 		}
 		rep.Writes++
+		rep.Narrowed = r.mem.narrowed(in.Policies, cur)
+		r.mem.enforced = cur
+	} else if err := r.endNarrowed(ctx, in.Policies, cur, want, have, rep); err != nil {
+		return err
 	}
 	if err := r.removeUndesired(ctx, in.Policies, want, have, rep); err != nil {
 		return err
@@ -221,6 +278,45 @@ func (r Reconciler) addMissing(ctx context.Context, policies []policy.Policy, wa
 		}
 		rep.Writes++
 	}
+	return nil
+}
+
+// narrowed returns the policies whose verdict cur narrows.
+func (m *memory) narrowed(policies []policy.Policy, cur map[policy.Name]verdict) []policy.Name {
+	var out []policy.Name
+	for _, p := range policies {
+		if m.enforced[p.Name].narrowedBy(cur[p.Name]) {
+			out = append(out, p.Name)
+		}
+	}
+	return out
+}
+
+// endNarrowed ends the states of each policy whose verdict cur narrows,
+// and records cur. The entries that addMissing added in this pass are
+// not in have: AddEntries ended their states already. On an error, the
+// narrowed policies that are not done keep their old verdict, so the
+// next pass tries again.
+func (r *Reconciler) endNarrowed(ctx context.Context, policies []policy.Policy, cur map[policy.Name]verdict, want, have map[policy.Name]prefixSet, rep *Report) error {
+	next := make(map[policy.Name]verdict, len(cur))
+	for _, p := range policies {
+		next[p.Name] = cur[p.Name]
+	}
+	narrowed := r.mem.narrowed(policies, cur)
+	for i, name := range narrowed {
+		if held := want[name].and(have[name]); len(held) > 0 {
+			if err := r.Backend.AddEntries(ctx, name, held); err != nil {
+				for _, n := range narrowed[i:] {
+					next[n] = r.mem.enforced[n]
+				}
+				r.mem.enforced = next
+				return fmt.Errorf("ending the states of table %s: %w", name, err)
+			}
+			rep.Writes++
+		}
+		rep.Narrowed = append(rep.Narrowed, name)
+	}
+	r.mem.enforced = next
 	return nil
 }
 
@@ -384,10 +480,15 @@ func newPrefixSet(entries []netip.Prefix) prefixSet {
 }
 
 // minus returns the members of s that are not in t, sorted.
-func (s prefixSet) minus(t prefixSet) []netip.Prefix {
+func (s prefixSet) minus(t prefixSet) []netip.Prefix { return s.filter(t, false) }
+
+// and returns the members of s that are in t, sorted.
+func (s prefixSet) and(t prefixSet) []netip.Prefix { return s.filter(t, true) }
+
+func (s prefixSet) filter(t prefixSet, in bool) []netip.Prefix {
 	var out []netip.Prefix
 	for p := range s {
-		if _, ok := t[p]; !ok {
+		if _, ok := t[p]; ok == in {
 			out = append(out, p)
 		}
 	}

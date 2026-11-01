@@ -100,7 +100,8 @@ var _ reconcile.Compiler = Compiler{}
 //
 // An interface name in a selector goes into the rules as it is, also when
 // the interface does not exist yet. A glob or a class selects only the
-// interfaces in ifaces.
+// interfaces in ifaces. Ruleset.Selected gives, for each policy, the
+// interface names that the rules list.
 //
 // Compile fails when a policy cannot be written as pf rules that make it
 // hold: a policy name that is not a valid pf table name or does not fit
@@ -113,14 +114,16 @@ func (Compiler) Compile(policies []policy.Policy, ifaces []reconcile.Interface, 
 	slices.SortFunc(sorted, func(a, b policy.Policy) int { return cmp.Compare(a.Name, b.Name) })
 	var tables, rules strings.Builder
 	var problems []reconcile.Problem
+	selected := make(map[policy.Name][]string, len(sorted))
 	for i, p := range sorted {
 		if i > 0 && sorted[i-1].Name == p.Name {
 			return reconcile.Ruleset{}, fmt.Errorf("%w: %q", errDuplicate, p.Name)
 		}
-		lines, problem, err := policyRules(p, ifaces, accounts)
+		lines, sel, problem, err := policyRules(p, ifaces, accounts)
 		if err != nil {
 			return reconcile.Ruleset{}, fmt.Errorf("policy %q: %w", p.Name, err)
 		}
+		selected[p.Name] = sel
 		if problem != "" {
 			problems = append(problems, reconcile.Problem{Text: problem})
 		}
@@ -129,14 +132,15 @@ func (Compiler) Compile(policies []policy.Policy, ifaces []reconcile.Interface, 
 			rules.WriteString(l + "\n")
 		}
 	}
-	return reconcile.NewRuleset([]byte(tables.String()+rules.String()), problems...), nil
+	return reconcile.NewRuleset([]byte(tables.String()+rules.String()), problems...).WithSelected(selected), nil
 }
 
-// policyRules returns the rules of one policy, in evaluation order, and
-// a problem text when the policy lost its scope.
-func policyRules(p policy.Policy, ifaces []reconcile.Interface, accounts reconcile.Accounts) ([]string, string, error) {
+// policyRules returns the rules of one policy, in evaluation order, the
+// interfaces that its selectors resolved to, and a problem text when the
+// policy lost its scope.
+func policyRules(p policy.Policy, ifaces []reconcile.Interface, accounts reconcile.Accounts) ([]string, []string, string, error) {
 	if !validName(p.Name) {
-		return nil, "", errName
+		return nil, nil, "", errName
 	}
 	owners, unresolved := ownerMatches(p.Scope, accounts)
 	var problem string
@@ -150,7 +154,7 @@ func policyRules(p policy.Policy, ifaces []reconcile.Interface, accounts reconci
 	case policy.OnlyVia:
 		allowed, err := resolve(c.Selectors(), ifaces, hasClass)
 		if err != nil {
-			return nil, "", err
+			return nil, nil, "", err
 		}
 		match := to
 		if len(allowed) > 0 {
@@ -162,27 +166,28 @@ func policyRules(p policy.Policy, ifaces []reconcile.Interface, accounts reconci
 		for _, o := range owners {
 			rules = append(rules, blockOut+match+o)
 		}
+		return rules, allowed, problem, nil
 	case policy.DenyVia:
 		sels := c.Selectors()
 		if len(sels) == 0 {
-			return nil, "", fmt.Errorf("%w: deny_via without an interface", errConstraint)
+			return nil, nil, "", fmt.Errorf("%w: deny_via without an interface", errConstraint)
 		}
 		denied, err := resolve(sels, ifaces, mayHaveClass)
 		if err != nil {
-			return nil, "", err
+			return nil, nil, "", err
 		}
 		// With no denied interface now, there is nothing to block. The
 		// next convergence adds the rule when such an interface appears.
 		if len(denied) == 0 {
-			return nil, problem, nil
+			return nil, nil, problem, nil
 		}
 		for _, o := range owners {
 			rules = append(rules, blockOut+" on "+list(denied)+to+o)
 		}
+		return rules, denied, problem, nil
 	default:
-		return nil, "", fmt.Errorf("%w: %T", errConstraint, p.Constraint)
+		return nil, nil, "", fmt.Errorf("%w: %T", errConstraint, p.Constraint)
 	}
-	return rules, problem, nil
 }
 
 // ownerMatches returns the socket-owner part of each block rule of a
