@@ -1,11 +1,18 @@
 package daemon
 
-import "github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
+import (
+	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
+	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
+	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
+)
 
 // State is the lifecycle state of the daemon.
 //
 // Starting goes to Ready, Degraded, or Unenforced. These three go to each
-// other. Only Ready and Degraded acknowledge reports.
+// other. Only Ready and Degraded acknowledge reports. A daemon that
+// starts without a stored configuration is in Unenforced; when Apply then
+// gives it a configuration and the snapshot does not load, it goes to
+// Starting.
 type State uint8
 
 // The lifecycle states. The zero State is StateStarting.
@@ -22,7 +29,8 @@ const (
 	StateDegraded
 	// StateUnenforced: the ruleset for the current configuration and
 	// interfaces is not installed, or a problem voids it, such as a
-	// disabled firewall. No report is acknowledged.
+	// disabled firewall, or the daemon has no configuration. No report is
+	// acknowledged.
 	StateUnenforced
 )
 
@@ -55,6 +63,12 @@ type Status struct {
 	// RetainRestart is true when the configured retain differs from the
 	// retain of the running address book. Only a restart applies it.
 	RetainRestart bool
+	// Config is the digest of the stored configuration that the daemon
+	// runs. It is zero when the daemon has no configuration.
+	Config configstore.Digest
+	// Warnings are the warnings of the upstream check for the running
+	// configuration.
+	Warnings []policy.Warning
 }
 
 // phase is the lifecycle state together with the facts it rests on. It
@@ -71,6 +85,12 @@ type phase struct {
 
 func startingPhase(reason string) phase {
 	return phase{state: StateStarting, reasons: []string{reason}}
+}
+
+// unconfiguredPhase is the phase of a daemon that has no configuration.
+// It does not converge, so it keeps the platform state that it found.
+func unconfiguredPhase(reason string) phase {
+	return phase{state: StateUnenforced, reasons: []string{reason}}
 }
 
 func unenforcedPhase(reason string) phase {
@@ -97,9 +117,6 @@ func convergedPhase(rep reconcile.Report, err error) phase {
 		return phase{state: StateReady, installed: rep.Installed}
 	}
 }
-
-// loaded reports whether the snapshot is loaded.
-func (p phase) loaded() bool { return p.state != StateStarting }
 
 // acks reports whether the phase acknowledges reports.
 func (p phase) acks() bool { return p.installed != "" }

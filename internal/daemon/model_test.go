@@ -1,7 +1,8 @@
 package daemon_test
 
 // A model-based test of the acknowledgement contract of the daemon. It
-// runs random operations (reports, configuration changes, interface
+// runs random operations (reports, configuration changes through
+// Reconfigure and Apply, refused and failed applies, interface
 // changes, write and save faults, problems, external flushes and loads,
 // time, crashes, restarts, lost snapshots) against a model written from
 // the spec. It uses only the public API of the daemon and the
@@ -14,6 +15,7 @@ package daemon_test
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -79,6 +81,13 @@ var (
 	omQNames  = []string{"a.example", "b.example", "s.example", "x.s.example", "deep.y.s.example",
 		"w.t.example", "c.example", "X.S.Example.", "nomatch.example"}
 	omMalformed = []string{"", "a..b", strings.Repeat("a", 64) + ".example"}
+	// omInvalid are configurations that Apply must refuse: one that does
+	// not parse, and one whose upstream is inside a policy that allows no
+	// interface.
+	omInvalid = []string{
+		"[dns\nlisten = 1\n",
+		omCfg{{Name: "pa", To: []string{"a.example"}}}.toml() + "[[policy]]\nname = \"pz\"\nto = [\"1.1.1.0/24\"]\nonly_via = []\n",
+	}
 
 	omEn0   = reconcile.Interface{Name: "en0", Class: policy.ClassHardware}
 	omEn1   = reconcile.Interface{Name: "en1", Class: policy.ClassHardware}
@@ -174,8 +183,10 @@ func (o omOp) String() string {
 	switch o.Kind {
 	case "observe", "unmatched", "malformed", "observeCancelled", "observeCancelMidway":
 		return fmt.Sprintf("%s(%q, %v, ttl=%v)", o.Kind, o.Q, o.Addrs, o.TTL)
-	case "reconfigure":
-		return fmt.Sprintf("reconfigure(%v)", o.Cfg)
+	case "reconfigure", "apply", "applyStoreFail":
+		return fmt.Sprintf("%s(%v)", o.Kind, o.Cfg)
+	case "applyInvalid":
+		return fmt.Sprintf("applyInvalid(%d)", o.Idx)
 	case "ifaces":
 		return fmt.Sprintf("ifaces(%v)", omIfs[o.Idx])
 	case "failWrite":
@@ -328,9 +339,17 @@ func (g *omGen) op(allowCrash bool) omOp {
 		return omOp{Kind: "observeCancelled", Q: omQNames[g.rng.IntN(len(omQNames)-1)], Addrs: []string{g.uniqueAddr("198.18")}, TTL: g.ttl()}
 	case r < 43:
 		return omOp{Kind: "observeCancelMidway", Q: omQNames[g.rng.IntN(len(omQNames)-1)], Addrs: []string{g.uniqueAddr("198.18")}, TTL: g.ttl()}
-	case r < 53:
+	case r < 48:
 		g.cfg = g.mutate(g.cfg)
 		return omOp{Kind: "reconfigure", Cfg: g.cfg.clone()}
+	case r < 51:
+		g.cfg = g.mutate(g.cfg)
+		return omOp{Kind: "apply", Cfg: g.cfg.clone()}
+	case r < 52:
+		return omOp{Kind: "applyInvalid", Idx: g.rng.IntN(len(omInvalid))}
+	case r < 53:
+		// The store fails, so the configuration stays.
+		return omOp{Kind: "applyStoreFail", Cfg: g.mutate(g.cfg)}
 	case r < 57:
 		return omOp{Kind: "ifaces", Idx: g.rng.IntN(len(omIfs))}
 	case r < 65:
@@ -404,6 +423,9 @@ type omRun struct {
 	inv   *reconciletest.Inventory
 	snap  string
 	dir   string
+	// store is the stored configuration. Its directory is not dir, so a
+	// save fault does not fail Apply.
+	store string
 
 	d      *daemon.Daemon
 	cancel context.CancelFunc
@@ -733,12 +755,10 @@ func (r *omRun) routedLocked(name string) bool {
 // ---- daemon lifecycle ----
 
 func (r *omRun) start() {
-	r.mu.Lock()
-	pc := r.pcfg
-	r.mu.Unlock()
 	r.d = daemon.New(daemon.Config{
-		Policy:   pc,
-		Snapshot: r.snap,
+		ConfigPath: r.store,
+		ConfigGID:  -1,
+		Snapshot:   r.snap,
 		// No host file: the tests here do not depend on the host file of the machine.
 		HostsFile: filepath.Join(filepath.Dir(r.snap), "hosts"),
 		Platform: reconcile.Reconciler{
@@ -1194,6 +1214,8 @@ func (r *omRun) exec(o omOp) {
 		r.observe(o)
 	case "reconfigure":
 		r.reconfigure(o.Cfg)
+	case "apply", "applyInvalid", "applyStoreFail":
+		r.apply(o)
 	case "ifaces":
 		r.inv.Set(omIfs[o.Idx]...)
 	case "failWrite":
@@ -1223,7 +1245,18 @@ func (r *omRun) exec(o omOp) {
 	}
 }
 
+// reconfigure changes the configuration through Reconfigure. It writes
+// the stored file first, as an administrator who edits it by hand would,
+// so that a restart loads the same configuration.
 func (r *omRun) reconfigure(cfg omCfg) {
+	r.writeStore(cfg.toml())
+	pc := r.setModelCfg(cfg)
+	_ = r.d.Reconfigure(context.Background(), pc) //nolint:errcheck // injected faults can fail it; the status check judges the outcome
+}
+
+// setModelCfg makes cfg the configuration of the model and returns it
+// parsed.
+func (r *omRun) setModelCfg(cfg omCfg) policy.Config {
 	r.mu.Lock()
 	for k, e := range r.tracked {
 		if !cfg.has(k.P) {
@@ -1246,7 +1279,83 @@ func (r *omRun) reconfigure(cfg omCfg) {
 	r.taintLocked()
 	pc := r.pcfg
 	r.mu.Unlock()
-	_ = r.d.Reconfigure(context.Background(), pc) //nolint:errcheck // injected faults can fail it; the status check judges the outcome
+	return pc
+}
+
+// count adds one to a coverage counter. The loop can converge at the
+// same time and count too, so it takes r.mu.
+func (r *omRun) count(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	omStats[key]++
+}
+
+func (r *omRun) writeStore(text string) {
+	if err := os.WriteFile(r.store, []byte(text), 0o600); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+func (r *omRun) readStore() []byte {
+	data, err := os.ReadFile(r.store)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return data
+}
+
+// apply sends a configuration through Apply. A valid one must be stored
+// and applied, with the digest of the stored bytes in the status. A
+// refused one and one whose store fails must change neither the stored
+// file nor the running configuration. The model then keeps its
+// configuration, so every later check also checks the running one.
+func (r *omRun) apply(o omOp) {
+	before, stored := r.status(), r.readStore()
+	switch o.Kind {
+	case "apply":
+		text := o.Cfg.toml()
+		r.setModelCfg(o.Cfg)
+		st, err := r.d.Apply(context.Background(), []byte(text))
+		r.count("apply")
+		if err != nil {
+			r.violate("Apply(valid) = %v, want nil", err)
+			return
+		}
+		if got := r.readStore(); string(got) != text {
+			r.violate("Apply(valid) stored %q, want %q", got, text)
+		}
+		if want := sha256.Sum256([]byte(text)); [sha256.Size]byte(st.Config) != want {
+			r.violate("Apply(valid): Status.Config = %v, want the digest of the stored bytes", st.Config)
+		}
+		return
+	case "applyInvalid":
+		_, err := r.d.Apply(context.Background(), []byte(omInvalid[o.Idx]))
+		r.count("apply refused")
+		var fe *policy.FieldError
+		if !errors.As(err, &fe) {
+			r.violate("Apply(invalid %d) = %v, want a *policy.FieldError", o.Idx, err)
+		}
+	case "applyStoreFail":
+		dir := filepath.Dir(r.store)
+		if err := os.Chmod(dir, 0o500); err != nil {
+			r.t.Fatal(err)
+		}
+		_, err := r.d.Apply(context.Background(), []byte(o.Cfg.toml()))
+		if err := os.Chmod(dir, 0o700); err != nil {
+			r.t.Fatal(err)
+		}
+		r.count("apply store failed")
+		if err == nil {
+			r.violate("Apply with a failing store = nil, want an error")
+		}
+	}
+	if got := r.readStore(); !bytes.Equal(got, stored) {
+		r.violate("%v changed the stored file", o)
+	}
+	if after := r.status(); after.Config != before.Config || after.Policies != before.Policies {
+		r.violate("%v changed the running configuration: config %v -> %v, policies %d -> %d",
+			o, before.Config, after.Config, before.Policies, after.Policies)
+	}
 }
 
 func (r *omRun) setSaveFail(on bool) {
@@ -1398,10 +1507,11 @@ func newOmRun(t *testing.T, initial omCfg) *omRun {
 	dir := t.TempDir()
 	r := &omRun{
 		t: t, world: reconciletest.NewWorld(), inv: reconciletest.NewInventory(omEn0),
-		dir: dir, snap: filepath.Join(dir, "addrbook.json"),
+		dir: dir, snap: filepath.Join(dir, "addrbook.json"), store: filepath.Join(t.TempDir(), "config.toml"),
 		tracked: map[omKey]*omEntry{}, pending: map[omKey]*omEntry{}, rsDamageSeq: -1,
 	}
 	r.setCfg(initial.clone())
+	r.writeStore(initial.toml())
 	r.world.SetBeforeWrite(func(n int) error {
 		r.mu.Lock()
 		blk, rel := r.block, r.release

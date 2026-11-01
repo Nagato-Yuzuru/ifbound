@@ -34,12 +34,14 @@ func (h *harness) touchHosts() {
 	}
 }
 
+// warnings returns the warnings, without the state changes: each start
+// is degraded until its first probe reaches ifbound-dns.
 func (h *harness) warnings() []string {
 	h.logs.mu.Lock()
 	defer h.logs.mu.Unlock()
 	var out []string
 	for _, m := range h.logs.msgs {
-		if strings.HasPrefix(m, "WARN ") {
+		if strings.HasPrefix(m, "WARN ") && !strings.HasPrefix(m, "WARN state changed") {
 			out = append(out, m)
 		}
 	}
@@ -288,7 +290,7 @@ func TestHostAddressesSurviveRestartWithUnreadableFile(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		h = start(t, h.world, h.inv, h.snapshot, parse(t, configV1))
+		h = start(t, h.world, h.inv, h.snapshot, configV1)
 		defer h.stop()
 
 		h.wantState(daemon.StateDegraded)
@@ -310,7 +312,7 @@ func TestAdoptionSkipsHostAddresses(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		h = start(t, h.world, h.inv, h.snapshot, parse(t, configV1))
+		h = start(t, h.world, h.inv, h.snapshot, configV1)
 		defer h.stop()
 		if !h.hasEntry("web", host("10.1.1.1")) {
 			t.Fatal("web table lost the host address at the restart")

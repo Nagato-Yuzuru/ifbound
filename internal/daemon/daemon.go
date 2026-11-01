@@ -27,6 +27,10 @@
 // application asks. A probe first proves that the lookups go to
 // ifbound-dns, and their reports take the normal path. See Daemon.Run.
 //
+// The configuration comes from the stored file of configstore. Run loads
+// it at start, and only Apply replaces it. See Daemon.Run and
+// Daemon.Apply.
+//
 // The ruleset limits a scoped policy to its users and groups by their
 // ids. The daemon reads these ids outside the loop, after the first
 // convergence, after each configuration change, and at each self-heal.
@@ -36,14 +40,17 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
+	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
-	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
@@ -68,6 +75,9 @@ var (
 	ErrStopped = errors.New("daemon: stopped")
 	// ErrAlreadyRunning is the error of a second Run call.
 	ErrAlreadyRunning = errors.New("daemon: Run already called")
+	// ErrBadConfig is the error of Run when a field of Config is not
+	// valid.
+	ErrBadConfig = errors.New("daemon: bad Config")
 )
 
 // SystemResolver resolves a name through the system resolver, as an
@@ -83,13 +93,21 @@ type SystemResolver interface {
 
 // Config holds what the daemon needs at start.
 type Config struct {
-	// Policy is the initial configuration. Its retain is fixed for the
-	// life of the daemon.
-	Policy policy.Config
+	// ConfigPath is the path of the stored configuration (see
+	// configstore). Run loads it at start, and Apply replaces it. The
+	// retain of the first configuration that the daemon gets is fixed
+	// for the life of the daemon. It must be absolute and clean.
+	ConfigPath string
+	// ConfigGID is the group that Apply gives the stored configuration:
+	// the group of ifbound-dns (layout.Group), so that ifbound-dns can
+	// read it. Zero is not valid: the group of ifbound-dns is never
+	// wheel, so a zero is a field that the caller did not set. A
+	// negative value keeps the group of the new file, for tests.
+	ConfigGID int
 	// Snapshot is the path of the address book snapshot.
 	Snapshot string
-	// HostsFile is the path of the host file. Empty means
-	// DefaultHostsFile.
+	// HostsFile is the path of the host file. Empty means the host file
+	// of layout.Default.
 	HostsFile string
 	// Platform converges the platform state. All its fields are required.
 	Platform reconcile.Reconciler
@@ -122,6 +140,12 @@ type Daemon struct {
 	requests chan request
 	done     chan struct{}
 	started  atomic.Bool
+	// status is the Status that the loop published last. The loop
+	// publishes after each request and at the end of each pass, so
+	// Status never waits for the loop.
+	status atomic.Pointer[Status]
+	// store is configstore.Store. A test can replace it before Run.
+	store storeFunc
 
 	// probes are the probe names that a probe waits for. The probe
 	// reports do not go through the loop: a probe report must never wait
@@ -140,17 +164,42 @@ func New(cfg Config) *Daemon {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
-	return &Daemon{
+	d := &Daemon{
 		cfg:      cfg,
+		store:    configstore.Store,
 		requests: make(chan request),
 		done:     make(chan struct{}),
 		probes:   make(map[string]*probeWait),
 	}
+	d.status.Store(&Status{State: StateStarting, Reasons: []string{reasonNotLoaded}})
+	return d
 }
 
-// Run is the event loop. It loads the snapshot, converges, and then
-// serves events until ctx ends. It returns nil when ctx ends, and
-// ErrAlreadyRunning when called a second time.
+// check returns an error that wraps ErrBadConfig when a field of c is
+// not valid.
+func (c Config) check() error {
+	switch {
+	case !filepath.IsAbs(c.ConfigPath) || filepath.Clean(c.ConfigPath) != c.ConfigPath:
+		return fmt.Errorf("%w: ConfigPath %q is not an absolute clean path", ErrBadConfig, c.ConfigPath)
+	case c.ConfigGID == 0:
+		return fmt.Errorf("%w: ConfigGID is zero", ErrBadConfig)
+	default:
+		return nil
+	}
+}
+
+// Run is the event loop. It loads the stored configuration and the
+// snapshot, converges, and then serves events until ctx ends. It returns
+// nil when ctx ends, ErrAlreadyRunning when called a second time, and
+// an error that wraps ErrBadConfig when a field of Config is not valid.
+//
+// A stored configuration that does not load, such as a missing or a
+// damaged file, puts the daemon in StateUnenforced with the load error
+// as the reason. The daemon then converges nothing, so it keeps the
+// platform state that it finds, and it acknowledges no report. It does
+// not read the file again: only Apply gives it a configuration. A stored
+// configuration that fails policy.Config.CheckUpstreams still applies;
+// the failure makes the state StateDegraded.
 //
 // A snapshot that does not load keeps the daemon in StateStarting. A
 // snapshot without an address of a configured policy, such as a missing
@@ -194,7 +243,18 @@ func New(cfg Config) *Daemon {
 // longer than AccountReadTimeout. Run does not wait for a lookup that
 // hangs: the lookup goes on after Run returns, until its system call
 // returns, and its result is dropped.
+//
+// The probes of the warm-up are also the self-test of ifbound-dns. Under
+// each configuration, the state is StateDegraded with the reason
+// "ifbound-dns not connected" until a probe reaches ifbound-dns. The
+// warm-up tries the names again after SelfHealInterval. The first probe
+// that reaches ifbound-dns removes the reason until the configuration
+// changes. A configuration without names has no warm-up, so it has no
+// self-test and no reason.
 func (d *Daemon) Run(ctx context.Context) error {
+	if err := d.cfg.check(); err != nil {
+		return err
+	}
 	if !d.started.CompareAndSwap(false, true) {
 		return ErrAlreadyRunning
 	}
@@ -205,7 +265,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer warm.wait()
 	defer close(d.done)
 
-	l := newLoop(d.cfg)
+	l := newLoop(d.cfg, d.store, &d.status)
+	l.loadStored(ctx)
 	heal := time.NewTicker(SelfHealInterval)
 	defer heal.Stop()
 	expiry := time.NewTimer(0) // armExpiry sets it before the first select
@@ -218,6 +279,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	for {
 		l.armExpiry(expiry)
 		warm.sync(ctx, l)
+		l.publish()
 		select {
 		case <-ctx.Done():
 			return nil
@@ -246,6 +308,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-l.accounts.timeout:
 			l.accountsOverdue(ctx)
 			_ = l.reconcile(ctx, "accounts") //nolint:errcheck // the phase holds the outcome
+		case <-warm.results:
+			if l.selfTestResult(warm.result()) {
+				_ = l.reconcile(ctx, "self-test") //nolint:errcheck // the phase holds the outcome
+			}
 		}
 	}
 }
@@ -274,28 +340,66 @@ func (d *Daemon) Observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error
 	return r.ack, r.err
 }
 
-// Reconfigure replaces the configuration and converges. The new
-// configuration applies also when the convergence fails: the error is
-// that of the convergence, the daemon acknowledges no report until a
-// convergence succeeds, and the self-heal timer retries it. A new retain
-// applies only after a restart; see Status.RetainRestart. See call for
-// ctx.Err() and ErrStopped: with either, the configuration did not apply.
-func (d *Daemon) Reconfigure(ctx context.Context, cfg policy.Config) error {
-	err, cerr := call(ctx, d, func(ctx context.Context, l *loop) error {
-		return l.reconfigure(ctx, cfg)
+// Apply checks, stores, and applies the configuration in data. It runs
+// configstore.Store on Config.ConfigPath, and then converges. The new
+// configuration applies also when the convergence fails: the daemon then
+// acknowledges no report until a convergence succeeds, and the self-heal
+// timer retries it. A new retain applies only after a restart; see
+// Status.RetainRestart.
+//
+// Apply returns the status after the convergence, with the digest of the
+// stored file. A failed convergence does not make an error: the status
+// tells the outcome. Status shows the new digest from the rename of the
+// stored file, also while the convergence runs.
+//
+// A refused data, such as one that fails policy.Parse or
+// policy.Config.CheckUpstreams, and a failed store change nothing: not
+// the stored file, not the running configuration. The error then comes
+// from configstore.Store, and an invalid data wraps a
+// *policy.FieldError. Apply does not start the store after ctx ends: the
+// error then wraps ctx.Err(). See call for ErrStopped. An error that
+// wraps configstore.ErrNotDurable comes with the status of the applied
+// configuration: the new file is in place, but a crash can bring back
+// the old one.
+//
+// The store runs on the loop, so reports wait for it. This serializes
+// each Apply with the configuration that runs.
+func (d *Daemon) Apply(ctx context.Context, data []byte) (Status, error) {
+	type result struct {
+		st  Status
+		err error
+	}
+	r, cerr := call(ctx, d, func(loopCtx context.Context, l *loop) result {
+		st, err := l.apply(loopCtx, ctx, data)
+		return result{st, err}
 	})
 	if cerr != nil {
-		return cerr
+		return Status{}, cerr
 	}
-	return err
+	return r.st, r.err
 }
 
-// Status returns a copy of the daemon state.
-func (d *Daemon) Status(ctx context.Context) (Status, error) {
-	return call(ctx, d, func(_ context.Context, l *loop) Status { return l.status() })
+// Status returns a copy of the daemon state that the loop published
+// last. It does not wait for the loop, so it answers also during a slow
+// convergence. The copy is never older than the last request that
+// returned, and than the last loop pass that ended. Before Run starts,
+// it is the status of StateStarting. It returns ErrStopped when Run has
+// returned. ctx is not used: Status does not block.
+func (d *Daemon) Status(context.Context) (Status, error) {
+	select {
+	case <-d.done:
+		return Status{}, ErrStopped
+	default:
+	}
+	st := *d.status.Load()
+	st.Reasons = slices.Clone(st.Reasons)
+	st.Warnings = slices.Clone(st.Warnings)
+	return st, nil
 }
 
-// call runs f on the loop goroutine and returns its result. Its error is
+// call runs f on the loop goroutine and returns its result. The loop
+// publishes its status before the reply, so a Status call after call
+// returns sees the effect of f. Its error is
 // ctx.Err() when ctx ends before the loop takes the request, and
 // ErrStopped when Run has returned; f then did not run. Once the loop
 // takes the request, call waits for the result and ignores ctx, so the
@@ -303,7 +407,11 @@ func (d *Daemon) Status(ctx context.Context) (Status, error) {
 // platform calls that f makes finish in bounded time.
 func call[R any](ctx context.Context, d *Daemon, f func(context.Context, *loop) R) (R, error) {
 	reply := make(chan R, 1)
-	req := func(loopCtx context.Context, l *loop) { reply <- f(loopCtx, l) }
+	req := func(loopCtx context.Context, l *loop) {
+		r := f(loopCtx, l)
+		l.publish()
+		reply <- r
+	}
 	var zero R
 	select {
 	case d.requests <- req:

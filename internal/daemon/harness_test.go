@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -92,6 +93,8 @@ type harness struct {
 	world    *reconciletest.World
 	inv      *reconciletest.Inventory
 	snapshot string
+	// store is the stored configuration of the daemon.
+	store string
 	// hosts is the host file of the daemon. It is next to the snapshot,
 	// so a restart on the same snapshot reads the same file.
 	hosts       string
@@ -99,48 +102,97 @@ type harness struct {
 	logs        *capturedLogs
 	d           *daemon.Daemon
 	stop        func()
+	// spec is what the daemon runs on. restart keeps it.
+	spec harnessSpec
+}
+
+// harnessSpec is what a daemon of a harness runs on: everything that
+// outlives one daemon.
+type harnessSpec struct {
+	world    *reconciletest.World
+	be       reconcile.Backend
+	inv      *reconciletest.Inventory
+	snapshot string
+	store    string
+	accounts daemon.AccountReader
+	dns      *sysNet
+}
+
+// newSpec returns a spec on a new World, with cfgText as the stored
+// configuration.
+func newSpec(t *testing.T, cfgText string) harnessSpec {
+	t.Helper()
+	world := reconciletest.NewWorld()
+	return harnessSpec{
+		world: world, be: world.Backend(), inv: reconciletest.NewInventory(en0),
+		snapshot: filepath.Join(t.TempDir(), "addrbook.json"),
+		store:    storeConfig(t, t.TempDir(), cfgText),
+		dns:      &sysNet{world: world, listen: parse(t, cfgText).DNS.Listen},
+	}
 }
 
 func newHarness(t *testing.T, cfgText string) *harness {
 	t.Helper()
-	world := reconciletest.NewWorld()
-	return start(t, world, reconciletest.NewInventory(en0), filepath.Join(t.TempDir(), "addrbook.json"), parse(t, cfgText))
+	return launch(t, newSpec(t, cfgText))
 }
 
 // start runs a daemon on the World until stop, and waits until the daemon
 // blocks for events.
-func start(t *testing.T, world *reconciletest.World, inv *reconciletest.Inventory, snapshot string, cfg policy.Config) *harness {
+func start(t *testing.T, world *reconciletest.World, inv *reconciletest.Inventory, snapshot, cfgText string) *harness {
 	t.Helper()
-	return startOn(t, world, world.Backend(), inv, snapshot, cfg)
+	return startOn(t, world, world.Backend(), inv, snapshot, cfgText)
 }
 
 // startOn is start with a Backend that wraps the one of the World.
-func startOn(t *testing.T, world *reconciletest.World, be reconcile.Backend, inv *reconciletest.Inventory, snapshot string, cfg policy.Config) *harness {
+func startOn(t *testing.T, world *reconciletest.World, be reconcile.Backend, inv *reconciletest.Inventory, snapshot, cfgText string) *harness {
 	t.Helper()
-	return startWith(t, world, be, inv, snapshot, cfg, nil)
+	return startWith(t, world, be, inv, snapshot, cfgText, nil)
 }
 
-// startWith is startOn with an account reader. accounts can be nil.
-func startWith(t *testing.T, world *reconciletest.World, be reconcile.Backend, inv *reconciletest.Inventory, snapshot string, cfg policy.Config, accounts daemon.AccountReader) *harness {
+// startWith is startOn with an account reader. accounts can be nil. The
+// stored configuration is cfgText, in a new directory.
+func startWith(t *testing.T, world *reconciletest.World, be reconcile.Backend, inv *reconciletest.Inventory, snapshot, cfgText string, accounts daemon.AccountReader) *harness {
 	t.Helper()
-	sys := &sysNet{world: world, listen: cfg.DNS.Listen}
-	hosts := filepath.Join(filepath.Dir(snapshot), "hosts")
+	return launch(t, harnessSpec{
+		world: world, be: be, inv: inv, snapshot: snapshot,
+		store:    storeConfig(t, t.TempDir(), cfgText),
+		accounts: accounts,
+		dns:      &sysNet{world: world, listen: parse(t, cfgText).DNS.Listen},
+	})
+}
+
+// launch runs a daemon on s until stop, and waits until the daemon blocks
+// for events.
+func launch(t *testing.T, s harnessSpec) *harness {
+	t.Helper()
+	return launchHook(t, s, nil)
+}
+
+// launchHook is launch with hook, when it is not nil, called on the
+// daemon before Run.
+func launchHook(t *testing.T, s harnessSpec, hook func(*daemon.Daemon)) *harness {
+	t.Helper()
+	hosts := filepath.Join(filepath.Dir(s.snapshot), "hosts")
 	logs := &capturedLogs{}
 	d := daemon.New(daemon.Config{
-		Policy:    cfg,
-		Snapshot:  snapshot,
-		HostsFile: hosts,
-		Logger:    slog.New(logs),
+		ConfigPath: s.store,
+		ConfigGID:  -1,
+		Snapshot:   s.snapshot,
+		HostsFile:  hosts,
+		Logger:     slog.New(logs),
 		Platform: reconcile.Reconciler{
 			Compiler:  scopeCompiler{},
-			Backend:   be,
-			Resolver:  world.Resolver(),
-			Inventory: inv,
+			Backend:   s.be,
+			Resolver:  s.world.Resolver(),
+			Inventory: s.inv,
 		},
-		Accounts: accounts,
-		Lookup:   sys,
+		Accounts: s.accounts,
+		Lookup:   s.dns,
 	})
-	sys.d = d
+	s.dns.d.Store(d)
+	if hook != nil {
+		hook(d)
+	}
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
@@ -151,11 +203,38 @@ func startWith(t *testing.T, world *reconciletest.World, be reconcile.Backend, i
 			t.Errorf("Run: %v", err)
 		}
 	}
-	return &harness{t: t, world: world, inv: inv, snapshot: snapshot, hosts: hosts, logs: logs, d: d, stop: stop}
+	return &harness{
+		t: t, world: s.world, inv: s.inv, snapshot: s.snapshot, store: s.store,
+		hosts: hosts, logs: logs, d: d, stop: stop, spec: s,
+	}
 }
 
+// restart stops the daemon and starts a new one on the same World,
+// stored file, and snapshot.
+func (h *harness) restart() *harness {
+	h.t.Helper()
+	h.stop()
+	return launch(h.t, h.spec)
+}
+
+// storeConfig writes text as the stored configuration in dir, as
+// "ifbound apply" leaves it, and returns its path.
+func storeConfig(t *testing.T, dir, text string) string {
+	t.Helper()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// status waits until every goroutine of the bubble blocks, so that the
+// published Status covers the passes that the last step started, such as
+// the warm-up of a new configuration. A test of Status itself calls
+// h.d.Status.
 func (h *harness) status() daemon.Status {
 	h.t.Helper()
+	synctest.Wait()
 	st, err := h.d.Status(h.t.Context())
 	if err != nil {
 		h.t.Fatalf("Status: %v", err)
@@ -235,16 +314,18 @@ func (b loadFails) Load(ctx context.Context, rs reconcile.Ruleset) error {
 // A name goes to the server of the most specific applied resolver entry
 // of the World that covers it, as the system routes a query; when that is
 // the listen address, ifbound-dns reports a probe name to the daemon. The
-// answer is always "no such name".
+// answer is always "no such name". While down is set, ifbound-dns
+// is not connected: no probe name reaches the daemon.
 type sysNet struct {
 	world  *reconciletest.World
 	listen netip.AddrPort
-	d      *daemon.Daemon
+	d      atomic.Pointer[daemon.Daemon]
+	down   atomic.Bool
 }
 
 func (s *sysNet) Resolve(_ context.Context, name string) ([]netip.Addr, error) {
-	if ipc.IsProbe(name) && routes(s.world.AppliedResolverEntries(), name, s.listen) {
-		s.d.ProbeSeen(name)
+	if !s.down.Load() && ipc.IsProbe(name) && routes(s.world.AppliedResolverEntries(), name, s.listen) {
+		s.d.Load().ProbeSeen(name)
 	}
 	return nil, fmt.Errorf("resolve %s: %w", name, syslookup.ErrNotFound)
 }

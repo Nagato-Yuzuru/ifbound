@@ -178,7 +178,7 @@ func newScopedHarness(t *testing.T, cfgText string, accounts daemon.AccountReade
 	t.Helper()
 	world := reconciletest.NewWorld()
 	return startWith(t, world, world.Backend(), reconciletest.NewInventory(en0),
-		filepath.Join(t.TempDir(), "addrbook.json"), parse(t, cfgText), accounts)
+		filepath.Join(t.TempDir(), "addrbook.json"), cfgText, accounts)
 }
 
 // owners returns the owner lines of the loaded ruleset, sorted.
@@ -356,9 +356,9 @@ func TestFlakyLookupsKeepTheReasonStable(t *testing.T) {
 		if n := h.stateChanges() - before; n != 1 {
 			t.Errorf("%d state changes in 12 self-heals with one failed lookup each, want 1", n)
 		}
-		// One for the failed lookup, one for the state change.
-		if w := h.warnings()[warnedBefore:]; len(w) != 2 {
-			t.Errorf("warnings = %q, want the first failure and one state change", w)
+		// One for the failed lookup. h.warnings has no state changes.
+		if w := h.warnings()[warnedBefore:]; len(w) != 1 {
+			t.Errorf("warnings = %q, want the first failure", w)
 		}
 	})
 }
