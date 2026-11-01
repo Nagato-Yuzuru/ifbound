@@ -18,7 +18,6 @@ import (
 
 func requireE2E(t *testing.T) {
 	t.Helper()
-	testenv.RequireDisposableHost(t)
 	testenv.RequireOS(t, "darwin")
 	testenv.RequireRoot(t)
 	testenv.RequireCommand(t, "ifconfig")
