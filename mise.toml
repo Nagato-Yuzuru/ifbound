@@ -1,6 +1,7 @@
 [tools]
 go = "1.27.3"
 "go:golang.org/x/vuln/cmd/govulncheck" = "1.8.0"
+"github:open-telemetry/weaver" = "0.28.0"
 golangci-lint = "2.15.0"
 jactionlint = "v2.3.0"
 prek = "0.5.7"
@@ -60,4 +61,45 @@ tart exec "$vm" sudo env \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   IFBOUND_E2E_STRICT=1 \
   "/Volumes/My Shared Files/ifbound/bin/e2e.test" -test.v
+'''
+
+# The semconv version lives in telemetry/manifest.yaml only. The task reads
+# the version from the manifest and names the archive after it, so a new
+# version never finds an old archive. Update the sha256 here with the
+# version. The archive is a GitHub-generated tarball: its bytes can change
+# without a new version. The sha256 check then fails loudly.
+[tasks."telemetry:semconv"]
+description = "Download the semconv archive that the telemetry registry depends on"
+run = '''
+set -eu
+sum=3afc6489d348fba740e0d3646c5cb91e47a057b4e4cef60701c8636d4330fde9
+ver=$(sed -n 's|^ *- schema_url: https://opentelemetry.io/schemas/\(.*\)$|\1|p' telemetry/manifest.yaml)
+f=.cache/weaver/semconv-v$ver.tar.gz
+if [ -z "$ver" ] || ! grep -qxF "    registry_path: $f[model]" telemetry/manifest.yaml; then
+  echo "telemetry/manifest.yaml: registry_path must be $f[model]" >&2
+  exit 1
+fi
+if [ -f "$f" ] && echo "$sum  $f" | shasum -a 256 -c --status; then exit 0; fi
+mkdir -p "${f%/*}"
+curl -fsSL -o "$f.tmp" "https://github.com/open-telemetry/semantic-conventions/archive/refs/tags/v$ver.tar.gz"
+echo "$sum  $f.tmp" | shasum -a 256 -c --status
+mv -f "$f.tmp" "$f"
+'''
+
+[tasks."telemetry:generate"]
+description = "Generate the log attribute constants and docs/telemetry.md. Fail when a generated file does not match the files that git tracks"
+depends = ["telemetry:semconv"]
+run = '''
+set -eu
+weaver registry generate --v2 --quiet -r telemetry -t telemetry/.templates go internal/logattr
+weaver registry generate --v2 --quiet -r telemetry -t telemetry/.templates markdown docs
+# A working tree column that is not blank shows a changed, deleted, or
+# untracked file. The check also catches a file that a template writes to a
+# new path, and a generated file that a commit deleted.
+stale=$(git status --porcelain --untracked-files=all -- internal/logattr docs/telemetry.md | grep '^.[^ ]' || true)
+if [ -n "$stale" ]; then
+  echo "generated files do not match the registry:" >&2
+  echo "$stale" >&2
+  exit 1
+fi
 '''

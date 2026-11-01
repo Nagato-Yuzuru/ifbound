@@ -1,0 +1,10 @@
+# The templates live in a hidden directory: weaver loads each YAML file under
+# telemetry/ as a part of the registry, but it skips hidden directories.
+templates:
+  - template: telemetry.md.j2
+    application_mode: single
+
+whitespace_control:
+  trim_blocks: true
+  lstrip_blocks: true
+  keep_trailing_newline: true

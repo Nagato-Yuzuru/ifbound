@@ -1,0 +1,173 @@
+# The log attributes of ifbound. A key is a contract with the queries of the
+# operator once a call site writes it: do not rename it then.
+#
+# The annotation go.name is the name of the Go constant that holds the key
+# or the value. Other packages import the constants. The name of a constant
+# for a semantic convention attribute comes from its key.
+file_format: definition/2
+
+attributes:
+  - key: ifbound.converge.trigger
+    type:
+      members:
+        - id: start
+          value: "start"
+          brief: The daemon started.
+          stability: development
+          annotations: {go: {name: TriggerStart}}
+        - id: ruleset_changed
+          value: "ruleset changed"
+          brief: A request left a recheck of the ruleset pending.
+          stability: development
+          annotations: {go: {name: TriggerRulesetChanged}}
+        - id: interfaces
+          value: "interfaces"
+          brief: The network interfaces changed and the debounce ended.
+          stability: development
+          annotations: {go: {name: TriggerInterfaces}}
+        - id: self_heal
+          value: "self-heal"
+          brief: The self-heal timer ticked, after a new read of the accounts.
+          stability: development
+          annotations: {go: {name: TriggerSelfHeal}}
+        - id: accounts
+          value: "accounts"
+          brief: An account read ended, or its time budget ended.
+          stability: development
+          annotations: {go: {name: TriggerAccounts}}
+        - id: self_test
+          value: "self-test"
+          brief: The warm-up self-test result asked for a convergence.
+          stability: development
+          annotations: {go: {name: TriggerSelfTest}}
+        - id: expiry
+          value: "expiry"
+          brief: Address entries expired.
+          stability: development
+          annotations: {go: {name: TriggerExpiry}}
+        - id: config
+          value: "config"
+          brief: A new configuration was applied.
+          stability: development
+          annotations: {go: {name: TriggerConfig}}
+    stability: development
+    brief: The cause of the convergence.
+    annotations: {go: {name: ConvergeTrigger}}
+  - key: ifbound.converge.writes
+    type: int
+    stability: development
+    brief: The number of kernel writes that the convergence made.
+    examples: [3]
+    annotations: {go: {name: ConvergeWrites}}
+  - key: ifbound.enforcement.state
+    type:
+      members:
+        - id: starting
+          value: "starting"
+          brief: The daemon has not loaded its snapshot.
+          stability: development
+          annotations: {go: {name: StateStarting}}
+        - id: ready
+          value: "ready"
+          brief: The ruleset is installed and nothing reports a problem.
+          stability: development
+          annotations: {go: {name: StateReady}}
+        - id: degraded
+          value: "degraded"
+          brief: The ruleset is installed, but a problem that does not void enforcement exists.
+          stability: development
+          annotations: {go: {name: StateDegraded}}
+        - id: unenforced
+          value: "unenforced"
+          brief: The ruleset is not installed, or a problem voids it.
+          stability: development
+          annotations: {go: {name: StateUnenforced}}
+        - id: unknown
+          value: "unknown"
+          brief: The state is not one of the known states.
+          stability: development
+          annotations: {go: {name: StateUnknown}}
+    stability: development
+    brief: The enforcement state of the daemon.
+    annotations: {go: {name: EnforcementState}}
+  - key: ifbound.enforcement.reasons
+    type: string[]
+    stability: development
+    brief: The reasons that the daemon is not ready.
+    examples:
+      - ["convergence failed: pfctl failed"]
+    annotations: {go: {name: EnforcementReasons}}
+  - key: ifbound.account.kind
+    type:
+      members:
+        - id: user
+          value: "user"
+          brief: A user account.
+          stability: development
+          annotations: {go: {name: AccountKindUser}}
+        - id: group
+          value: "group"
+          brief: A group account.
+          stability: development
+          annotations: {go: {name: AccountKindGroup}}
+    stability: development
+    brief: The kind of the account that the daemon looked up.
+    annotations: {go: {name: AccountKind}}
+  - key: ifbound.account.name
+    type: string
+    stability: development
+    brief: The name of the user or group account that the daemon looked up.
+    examples: ["alice"]
+    annotations: {go: {name: AccountName}}
+  - key: ifbound.hosts.name
+    type: string
+    stability: development
+    brief: A name from the host file. It is not a DNS query name.
+    examples: ["example.com"]
+    annotations: {go: {name: HostsName}}
+  - key: ifbound.hosts.line
+    type: int
+    stability: development
+    brief: The line number in the host file.
+    examples: [12]
+    annotations: {go: {name: HostsLine}}
+  - key: ifbound.hosts.names
+    type: string[]
+    stability: development
+    brief: The names on a line of the host file.
+    examples:
+      - ["example.com", "www.example.com"]
+    annotations: {go: {name: HostsNames}}
+  - key: ifbound.pf.anchor
+    type: string
+    stability: development
+    brief: The name of the pf anchor that ifbound owns.
+    examples: ["ifbound"]
+    annotations: {go: {name: PFAnchor}}
+  - key: ifbound.peer.uid
+    type: int
+    stability: development
+    brief: The user ID of the process on the other end of a socket.
+    examples: [501]
+    annotations: {go: {name: PeerUID}}
+  - key: ifbound.backoff_ms
+    type: int
+    stability: development
+    brief: The wait before the next try, in milliseconds.
+    examples: [50]
+    annotations: {go: {name: BackoffMS}}
+
+attribute_groups:
+  - id: ifbound.semconv
+    visibility: public
+    stability: development
+    brief: Attributes from OpenTelemetry semantic conventions that ifbound emits.
+    attributes:
+      - ref: dns.question.name
+      - ref: error.type
+      - ref: exception.message
+        brief: The text of the error chain.
+      - ref: file.path
+      - ref: service.name
+        examples: ["ifbound"]
+      - ref: service.version

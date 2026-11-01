@@ -193,3 +193,6 @@ CLAUDE.local.md
 
 # Per-host mise overrides, such as a registry mirror
 mise.local.toml
+
+# The semconv archive of the telemetry registry (mise run telemetry:semconv).
+/.cache/

@@ -1,0 +1,15 @@
+# The registry of the log attributes that ifbound emits.
+file_format: definition_manifest/2.0
+description: Log attributes of the ifbound binaries.
+schema_url: https://github.com/Nagato-Yuzuru/ifbound/schemas/1.0.0
+stability: development
+dependencies:
+  # `mise run telemetry:semconv` downloads the archive, so that Weaver does
+  # not clone the repository on each run. The task reads the version from
+  # the schema_url below, and it checks that registry_path names the same
+  # version. The path is relative to the working directory of Weaver: run
+  # Weaver from the repository root.
+  # A .weaver.toml schema_url_overrides entry does not prevent the clone in
+  # Weaver 0.28.0: it applies after the dependency is fetched.
+  - schema_url: https://opentelemetry.io/schemas/1.44.0
+    registry_path: .cache/weaver/semconv-v1.44.0.tar.gz[model]
