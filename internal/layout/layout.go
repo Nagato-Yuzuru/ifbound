@@ -89,8 +89,13 @@ func (l Layout) Snapshot() string { return filepath.Join(l.StateDir, "addrbook.j
 // ifboundd.
 func (l Layout) ReportSocket() string { return filepath.Join(l.RunDir, "report.sock") }
 
-// ControlSocket is the socket where the CLI sends commands to ifboundd.
+// ControlSocket is the socket where every local user asks ifboundd for its
+// status. It serves Status only.
 func (l Layout) ControlSocket() string { return filepath.Join(l.RunDir, "control.sock") }
+
+// AdminSocket is the socket where root sends Apply to ifboundd. It serves
+// Status and Apply, and only root can connect.
+func (l Layout) AdminSocket() string { return filepath.Join(l.RunDir, "admin.sock") }
 
 // DaemonLog is the log file of ifboundd.
 func (l Layout) DaemonLog() string { return filepath.Join(l.LogDir, "ifboundd.log") }

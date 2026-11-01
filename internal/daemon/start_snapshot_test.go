@@ -287,13 +287,13 @@ func (h *capturedLogs) WithGroup(string) slog.Handler      { return h }
 // cause and a later retry, not a lookup.
 func TestWarmUpWaitsForTheProbeAndRetriesLater(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		cfg := rigCfg(t, rigCfgA)
 		w := reconciletest.NewWorld()
 		lookup := &gatedWarmLookup{}
 		logs := &capturedLogs{}
 		d := daemon.New(daemon.Config{
-			Policy:   cfg,
-			Snapshot: filepath.Join(t.TempDir(), "addrbook.json"),
+			ConfigPath: storeConfig(t, t.TempDir(), rigCfgA),
+			ConfigGID:  -1,
+			Snapshot:   filepath.Join(t.TempDir(), "addrbook.json"),
 			// No host file: the test does not depend on the host file of the machine.
 			HostsFile: filepath.Join(t.TempDir(), "hosts"),
 			Platform: reconcile.Reconciler{

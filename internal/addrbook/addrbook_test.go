@@ -585,3 +585,35 @@ func TestSaveLeavesNoTempFile(t *testing.T) {
 		t.Fatalf("dir = %v, %v", ents, err)
 	}
 }
+
+// Len counts what Addrs returns through Observe, a duplicate address,
+// Expire, and Prune.
+func TestLenCountsTheAddressesOfAPolicy(t *testing.T) {
+	b, c := newBook(t)
+	check := func(when string) {
+		t.Helper()
+		for _, n := range []policy.Name{"p", "q", "none"} {
+			if got, want := b.Len(n), len(b.Addrs(n)); got != want {
+				t.Errorf("%s: Len(%s) = %d, want %d", when, n, got, want)
+			}
+		}
+	}
+	check("empty")
+	observe(t, b, "p", 0, a1, a2)
+	observe(t, b, "p", 0, a1)
+	observe(t, b, "q", 0, a3)
+	check("observed")
+	if b.Len("p") != 2 || b.Len("q") != 1 {
+		t.Fatalf("Len = %d, %d, want 2, 1", b.Len("p"), b.Len("q"))
+	}
+	c.advance(retain / 2)
+	observe(t, b, "p", 0, a1)
+	c.advance(retain/2 + time.Second)
+	b.Expire()
+	check("expired")
+	if b.Len("p") != 1 || b.Len("q") != 0 {
+		t.Fatalf("after Expire: Len = %d, %d, want 1, 0", b.Len("p"), b.Len("q"))
+	}
+	b.Prune(nil)
+	check("pruned")
+}

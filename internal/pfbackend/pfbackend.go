@@ -33,11 +33,19 @@
 // stays. It is not evaluated, and Load keeps it empty.
 //
 // The Backend never runs "pfctl -d". Each Load takes a pf reference with
-// "pfctl -E" and gives back the reference that ifbound held before, so
+// "pfctl -E" and gives back the references that ifbound held before, so
 // ifbound holds one reference also when another tool enabled pf first.
-// The token of the reference goes into the label of a second sentinel
-// rule. A pf token outlives the process, so a restarted Backend reads its
-// token from that label. Release gives the token back.
+// The token of each reference that ifbound holds goes into the label of
+// a token rule. A pf token outlives the process, so a restarted Backend
+// reads its tokens from these labels. Unload gives the tokens back and
+// flushes the anchor.
+//
+// pf gives a released token value again, also to another process. So a
+// token is the value together with the time when pf created it, and the
+// Backend gives back a token only when "pfctl -s References" shows the
+// same pair. Else the value names the reference of another process, and
+// the Backend leaves it. A token that the Backend fails to give back
+// stays in the labels, and the next Load or Unload tries again.
 //
 // Every pfctl call goes through a Runner, so the logic runs without pf
 // and without root.
@@ -69,6 +77,9 @@ const (
 	// EnableInterval is the minimum time between two "pfctl -E" calls. It
 	// stops a fight with another tool that disables pf again and again.
 	EnableInterval = 10 * time.Second
+	// cleanupWait bounds Unload and the give-back of a token that no
+	// label holds. They do not use the context of the caller.
+	cleanupWait = 10 * time.Second
 )
 
 var (
@@ -88,9 +99,9 @@ type Backend struct {
 	run Runner
 	now func() time.Time
 	log *slog.Logger
-	// token is the reference token that ifbound holds, or "" when it
-	// holds none or does not know it yet.
-	token string
+	// tokens are the pf references that ifbound holds, or none when it
+	// holds none or does not know them yet.
+	tokens []token
 	// enabledAt is the time of the last "pfctl -E" call on a disabled pf.
 	enabledAt time.Time
 	// unfinished is true from the start of a Load until it finishes, and
@@ -142,8 +153,8 @@ func (b *Backend) LoadedID(ctx context.Context) (string, error) {
 
 // loaded reads whether pf is enabled and the ID of the loaded ruleset.
 // The ID is "" when pf is disabled: no rule is in effect then. When the
-// Backend does not know its token, it takes the token from the anchor,
-// where an earlier process of ifbound wrote it.
+// Backend knows no token, it takes the tokens from the anchor, where an
+// earlier process of ifbound wrote them.
 func (b *Backend) loaded(ctx context.Context) (enabled bool, id string, err error) {
 	enabled, err = b.enabled(ctx)
 	if err != nil {
@@ -156,9 +167,9 @@ func (b *Backend) loaded(ctx context.Context) (enabled bool, id string, err erro
 	if !enabled {
 		return false, "", nil
 	}
-	id, token := parseRuleset(out.Stdout)
-	if b.token == "" {
-		b.token = token
+	id, tokens := parseRuleset(out.Stdout)
+	if len(b.tokens) == 0 {
+		b.tokens = tokens
 	}
 	// pfctl reports a missing anchor, and a sub-anchor that it cannot
 	// read, on stderr and exits with 0. The output can then miss rules.
@@ -176,11 +187,17 @@ func (b *Backend) enabled(ctx context.Context) (bool, error) {
 	return parseStatus(out.Stdout)
 }
 
-// Load implements reconcile.Backend. It takes a pf reference (this
+// Load implements reconcile.Backend. It takes a new pf reference (this
 // enables pf when it is disabled), loads the ruleset with the sentinel
-// rules, flushes the rules of every sub-anchor, and then ends the states
-// to every entry of every table of the anchor. The rate limit can refuse
-// to enable pf: Load then fails, and a later Load tries again.
+// rules, gives back the references that ifbound held before, flushes the
+// rules of every sub-anchor, and then ends the states to every entry of
+// every table of the anchor. The rate limit can refuse to enable pf: Load
+// then fails, and a later Load tries again.
+//
+// The labels of the loaded ruleset hold the new token and the old ones.
+// So an old token that Load fails to give back stays in the labels. When
+// the load of the anchor fails, no label holds the new token, and Load
+// gives it back at once.
 func (b *Backend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 	s, err := sentinel(rs.ID())
 	if err != nil {
@@ -191,17 +208,31 @@ func (b *Backend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 	if err != nil {
 		return err
 	}
-	if err := b.reference(ctx, enabled); err != nil {
+	tok, err := b.reference(ctx, enabled)
+	if err != nil {
 		return err
 	}
+	old := b.tokens
 	body := rs.Body()
 	if len(body) > 0 && body[len(body)-1] != '\n' {
 		body = append(body, '\n')
 	}
-	body = append(append(body, s...), tokenRule(b.token)...)
+	body = append(append(body, s...), tokenRule(tok)...)
+	for _, t := range old {
+		body = append(body, tokenRule(t)...)
+	}
 	if _, err := b.pfctl(ctx, body, "-a", Anchor, "-f", "-"); err != nil {
+		b.abandon(ctx, tok)
 		return fmt.Errorf("loading the anchor: %w", err)
 	}
+	kept, err := b.giveBack(ctx, old)
+	if err != nil {
+		// The new token keeps pf enabled. An old token that stays only
+		// keeps pf enabled after uninstall, and its label keeps it known,
+		// so Load goes on.
+		b.log.WarnContext(ctx, "cannot give back an old pf token", slog.String("error", err.Error()))
+	}
+	b.tokens = append([]token{tok}, kept...)
 	if err := b.flushSubAnchors(ctx); err != nil {
 		return err
 	}
@@ -231,69 +262,122 @@ func (b *Backend) flushSubAnchors(ctx context.Context) error {
 	return nil
 }
 
-// reference takes a new pf reference with "pfctl -E" and then gives back
-// the token that ifbound held before. pf stays enabled while any
-// reference exists, so ifbound needs its own: without it, pf stops when
-// another tool gives back the reference that enabled pf. A new token at
-// each Load also replaces a token that pf no longer knows (after
-// "pfctl -d" and an enable by another tool).
+// reference takes a new pf reference with "pfctl -E" and returns its
+// token. pf stays enabled while any reference exists, so ifbound needs
+// its own: without it, pf stops when another tool gives back the
+// reference that enabled pf. A new token at each Load also replaces a
+// token that pf no longer knows (after "pfctl -d" and an enable by
+// another tool).
 //
 // On a disabled pf the call enables pf, at most once in EnableInterval,
-// and logs a warning. A disabled pf has dropped every token, so no old
-// token goes back then.
-func (b *Backend) reference(ctx context.Context, enabled bool) error {
-	old := b.token
+// and logs a warning. A disabled pf has dropped every token, so the
+// Backend forgets its old tokens then.
+func (b *Backend) reference(ctx context.Context, enabled bool) (token, error) {
 	if !enabled {
 		now := b.now()
 		if !b.enabledAt.IsZero() && now.Sub(b.enabledAt) < EnableInterval {
-			return fmt.Errorf("%w: the last enable was less than %s ago", errDisabled, EnableInterval)
+			return token{}, fmt.Errorf("%w: the last enable was less than %s ago", errDisabled, EnableInterval)
 		}
 		b.enabledAt = now
-		old, b.token = "", ""
+		b.tokens = nil
 	}
 	out, err := b.pfctl(ctx, nil, "-E")
 	if err != nil {
-		return fmt.Errorf("enabling pf: %w", err)
+		return token{}, fmt.Errorf("enabling pf: %w", err)
 	}
-	tok, err := parseToken(out.Stderr)
+	value, err := parseToken(out.Stderr)
 	if err != nil {
-		return err
+		return token{}, err
 	}
-	b.token = tok
 	if !enabled {
 		b.log.WarnContext(ctx, "pf was disabled; ifbound enabled it", slog.String("anchor", Anchor))
 	}
-	if old != "" && old != tok {
-		// The new token keeps pf enabled. An old token that stays only
-		// keeps pf enabled after uninstall, so Load goes on.
-		if err := b.release(ctx, old); err != nil {
-			b.log.WarnContext(ctx, "cannot give back the old pf token", slog.String("error", err.Error()))
-		}
-	}
-	return nil
+	return token{value: value, created: b.now().Unix()}, nil
 }
 
-// Release gives back the reference token of ifbound, so pf stays enabled
-// only while other references exist. It is for uninstall. With no token
-// it does nothing. A token that pf no longer holds (pf was disabled,
-// which drops every token, or the token is stale) counts as given back.
-func (b *Backend) Release(ctx context.Context) error {
-	if b.token == "" {
-		return nil
+// abandon gives back the token of a reference that no label holds. It
+// uses a new context: the context of the caller can be the cause of the
+// failure. When the give-back fails, the Backend keeps the token, and the
+// next Load writes it into a label.
+func (b *Backend) abandon(ctx context.Context, t token) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupWait)
+	defer cancel()
+	kept, err := b.giveBack(ctx, []token{t})
+	if err != nil {
+		b.log.WarnContext(ctx, "cannot give back a new pf token", slog.String("error", err.Error()))
 	}
-	if err := b.release(ctx, b.token); err != nil {
+	b.tokens = append(b.tokens, kept...)
+}
+
+// Unload removes the enforcement of ifbound from pf. It is for
+// uninstall. It gives back the reference tokens of ifbound, then flushes
+// the rules and the tables of the anchor. It never disables pf and never
+// flushes all of the anchor, so pf stays enabled while other references
+// exist.
+//
+// The tokens go back first. Their labels are in the rules of the anchor,
+// so after a stop between the two steps the labels stay, and a second
+// Unload, also in a new process, reads the tokens from them. When the
+// Backend knows no token, Unload reads them from the anchor first. A
+// token that pf no longer holds counts as given back. Thus Unload is
+// idempotent.
+//
+// Unload uses a new context with a timeout of cleanupWait, so a canceled
+// caller still gives back the tokens.
+func (b *Backend) Unload(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupWait)
+	defer cancel()
+	if _, _, err := b.loaded(ctx); err != nil {
 		return err
 	}
-	b.token = ""
+	if err := b.release(ctx); err != nil {
+		return err
+	}
+	if _, err := b.pfctl(ctx, nil, "-a", Anchor, "-F", "rules"); err != nil {
+		return fmt.Errorf("flushing the rules of the anchor: %w", err)
+	}
+	if _, err := b.pfctl(ctx, nil, "-a", Anchor, "-F", "Tables"); err != nil {
+		return fmt.Errorf("flushing the tables of the anchor: %w", err)
+	}
 	return nil
 }
 
-func (b *Backend) release(ctx context.Context, token string) error {
-	out, err := b.run.Run(ctx, nil, "-X", token)
-	if err != nil && !tokenGone(out.Stderr) {
-		return fmt.Errorf("%w: pfctl -X: %v: %s", errPfctl, err, stderrText(out.Stderr))
+// release gives back the reference tokens of ifbound, so pf stays
+// enabled only while other references exist. With no token it does
+// nothing. A token that fails to go back stays known.
+func (b *Backend) release(ctx context.Context) error {
+	kept, err := b.giveBack(ctx, b.tokens)
+	b.tokens = kept
+	return err
+}
+
+// giveBack gives back each token that pf still holds as the same
+// reference: "pfctl -s References" shows its value with its creation
+// time. A token that pf no longer holds (pf was disabled, which drops
+// every token, or another process holds the value now) counts as given
+// back. It returns the tokens that did not go back.
+func (b *Backend) giveBack(ctx context.Context, tokens []token) ([]token, error) {
+	if len(tokens) == 0 {
+		return nil, nil
 	}
-	return nil
+	out, err := b.pfctl(ctx, nil, "-s", "References")
+	if err != nil {
+		return tokens, fmt.Errorf("reading the pf references: %w", err)
+	}
+	held := parseReferences(out.Stdout, b.now())
+	var kept []token
+	var errs []error
+	for _, t := range tokens {
+		if !slices.ContainsFunc(held, t.same) {
+			continue
+		}
+		out, err := b.run.Run(ctx, nil, "-X", t.value)
+		if err != nil && !tokenGone(out.Stderr) {
+			kept = append(kept, t)
+			errs = append(errs, fmt.Errorf("%w: pfctl -X: %v: %s", errPfctl, err, stderrText(out.Stderr)))
+		}
+	}
+	return kept, errors.Join(errs...)
 }
 
 // AddEntries implements reconcile.Backend. "pfctl -T add" creates the

@@ -181,13 +181,14 @@ type warmHarness struct {
 
 // startWarm runs a daemon with the system resolver net, and waits until
 // every goroutine blocks.
-func startWarm(t *testing.T, world *reconciletest.World, snapshot string, cfg policy.Config, net *warmNet) *warmHarness {
+func startWarm(t *testing.T, world *reconciletest.World, snapshot, cfgText string, net *warmNet) *warmHarness {
 	t.Helper()
 	log := &logRecords{}
 	inv := reconciletest.NewInventory(en0)
 	d := daemon.New(daemon.Config{
-		Policy:   cfg,
-		Snapshot: snapshot,
+		ConfigPath: storeConfig(t, t.TempDir(), cfgText),
+		ConfigGID:  -1,
+		Snapshot:   snapshot,
 		// No host file: the tests here do not depend on the host file of the machine.
 		HostsFile: filepath.Join(filepath.Dir(snapshot), "hosts"),
 		Platform: reconcile.Reconciler{
@@ -255,12 +256,17 @@ func (h *warmHarness) reconfigureTo(prefixes ...string) {
 // warmConfig is one policy "web" with the destinations to.
 func warmConfig(t *testing.T, to ...string) policy.Config {
 	t.Helper()
-	return parse(t, header+fmt.Sprintf(`
+	return parse(t, warmText(to...))
+}
+
+// warmText is the text of warmConfig.
+func warmText(to ...string) string {
+	return header + fmt.Sprintf(`
 [[policy]]
 name = "web"
 to = ["%s"]
 only_via = ["en0"]
-`, strings.Join(to, `", "`)))
+`, strings.Join(to, `", "`))
 }
 
 // seqNames returns n names: prefix0.example, prefix1.example, and so on.
@@ -390,7 +396,7 @@ only_via = ["en0"]
 			synctest.Test(t, func(t *testing.T) {
 				world := reconciletest.NewWorld()
 				cfg := parse(t, tt.cfg)
-				h := startWarm(t, world, snapshotPath(t), cfg, newWarmNet(world, cfg.DNS.Listen))
+				h := startWarm(t, world, snapshotPath(t), tt.cfg, newWarmNet(world, cfg.DNS.Listen))
 				defer h.stop()
 				h.wantState(daemon.StateReady)
 				h.wantCounts(tt.want)
@@ -408,8 +414,9 @@ func TestWarmUpRunsOnlyWhileTheDaemonAcks(t *testing.T) {
 			if err := os.WriteFile(snapshot, []byte("not json"), 0o600); err != nil {
 				t.Fatal(err)
 			}
-			cfg := warmConfig(t, names...)
-			h := startWarm(t, world, snapshot, cfg, newWarmNet(world, cfg.DNS.Listen))
+			cfgText := warmText(names...)
+			cfg := parse(t, cfgText)
+			h := startWarm(t, world, snapshot, cfgText, newWarmNet(world, cfg.DNS.Listen))
 			defer h.stop()
 			for range 3 {
 				heal()
@@ -429,8 +436,9 @@ func TestWarmUpRunsOnlyWhileTheDaemonAcks(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			world := reconciletest.NewWorld()
 			world.SetProblems([]reconcile.Problem{pfDisabled}, nil)
-			cfg := warmConfig(t, names...)
-			h := startWarm(t, world, snapshotPath(t), cfg, newWarmNet(world, cfg.DNS.Listen))
+			cfgText := warmText(names...)
+			cfg := parse(t, cfgText)
+			h := startWarm(t, world, snapshotPath(t), cfgText, newWarmNet(world, cfg.DNS.Listen))
 			defer h.stop()
 			for range 3 {
 				heal()
@@ -447,8 +455,9 @@ func TestWarmUpRunsOnlyWhileTheDaemonAcks(t *testing.T) {
 	t.Run("configuration change while unenforced", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			world := reconciletest.NewWorld()
-			cfg := warmConfig(t, "old.example")
-			h := startWarm(t, world, snapshotPath(t), cfg, newWarmNet(world, cfg.DNS.Listen))
+			cfgText := warmText("old.example")
+			cfg := parse(t, cfgText)
+			h := startWarm(t, world, snapshotPath(t), cfgText, newWarmNet(world, cfg.DNS.Listen))
 			defer h.stop()
 			h.wantState(daemon.StateReady)
 			h.wantCounts(once("old.example"))
@@ -472,8 +481,9 @@ func TestWarmUpRunsOnlyWhileTheDaemonAcks(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			world := reconciletest.NewWorld()
 			world.SetProblems(nil, []reconcile.Problem{conflict})
-			cfg := warmConfig(t, names...)
-			h := startWarm(t, world, snapshotPath(t), cfg, newWarmNet(world, cfg.DNS.Listen))
+			cfgText := warmText(names...)
+			cfg := parse(t, cfgText)
+			h := startWarm(t, world, snapshotPath(t), cfgText, newWarmNet(world, cfg.DNS.Listen))
 			defer h.stop()
 			h.wantState(daemon.StateDegraded)
 			h.wantCounts(once(names...))
@@ -485,11 +495,12 @@ func TestWarmUpStopsWhenEnforcementEndsAndStartsAgain(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		names := seqNames("n", 6)
 		world := reconciletest.NewWorld()
-		cfg := warmConfig(t, names...)
+		cfgText := warmText(names...)
+		cfg := parse(t, cfgText)
 		net := newWarmNet(world, cfg.DNS.Listen)
 		hold := newHold(true)
 		net.hook = hold.hook
-		h := startWarm(t, world, snapshotPath(t), cfg, net)
+		h := startWarm(t, world, snapshotPath(t), cfgText, net)
 		defer h.stop()
 		h.wantState(daemon.StateReady)
 
@@ -518,8 +529,9 @@ func TestWarmUpRestartsAfterConfigChange(t *testing.T) {
 	t.Run("after a finished warm-up", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			world := reconciletest.NewWorld()
-			cfg := warmConfig(t, "keep.example", "gone.example")
-			h := startWarm(t, world, snapshotPath(t), cfg, newWarmNet(world, cfg.DNS.Listen))
+			cfgText := warmText("keep.example", "gone.example")
+			cfg := parse(t, cfgText)
+			h := startWarm(t, world, snapshotPath(t), cfgText, newWarmNet(world, cfg.DNS.Listen))
 			defer h.stop()
 			h.wantState(daemon.StateReady)
 			h.wantCounts(once("keep.example", "gone.example"))
@@ -535,11 +547,12 @@ func TestWarmUpRestartsAfterConfigChange(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			before := seqNames("n", 2*daemon.WarmUpConcurrency)
 			world := reconciletest.NewWorld()
-			cfg := warmConfig(t, before...)
+			cfgText := warmText(before...)
+			cfg := parse(t, cfgText)
 			net := newWarmNet(world, cfg.DNS.Listen)
 			hold := newHold(true)
 			net.hook = hold.hook
-			h := startWarm(t, world, snapshotPath(t), cfg, net)
+			h := startWarm(t, world, snapshotPath(t), cfgText, net)
 			defer h.stop()
 			h.wantState(daemon.StateReady)
 			h.wantCounts(once(before[:daemon.WarmUpConcurrency]...))
@@ -567,14 +580,16 @@ func TestWarmUpWaitsUntilTheResolverEntriesApply(t *testing.T) {
 		world := reconciletest.NewWorld()
 		world.SetResolverDelay(true)
 		names := []string{"n1.example", "n2.example", "new.other"}
-		cfg := warmConfig(t, names[:2]...)
+		cfgText := warmText(names[:2]...)
+		cfg := parse(t, cfgText)
 		net := newWarmNet(world, cfg.DNS.Listen)
 		for i, n := range names {
 			net.answers[n] = []netip.Addr{netip.AddrFrom4([4]byte{203, 0, 113, byte(20 + i)})}
 		}
-		h := startWarm(t, world, snapshotPath(t), cfg, net)
+		h := startWarm(t, world, snapshotPath(t), cfgText, net)
 		defer h.stop()
-		h.wantState(daemon.StateReady)
+		// No probe can pass before the entries apply.
+		h.wantState(daemon.StateDegraded)
 
 		// The entries apply only after more than one probe budget.
 		for range 3 {
@@ -585,6 +600,7 @@ func TestWarmUpWaitsUntilTheResolverEntriesApply(t *testing.T) {
 		heal()
 		heal()
 		h.wantCounts(once(names[:2]...))
+		h.wantState(daemon.StateReady)
 
 		if err := h.d.Reconfigure(t.Context(), warmConfig(t, names...)); err != nil {
 			t.Fatal(err)
@@ -618,11 +634,12 @@ func TestWarmUpConcurrencyBound(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			names := seqNames("c", 3*daemon.WarmUpConcurrency)
 			world := reconciletest.NewWorld()
-			cfg := warmConfig(t, names...)
+			cfgText := warmText(names...)
+			cfg := parse(t, cfgText)
 			net := newWarmNet(world, cfg.DNS.Listen)
 			hold := newHold(false)
 			net.hook = hold.hook
-			h := startWarm(t, world, snapshotPath(t), cfg, net)
+			h := startWarm(t, world, snapshotPath(t), cfgText, net)
 			defer h.stop()
 			if n, _ := net.load(); n != daemon.WarmUpConcurrency {
 				t.Errorf("%d lookups in flight, want %d", n, daemon.WarmUpConcurrency)
@@ -639,11 +656,12 @@ func TestWarmUpConcurrencyBound(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			names := seqNames("t", daemon.WarmUpConcurrency+1)
 			world := reconciletest.NewWorld()
-			cfg := warmConfig(t, names...)
+			cfgText := warmText(names...)
+			cfg := parse(t, cfgText)
 			net := newWarmNet(world, cfg.DNS.Listen)
 			hold := newHold(true) // never released: each lookup ends at its timeout
 			net.hook = hold.hook
-			h := startWarm(t, world, snapshotPath(t), cfg, net)
+			h := startWarm(t, world, snapshotPath(t), cfgText, net)
 			defer h.stop()
 			h.wantCounts(once(names[:daemon.WarmUpConcurrency]...))
 
@@ -662,11 +680,12 @@ func TestWarmUpConcurrencyBoundAcrossConfigChanges(t *testing.T) {
 	t.Run("lookups that ignore their ctx", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			world := reconciletest.NewWorld()
-			cfg := warmConfig(t, seqNames("a", 10)...)
+			cfgText := warmText(seqNames("a", 10)...)
+			cfg := parse(t, cfgText)
 			net := newWarmNet(world, cfg.DNS.Listen)
 			hold := newHold(false) // a lookup that ignores its ctx
 			net.hook = hold.hook
-			h := startWarm(t, world, snapshotPath(t), cfg, net)
+			h := startWarm(t, world, snapshotPath(t), cfgText, net)
 			defer h.stop()
 			h.reconfigureTo("b", "c", "d")
 			if _, most := net.load(); most > daemon.WarmUpConcurrency {
@@ -687,11 +706,12 @@ func TestWarmUpConcurrencyBoundAcrossConfigChanges(t *testing.T) {
 	t.Run("a stopped warm-up does not end its system lookups", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			world := reconciletest.NewWorld()
-			cfg := warmConfig(t, seqNames("a", 10)...)
+			cfgText := warmText(seqNames("a", 10)...)
+			cfg := parse(t, cfgText)
 			net := newWarmNet(world, cfg.DNS.Listen)
 			g := &getaddrinfo{release: make(chan struct{})}
 			net.hook = g.hook
-			h := startWarm(t, world, snapshotPath(t), cfg, net)
+			h := startWarm(t, world, snapshotPath(t), cfgText, net)
 			defer h.stop()
 			defer close(g.release)
 			h.reconfigureTo("b", "c", "d")
@@ -709,7 +729,8 @@ func TestWarmUpConcurrencyBoundAcrossConfigChanges(t *testing.T) {
 func TestSlowWarmUpLookupDelaysNoReport(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		world := reconciletest.NewWorld()
-		cfg := warmConfig(t, "slow.example", "fast.example")
+		cfgText := warmText("slow.example", "fast.example")
+		cfg := parse(t, cfgText)
 		net := newWarmNet(world, cfg.DNS.Listen)
 		var (
 			mu      sync.Mutex
@@ -729,7 +750,7 @@ func TestSlowWarmUpLookupDelaysNoReport(t *testing.T) {
 			mu.Unlock()
 			return nil, ctx.Err()
 		}
-		h := startWarm(t, world, snapshotPath(t), cfg, net)
+		h := startWarm(t, world, snapshotPath(t), cfgText, net)
 		defer h.stop()
 		inFlight := func() bool {
 			mu.Lock()
@@ -762,11 +783,12 @@ func TestSlowWarmUpLookupDelaysNoReport(t *testing.T) {
 func TestHeldLookupsOfAStoppedWarmUpDelayNoReport(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		world := reconciletest.NewWorld()
-		cfg := warmConfig(t, seqNames("h", 6)...)
+		cfgText := warmText(seqNames("h", 6)...)
+		cfg := parse(t, cfgText)
 		net := newWarmNet(world, cfg.DNS.Listen)
 		hold := newHold(false) // a lookup that ignores its ctx
 		net.hook = hold.hook
-		h := startWarm(t, world, snapshotPath(t), cfg, net)
+		h := startWarm(t, world, snapshotPath(t), cfgText, net)
 		defer h.stop()
 		defer close(hold.release)
 
@@ -797,7 +819,8 @@ func TestWarmUpLogsAndSkipsAFailedName(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		names := append([]string{"bad.example"}, seqNames("ok", 2*daemon.WarmUpConcurrency)...)
 		world := reconciletest.NewWorld()
-		cfg := warmConfig(t, names...)
+		cfgText := warmText(names...)
+		cfg := parse(t, cfgText)
 		net := newWarmNet(world, cfg.DNS.Listen)
 		// The other names wait until the failure of bad.example is
 		// complete, so the names after it start only after the failure.
@@ -808,7 +831,7 @@ func TestWarmUpLogsAndSkipsAFailedName(t *testing.T) {
 			}
 			return hold.hook(ctx, name)
 		}
-		h := startWarm(t, world, snapshotPath(t), cfg, net)
+		h := startWarm(t, world, snapshotPath(t), cfgText, net)
 		defer h.stop()
 		close(hold.release)
 		synctest.Wait()
@@ -847,10 +870,11 @@ func TestWarmUpWarnsNotForANameWithoutAnswer(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				world := reconciletest.NewWorld()
-				cfg := warmConfig(t, "*.quiet.example")
+				cfgText := warmText("*.quiet.example")
+				cfg := parse(t, cfgText)
 				net := newWarmNet(world, cfg.DNS.Listen)
 				net.hook = tt.hook
-				h := startWarm(t, world, snapshotPath(t), cfg, net)
+				h := startWarm(t, world, snapshotPath(t), cfgText, net)
 				defer h.stop()
 				time.Sleep(daemon.WarmUpTimeout)
 				synctest.Wait()
@@ -868,11 +892,12 @@ func TestWarmUpWritesNothingAndItsReportsTakeTheNormalPath(t *testing.T) {
 	t.Run("no report, no write", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			world := reconciletest.NewWorld()
-			cfg := warmConfig(t, seqNames("w", 6)...)
+			cfgText := warmText(seqNames("w", 6)...)
+			cfg := parse(t, cfgText)
 			net := newWarmNet(world, cfg.DNS.Listen)
 			hold := newHold(false)
 			net.hook = hold.hook
-			h := startWarm(t, world, snapshotPath(t), cfg, net)
+			h := startWarm(t, world, snapshotPath(t), cfgText, net)
 			defer h.stop()
 			h.wantState(daemon.StateReady)
 			writes := world.Writes()
@@ -891,10 +916,11 @@ func TestWarmUpWritesNothingAndItsReportsTakeTheNormalPath(t *testing.T) {
 	t.Run("a routed lookup is reported and learned", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			world := reconciletest.NewWorld()
-			cfg := warmConfig(t, "learn.example")
+			cfgText := warmText("learn.example")
+			cfg := parse(t, cfgText)
 			net := newWarmNet(world, cfg.DNS.Listen)
 			net.answers["learn.example"] = []netip.Addr{addr}
-			h := startWarm(t, world, snapshotPath(t), cfg, net)
+			h := startWarm(t, world, snapshotPath(t), cfgText, net)
 			defer h.stop()
 			h.wantState(daemon.StateReady)
 			net.mu.Lock()

@@ -57,10 +57,28 @@ type warmUp struct {
 	// started for gen while the phase acks.
 	cancel context.CancelFunc
 	gen    uint64
+	// results receives a value when res changes. It has room for one
+	// value, and a send that finds it full is dropped: the loop reads the
+	// latest res.
+	results chan struct{}
+	resMu   sync.Mutex
+	res     warmResult
+}
+
+// warmResult holds the latest configuration generations of the
+// self-test: proved is the generation under which a probe reached
+// ifbound-dns, and missed the generation under which a whole pass
+// ended with no such probe.
+type warmResult struct {
+	proved, missed uint64
 }
 
 func newWarmUp(lookup SystemResolver, prove func(context.Context, policy.Domain) error, log *slog.Logger) *warmUp {
-	return &warmUp{lookup: lookup, prove: prove, log: log, slots: make(chan struct{}, WarmUpConcurrency)}
+	return &warmUp{
+		lookup: lookup, prove: prove, log: log,
+		slots:   make(chan struct{}, WarmUpConcurrency),
+		results: make(chan struct{}, 1),
+	}
 }
 
 // sync runs one warm-up for each configuration while the phase acks. It
@@ -79,17 +97,22 @@ func (w *warmUp) sync(ctx context.Context, l *loop) {
 	var wctx context.Context
 	wctx, w.cancel = context.WithCancel(ctx)
 	w.gen = l.gen
-	w.wg.Go(func() { w.run(wctx, ctx, names) })
+	gen := l.gen
+	w.wg.Go(func() { w.run(wctx, ctx, names, gen) })
 }
 
 // run warms up names in passes until each name had a successful probe,
 // or wctx ends. wctx is the life of the warm-up, and ctx is the life of
 // Run.
-func (w *warmUp) run(wctx, ctx context.Context, names []policy.Domain) {
+func (w *warmUp) run(wctx, ctx context.Context, names []policy.Domain, gen uint64) {
 	for first := true; ; first = false {
-		names = w.pass(wctx, ctx, names, first)
+		tried := len(names)
+		names = w.pass(wctx, ctx, names, first, gen)
 		if len(names) == 0 {
 			return
+		}
+		if len(names) == tried && wctx.Err() == nil {
+			w.report(func(r *warmResult) { r.missed = gen })
 		}
 		select {
 		case <-wctx.Done():
@@ -102,7 +125,7 @@ func (w *warmUp) run(wctx, ctx context.Context, names []policy.Domain) {
 // pass starts the work on one name when a slot is free, until wctx ends.
 // It returns when the work on each started name has ended, with the names
 // whose probe failed.
-func (w *warmUp) pass(wctx, ctx context.Context, names []policy.Domain, first bool) []policy.Domain {
+func (w *warmUp) pass(wctx, ctx context.Context, names []policy.Domain, first bool, gen uint64) []policy.Domain {
 	var (
 		wg       sync.WaitGroup
 		mu       sync.Mutex
@@ -114,7 +137,7 @@ func (w *warmUp) pass(wctx, ctx context.Context, names []policy.Domain, first bo
 		}
 		wg.Go(func() {
 			defer func() { <-w.slots }()
-			if !w.warm(wctx, ctx, name, first) {
+			if !w.warm(wctx, ctx, name, first, gen) {
 				mu.Lock()
 				unproven = append(unproven, name)
 				mu.Unlock()
@@ -144,7 +167,7 @@ func (w *warmUp) acquire(wctx context.Context) bool {
 // warm probes below name, and then resolves name when the probe
 // succeeded. It reports whether the probe succeeded. The lookup ends with
 // its budget or with ctx, not with wctx: see warmUp.slots.
-func (w *warmUp) warm(wctx, ctx context.Context, name policy.Domain, first bool) bool {
+func (w *warmUp) warm(wctx, ctx context.Context, name policy.Domain, first bool, gen uint64) bool {
 	pctx, cancel := context.WithTimeout(wctx, WarmUpTimeout)
 	err := w.prove(pctx, name)
 	cancel()
@@ -155,6 +178,7 @@ func (w *warmUp) warm(wctx, ctx context.Context, name policy.Domain, first bool)
 		}
 		return false
 	}
+	w.report(func(r *warmResult) { r.proved = gen })
 	lctx, cancel := context.WithTimeout(ctx, WarmUpTimeout)
 	defer cancel()
 	// The report of ifbound-dns learns the answer, so only the error
@@ -172,6 +196,24 @@ func (w *warmUp) warm(wctx, ctx context.Context, name policy.Domain, first bool)
 		w.log.WarnContext(ctx, "warm-up lookup failed", slog.String("name", name.String()), slog.Any("error", err))
 	}
 	return true
+}
+
+// report changes the result with f and tells the loop.
+func (w *warmUp) report(f func(*warmResult)) {
+	w.resMu.Lock()
+	f(&w.res)
+	w.resMu.Unlock()
+	select {
+	case w.results <- struct{}{}:
+	default:
+	}
+}
+
+// result returns the latest result.
+func (w *warmUp) result() warmResult {
+	w.resMu.Lock()
+	defer w.resMu.Unlock()
+	return w.res
 }
 
 // wait returns when every lookup of every warm-up has returned.

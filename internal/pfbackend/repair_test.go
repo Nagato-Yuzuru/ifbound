@@ -280,9 +280,9 @@ func checkHeld(t *testing.T, r *rig, p netip.Prefix) {
 	}
 }
 
-// Release gives back the reference of ifbound also after a restart: the
+// Unload gives back the reference of ifbound also after a restart: the
 // token is in the anchor, and a new Backend reads it.
-func TestReleaseAfterRestart(t *testing.T) {
+func TestUnloadAfterRestart(t *testing.T) {
 	for _, load := range []bool{true, false} {
 		name := "the restarted daemon loads"
 		if !load {
@@ -300,8 +300,8 @@ func TestReleaseAfterRestart(t *testing.T) {
 			} else if _, err := again.Read(t.Context()); err != nil {
 				t.Fatal(err)
 			}
-			if err := again.Release(t.Context()); err != nil {
-				t.Fatalf("Release: %v", err)
+			if err := again.Unload(t.Context()); err != nil {
+				t.Fatalf("Unload: %v", err)
 			}
 			if r.k.enabled {
 				t.Errorf("pf is still enabled after uninstall by the restarted daemon; references left %v", r.k.refs)
@@ -311,18 +311,18 @@ func TestReleaseAfterRestart(t *testing.T) {
 }
 
 // After "pfctl -d" and an enable by another tool, the token of ifbound is
-// stale. Release counts it as given back and keeps the other reference.
-func TestReleaseOfAStaleToken(t *testing.T) {
+// stale. Unload counts it as given back and keeps the other reference.
+func TestUnloadOfAStaleToken(t *testing.T) {
 	r := newRig(t)
 	mustLoad(t, r, compileRS(t, testPolicies))
 	r.k.enabled, r.k.refs = false, nil         // pfctl -d by someone
 	if _, err := r.k.enableRef(); err != nil { // another tool: pfctl -E
 		t.Fatal(err)
 	}
-	first := r.b.Release(t.Context())
-	second := r.b.Release(t.Context())
+	first := r.b.Unload(t.Context())
+	second := r.b.Unload(t.Context())
 	if first != nil || second != nil {
-		t.Errorf("Release with a stale token = (%v, %v), want success: the token is already gone", first, second)
+		t.Errorf("Unload with a stale token = (%v, %v), want success: the token is already gone", first, second)
 	}
 	if !r.k.enabled || len(r.k.refs) != 1 {
 		t.Errorf("the other tool's reference is gone: enabled %v refs %v", r.k.enabled, r.k.refs)

@@ -17,10 +17,6 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
-// DefaultHostsFile is the host file that the daemon reads when
-// Config.HostsFile is empty.
-const DefaultHostsFile = "/etc/hosts"
-
 // hostsState is what the daemon knows of the host file. macOS answers a
 // name from the host file before it asks DNS, so a host entry for a
 // protected name never reaches ifbound-dns. Its address goes into the

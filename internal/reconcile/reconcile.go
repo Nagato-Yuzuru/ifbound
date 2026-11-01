@@ -116,6 +116,16 @@ func (r Reconciler) Converge(ctx context.Context, in Inputs) (Report, error) {
 	return rep, errors.Join(berr, rerr)
 }
 
+// ConvergeResolver runs only the SysResolver part of Converge. It uses
+// only the Resolver field, so the other fields can be nil. Uninstall uses
+// it with the zero Inputs after the Backend removed the enforcement: it
+// removes every resolver entry and loads no ruleset.
+func (r Reconciler) ConvergeResolver(ctx context.Context, in Inputs) (Report, error) {
+	var rep Report
+	err := r.convergeResolver(ctx, in, &rep)
+	return rep, err
+}
+
 // AddObserved adds the addresses to the table of one policy. It is the
 // fast path for a DNS report: it neither reads the actual state nor
 // recompiles. A nil error means the Backend holds every address in the
