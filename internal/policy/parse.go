@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
-	"github.com/pelletier/go-toml/v2/unstable"
 )
 
 // The reasons that Parse and Config.CheckUpstreams report. Each syntax
@@ -51,9 +50,23 @@ var (
 // FieldError reports a configuration fault at one field. Field is the
 // path in the file, for example "policy[1].to[0]". It is empty when the
 // fault is not tied to a field, such as a TOML syntax error.
+//
+// Line and Column give the place of the fault in the file. Both start at 1.
+// Column counts bytes, not characters. For a syntax error at the end of a
+// line in a file with CRLF line ends, go-toml counts the "\r" in the column.
+// Both are zero when the place is unknown. Parse sets them. An error
+// from Config.CheckUpstreams has no place until the caller runs Locate on
+// the file text, because a Config does not keep the text.
 type FieldError struct {
-	Field string
-	Err   error
+	Field  string
+	Err    error
+	Line   int
+	Column int
+
+	// path is Field as a list of steps. Field can be the same text for two
+	// paths, such as a key "a.b" and the key b in the table a. Locate uses
+	// path, so it finds the right one.
+	path fieldPath
 }
 
 func (e *FieldError) Error() string {
@@ -68,15 +81,13 @@ func (e *FieldError) Unwrap() error { return e.Err }
 
 // at puts field in front of the field path of err.
 func at(field string, err error) error {
+	p := literal(field)
 	var fe *FieldError
 	if !errors.As(err, &fe) {
-		return &FieldError{Field: field, Err: err}
+		return newFieldError(p, err)
 	}
-	sep := "."
-	if fe.Field == "" || strings.HasPrefix(fe.Field, "[") {
-		sep = ""
-	}
-	return &FieldError{Field: field + sep + fe.Field, Err: fe.Err}
+	p = append(p, fe.path...)
+	return &FieldError{Field: p.String(), Err: fe.Err, Line: fe.Line, Column: fe.Column, path: p}
 }
 
 type rawConfig struct {
@@ -125,8 +136,20 @@ func Parse(r io.Reader) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("reading config: %w", err)
 	}
-	if field, dup := findDuplicateKey(b); dup {
-		return Config{}, &FieldError{Field: field, Err: fmt.Errorf("%w: duplicate key", errSyntax)}
+	idx := newIndex(b)
+	cfg, err := parse(b, idx)
+	var fe *FieldError
+	if errors.As(err, &fe) {
+		fe.locateIn(idx)
+	}
+	return cfg, err
+}
+
+func parse(b []byte, idx *index) (Config, error) {
+	// The decoder reports a duplicate key without its parent path, so the
+	// index reports it first, with the full path.
+	if dup := idx.dup; dup != nil {
+		return Config{}, dup
 	}
 	var tree map[string]any
 	if err := toml.Unmarshal(b, &tree); err != nil {
@@ -145,106 +168,20 @@ func Parse(r io.Reader) (Config, error) {
 }
 
 // decodeError turns a decoder failure into this package's vocabulary.
-// The decoder's own error stays out of the %w chain.
+// The decoder's own error stays out of the %w chain. The decoder gives the
+// place of its error, so decodeError keeps it.
 func decodeError(err error) error {
-	var missing *toml.StrictMissingError
-	if errors.As(err, &missing) && len(missing.Errors) > 0 {
-		key := strings.Join(missing.Errors[0].Key(), ".")
-		return &FieldError{Field: key, Err: errUnknownKey}
-	}
 	var derr *toml.DecodeError
 	if errors.As(err, &derr) {
+		line, col := derr.Position()
 		return &FieldError{
-			Field: strings.Join(derr.Key(), "."),
-			Err:   fmt.Errorf("%w: %v", errSyntax, err),
+			Field:  strings.Join(derr.Key(), "."),
+			Err:    fmt.Errorf("%w: %v", errSyntax, err),
+			Line:   line,
+			Column: col,
 		}
 	}
 	return &FieldError{Err: fmt.Errorf("%w: %v", errSyntax, err)}
-}
-
-// findDuplicateKey finds a key or table that the file defines twice. The
-// decoder reports such a key without its parent path, so Parse looks for
-// it first, with the full path. It does not see duplicates inside inline
-// tables: for those, the decoder's own error stands.
-func findDuplicateKey(b []byte) (string, bool) {
-	var p unstable.Parser
-	p.Reset(b)
-	f := dupFinder{seen: map[string]struct{}{}}
-	for p.NextExpression() {
-		e := p.Expression()
-		parts := keyParts(e.Key())
-		var dup string
-		//nolint:exhaustive // the other kinds are comments and values: they define no path
-		switch e.Kind {
-		case unstable.Table:
-			dup = f.enterTable(parts)
-		case unstable.ArrayTable:
-			f.enterArrayTable(parts)
-		case unstable.KeyValue:
-			dup = f.keyValue(parts)
-		}
-		if dup != "" {
-			return dup, true
-		}
-	}
-	return "", false
-}
-
-// dupFinder tracks the paths that the file has defined so far.
-type dupFinder struct {
-	seen     map[string]struct{}
-	current  string // path of the current table
-	policies int    // number of [[policy]] headers so far
-}
-
-// define records a path. It returns the path if it was already defined.
-func (f *dupFinder) define(path string) string {
-	if _, dup := f.seen[path]; dup {
-		return path
-	}
-	f.seen[path] = struct{}{}
-	return ""
-}
-
-func (f *dupFinder) enterTable(parts []string) string {
-	// A table below [[policy]] belongs to the latest policy.
-	if parts[0] == "policy" && f.policies > 0 {
-		parts = slices.Clone(parts)
-		parts[0] = fmt.Sprintf("policy[%d]", f.policies-1)
-	}
-	f.current = strings.Join(parts, ".")
-	return f.define(f.current)
-}
-
-func (f *dupFinder) enterArrayTable(parts []string) {
-	if len(parts) == 1 && parts[0] == "policy" {
-		f.current = fmt.Sprintf("policy[%d]", f.policies)
-		f.policies++
-		return
-	}
-	f.current = strings.Join(parts, ".")
-}
-
-func (f *dupFinder) keyValue(parts []string) string {
-	for i := 1; i < len(parts); i++ { // a dotted key defines its tables
-		f.define(joinPath(f.current, strings.Join(parts[:i], ".")))
-	}
-	return f.define(joinPath(f.current, strings.Join(parts, ".")))
-}
-
-func joinPath(table, key string) string {
-	if table == "" {
-		return key
-	}
-	return table + "." + key
-}
-
-func keyParts(it unstable.Iterator) []string {
-	var parts []string
-	for it.Next() {
-		parts = append(parts, string(it.Node().Data))
-	}
-	return parts
 }
 
 // checkKeys rejects every key that is not spelled exactly as the schema
@@ -252,16 +189,16 @@ func keyParts(it unstable.Iterator) []string {
 // where the array indices are known, so each error names its exact path.
 // It also requires [[policy]] to be an array of tables.
 func checkKeys(tree map[string]any) error {
-	if err := checkTable("", tree, "dns", "addrbook", "policy"); err != nil {
+	if err := checkTable(nil, tree, "dns", "addrbook", "policy"); err != nil {
 		return err
 	}
 	if v, ok := tree["dns"]; ok {
-		if err := checkTableValue("dns", v, map[string]fieldKind{"listen": kindString, "upstream": kindStrings}); err != nil {
+		if err := checkTableValue(literal("dns"), v, map[string]fieldKind{"listen": kindString, "upstream": kindStrings}); err != nil {
 			return err
 		}
 	}
 	if v, ok := tree["addrbook"]; ok {
-		if err := checkTableValue("addrbook", v, map[string]fieldKind{"retain": kindString}); err != nil {
+		if err := checkTableValue(literal("addrbook"), v, map[string]fieldKind{"retain": kindString}); err != nil {
 			return err
 		}
 	}
@@ -271,16 +208,16 @@ func checkKeys(tree map[string]any) error {
 	}
 	list, ok := pol.([]any)
 	if !ok {
-		return &FieldError{Field: "policy", Err: errPolicyShape}
+		return newFieldError(literal("policy"), errPolicyShape)
 	}
 	for i, e := range list {
-		path := fmt.Sprintf("policy[%d]", i)
+		path := literal("policy").add(idxSeg(i))
 		kinds := map[string]fieldKind{"name": kindString, "to": kindStrings, "only_via": kindStrings, "deny_via": kindStrings, "scope": kindTable}
 		if err := checkTableValue(path, e, kinds); err != nil {
 			return err
 		}
 		if scope, ok := e.(map[string]any)["scope"]; ok {
-			if err := checkTableValue(path+".scope", scope, map[string]fieldKind{"users": kindStrings, "groups": kindStrings}); err != nil {
+			if err := checkTableValue(path.add(keySeg("scope")), scope, map[string]fieldKind{"users": kindStrings, "groups": kindStrings}); err != nil {
 				return err
 			}
 		}
@@ -305,10 +242,10 @@ const (
 // checkTableValue checks that v is a table that holds only the keys in
 // kinds, each with its kind of value. path is the table's own path.
 // Several keys can be wrong; the error names the first in key order.
-func checkTableValue(path string, v any, kinds map[string]fieldKind) error {
+func checkTableValue(path fieldPath, v any, kinds map[string]fieldKind) error {
 	m, ok := v.(map[string]any)
 	if !ok {
-		return &FieldError{Field: path, Err: typeError("a table")}
+		return newFieldError(path, typeError("a table"))
 	}
 	keys := slices.Sorted(maps.Keys(kinds))
 	if err := checkTable(path, m, keys...); err != nil {
@@ -319,34 +256,34 @@ func checkTableValue(path string, v any, kinds map[string]fieldKind) error {
 		if !ok {
 			continue
 		}
-		field := path + "." + k
+		field := path.add(keySeg(k))
 		switch kinds[k] {
 		case kindString:
 			if _, isStr := val.(string); !isStr {
-				return &FieldError{Field: field, Err: typeError("a string")}
+				return newFieldError(field, typeError("a string"))
 			}
 			continue
 		case kindTable:
 			if _, isTable := val.(map[string]any); !isTable {
-				return &FieldError{Field: field, Err: typeError("a table")}
+				return newFieldError(field, typeError("a table"))
 			}
 			continue
 		case kindStrings: // checked below
 		}
 		list, isList := val.([]any)
 		if !isList {
-			return &FieldError{Field: field, Err: typeError("an array of strings")}
+			return newFieldError(field, typeError("an array of strings"))
 		}
 		for i, e := range list {
 			if _, isStr := e.(string); !isStr {
-				return &FieldError{Field: fmt.Sprintf("%s[%d]", field, i), Err: typeError("a string")}
+				return newFieldError(field.add(idxSeg(i)), typeError("a string"))
 			}
 		}
 	}
 	return nil
 }
 
-func checkTable(path string, m map[string]any, allowed ...string) error {
+func checkTable(path fieldPath, m map[string]any, allowed ...string) error {
 	var unknown []string
 	for k := range m {
 		if !slices.Contains(allowed, k) {
@@ -357,11 +294,7 @@ func checkTable(path string, m map[string]any, allowed ...string) error {
 		return nil
 	}
 	slices.Sort(unknown) // the same file always gives the same error
-	field := unknown[0]
-	if path != "" {
-		field = path + "." + field
-	}
-	return &FieldError{Field: field, Err: errUnknownKey}
+	return newFieldError(path.add(keySeg(unknown[0])), errUnknownKey)
 }
 
 func (raw rawConfig) validate() (Config, error) {
@@ -381,7 +314,7 @@ func (raw rawConfig) validate() (Config, error) {
 			return Config{}, at(field, err)
 		}
 		if _, dup := seen[p.Name]; dup {
-			return Config{}, at(field+".name", fmt.Errorf("%w: %q", errNameDuplicate, p.Name))
+			return Config{}, at(field, at("name", fmt.Errorf("%w: %q", errNameDuplicate, p.Name)))
 		}
 		seen[p.Name] = struct{}{}
 		cfg.Policies = append(cfg.Policies, p)

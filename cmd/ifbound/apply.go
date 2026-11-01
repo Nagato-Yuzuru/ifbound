@@ -37,7 +37,7 @@ func newApplyCmd(d deps) *cobra.Command {
 				err = cfg.CheckUpstreams()
 			}
 			if err != nil {
-				return fmt.Errorf("%s: %w", path, err)
+				return configError(path, data, err)
 			}
 			rep, err := d.admin.Apply(cmd.Context(), data)
 			if err != nil {
@@ -50,6 +50,20 @@ func newApplyCmd(d deps) *cobra.Command {
 			return stateExit(rep.State)
 		},
 	}
+}
+
+// configError prefixes a configuration error with the file and, when the
+// error has it, the line and column: "<file>:<line>:<column>: <error>".
+// Without a place it prints "<file>: <error>".
+func configError(path string, data []byte, err error) error {
+	var fe *policy.FieldError
+	if errors.As(err, &fe) {
+		fe.Locate(data) // an error from the upstream check has no place yet
+		if fe.Line > 0 {
+			return fmt.Errorf("%s:%d:%d: %w", path, fe.Line, fe.Column, err)
+		}
+	}
+	return fmt.Errorf("%s: %w", path, err)
 }
 
 // completeToml completes the one file argument with .toml files. It never

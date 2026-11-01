@@ -22,7 +22,17 @@ linters:
     - sloglint
     - nolintlint
     - godox
+    - depguard
   settings:
+    depguard:
+      rules:
+        toml-position-walk:
+          # One walk over unstable.Parser gives the places of fields and finds
+          # duplicate keys. A second walker would drift from it.
+          files: ["$all", "!**/internal/policy/position.go"]
+          deny:
+            - pkg: github.com/pelletier/go-toml/v2/unstable
+              desc: walk the TOML text only in internal/policy/position.go (newIndex)
     errcheck:
       check-blank: true # a blank drop needs //nolint:errcheck with a reason; nolintlint enforces the reason
     godox:

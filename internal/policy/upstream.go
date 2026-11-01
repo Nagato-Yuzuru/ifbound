@@ -82,7 +82,7 @@ func (c Config) upstreamFindings() (faults []error, warnings []Warning) {
 				where := h.describe(c)
 				switch {
 				case !h.byName && blocked:
-					faults = append(faults, &FieldError{Field: h.field(), Err: fmt.Errorf("%w: %s, which allows no interface", errUnreachable, where)})
+					faults = append(faults, newFieldError(h.path(), fmt.Errorf("%w: %s, which allows no interface", errUnreachable, where)))
 				case !h.byName:
 					warnings = append(warnings, Warning{h.field(), where + ": ifbound-dns reaches this upstream only through the interfaces that the policy allows"})
 				case blocked:
@@ -118,7 +118,11 @@ func matchUpstream(d Destination, u Upstream) (upstreamHit, bool) {
 // field is the path of the destination list. It has no index: Parse
 // removes duplicate destinations, so the index in Policy.To can differ
 // from the index in the file.
-func (h upstreamHit) field() string { return fmt.Sprintf("policy[%d].to", h.policy) }
+func (h upstreamHit) path() fieldPath {
+	return fieldPath{keySeg("policy"), idxSeg(h.policy), keySeg("to")}
+}
+
+func (h upstreamHit) field() string { return h.path().String() }
 
 func (h upstreamHit) describe(c Config) string {
 	u := c.DNS.Upstream[h.upstream]
