@@ -1,0 +1,9 @@
+.:10053 {
+	bind 127.0.0.1
+	errors {
+		consolidate 1m ".*"
+	}
+	ifbound "/var/run/ifbound/report.sock"
+	cache
+	forward . tls://9.9.9.9%dns.quad9.net:853 tls://[2606:4700:4700::1111%one.one.one.one]:853
+}
