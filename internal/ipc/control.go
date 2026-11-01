@@ -246,7 +246,10 @@ func (c *ControlClient) Status(ctx context.Context) (StatusReport, error) {
 // not a reply of the server (ErrUnavailable, ErrDenied, or the context
 // error), a request that reaches the server later does not apply cfg. A
 // request that the server started in time can have applied cfg: Status
-// shows the hash of the applied configuration.
+// shows the hash of the applied configuration. The error has ErrNoReply
+// exactly when the client sent the whole request: then the server can
+// have applied cfg. A dial failure, a wrong server uid, and a context
+// that ended before the send never have it.
 func (c *ControlClient) Apply(ctx context.Context, cfg []byte) (StatusReport, error) {
 	if len(cfg) == 0 {
 		return StatusReport{}, errNoConfig
@@ -267,6 +270,9 @@ func (c *ControlClient) call(ctx context.Context, req func(context.Context) enve
 	body, err := c.roundTrip(ctx, env)
 	if err != nil {
 		if ctx.Err() != nil {
+			if errors.Is(err, ErrNoReply) {
+				return StatusReport{}, fmt.Errorf("requesting %s: %w: %w", env.Type, ctx.Err(), ErrNoReply)
+			}
 			return StatusReport{}, fmt.Errorf("requesting %s: %w", env.Type, ctx.Err())
 		}
 		return StatusReport{}, err

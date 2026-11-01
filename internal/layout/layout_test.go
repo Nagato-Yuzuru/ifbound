@@ -16,6 +16,7 @@ func TestDefaultPaths(t *testing.T) {
 		{l.Snapshot(), "/var/db/ifbound/addrbook.json"},
 		{l.ReportSocket(), "/var/run/ifbound/report.sock"},
 		{l.ControlSocket(), "/var/run/ifbound/control.sock"},
+		{l.AdminSocket(), "/var/run/ifbound/admin.sock"},
 		{l.DaemonLog(), "/var/log/ifbound/ifboundd.log"},
 		{l.DNSLog(), "/var/log/ifbound/ifbound-dns.log"},
 		{l.LibexecDir, "/usr/local/libexec/ifbound"},
