@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -62,8 +63,8 @@ func (e Exec) Run(ctx context.Context, stdin []byte, args ...string) (Output, er
 // blocks, and writes numeric IDs), so the ID cannot be computed again
 // from the rules that the kernel prints. A label keeps its text. A label
 // holds at most 63 bytes, so the 32-byte digest goes in as 43 characters
-// of unpadded base64url. A second sentinel rule carries the pf token of
-// ifbound in the same way.
+// of unpadded base64url. A token rule carries one pf token of ifbound in
+// the same way: the value and the creation time, "<value>.<unix seconds>".
 //
 // The rules match only packets with the tag sentinelTag, and no rule
 // sets that tag: every tag of a policy starts with "ifbound.". So the
@@ -84,9 +85,29 @@ func sentinel(id string) (string, error) {
 	return labelRule(labelPrefix + base64.RawURLEncoding.EncodeToString(sum)), nil
 }
 
-// tokenRule returns the sentinel rule for a pf token. A token is a
-// decimal number of at most 20 digits.
-func tokenRule(token string) string { return labelRule(tokenPrefix + token) }
+// token is a pf reference token. pf gives a released value again, also
+// to another process, so only the value with its creation time names
+// one reference.
+type token struct {
+	value   string // a decimal number of at most 20 digits
+	created int64  // Unix time in seconds
+}
+
+// tokenSkew is the largest difference in seconds between two creation
+// times of the same reference. pfctl prints the age of a reference in
+// whole seconds, and the Backend reads the clock after pfctl returns.
+const tokenSkew = 2
+
+// same reports whether r is the reference of t.
+func (t token) same(r token) bool {
+	d := t.created - r.created
+	return t.value == r.value && d >= -tokenSkew && d <= tokenSkew
+}
+
+// tokenRule returns the token rule for a pf token.
+func tokenRule(t token) string {
+	return labelRule(tokenPrefix + t.value + "." + strconv.FormatInt(t.created, 10))
+}
 
 func labelRule(label string) string {
 	return `block drop out quick tagged "` + sentinelTag + `" label "` + label + `"` + "\n"
@@ -95,7 +116,7 @@ func labelRule(label string) string {
 // parseRuleset reads the output of "pfctl -a <anchor>/* -sr": the rules
 // of the anchor, each referenced sub-anchor with its rules between braces,
 // recursively. It returns the ruleset ID from the sentinel rule, and the
-// token from the token rule ("" when there is not exactly one).
+// tokens from the token rules.
 //
 // The ID is "" when there is not exactly one valid sentinel rule, or when
 // the output holds a rule that the ruleset of ifbound does not write: a
@@ -103,8 +124,8 @@ func labelRule(label string) string {
 // an anchor rule. pf prints the rules of a sub-anchor indented below its
 // anchor rule. A block rule that another tool adds only blocks more, so
 // it does not change the ID.
-func parseRuleset(out []byte) (id, token string) {
-	var ids, tokens []string
+func parseRuleset(out []byte) (id string, tokens []token) {
+	var ids []string
 	foreign := false
 	for line := range strings.Lines(string(out)) {
 		line = strings.TrimRight(line, "\r\n")
@@ -123,13 +144,10 @@ func parseRuleset(out []byte) (id, token string) {
 			}
 		}
 	}
-	if len(tokens) == 1 {
-		token = tokens[0]
-	}
 	if len(ids) != 1 || foreign {
-		return "", token
+		return "", tokens
 	}
-	return ids[0], token
+	return ids[0], tokens
 }
 
 // labelID returns the ruleset ID in the label of a sentinel rule. A
@@ -151,16 +169,60 @@ func labelID(rule string) (string, bool) {
 }
 
 // labelToken returns the pf token in the label of a token rule.
-func labelToken(rule string) (string, bool) {
+func labelToken(rule string) (token, bool) {
 	_, rest, ok := strings.Cut(rule, `label "`+tokenPrefix)
 	if !ok {
-		return "", false
+		return token{}, false
 	}
 	text, _, ok := strings.Cut(rest, `"`)
-	if !ok || text == "" || strings.ContainsFunc(text, func(r rune) bool { return r < '0' || r > '9' }) {
-		return "", false
+	if !ok {
+		return token{}, false
 	}
-	return text, true
+	value, created, ok := strings.Cut(text, ".")
+	if !ok || !isDigits(value) || !isDigits(created) {
+		return token{}, false
+	}
+	sec, err := strconv.ParseInt(created, 10, 64)
+	if err != nil {
+		return token{}, false
+	}
+	return token{value: value, created: sec}, true
+}
+
+func isDigits(s string) bool {
+	return s != "" && !strings.ContainsFunc(s, func(r rune) bool { return r < '0' || r > '9' })
+}
+
+// parseReferences reads the output of "pfctl -s References" on macOS 27:
+//
+//	TOKENS:
+//	PID      Process Name                 TOKEN                    TIMESTAMP
+//	796      pfctl                        3634474195142116324      0 days 00:00:05
+//
+// TIMESTAMP is the age of the reference. The creation time of each token
+// is now minus its age. A process name can hold spaces, so the fields
+// count from the end of the line. A line in another format is skipped:
+// the Backend then gives back no token for it.
+func parseReferences(out []byte, now time.Time) []token {
+	var refs []token
+	for line := range strings.Lines(string(out)) {
+		f := strings.Fields(line)
+		n := len(f)
+		if n < 5 || f[n-2] != "days" || !isDigits(f[n-4]) {
+			continue
+		}
+		days, err := strconv.ParseInt(f[n-3], 10, 64)
+		if err != nil {
+			continue
+		}
+		var h, m, sec int64
+		if _, err := fmt.Sscanf(f[n-1], "%d:%d:%d", &h, &m, &sec); err != nil {
+			continue
+		}
+		age := ((days*24+h)*60+m)*60 + sec
+		refs = append(refs, token{value: f[n-4], created: now.Unix() - age})
+	}
+	return refs
 }
 
 // tokenGone reports whether the stderr of "pfctl -X" says that pf does

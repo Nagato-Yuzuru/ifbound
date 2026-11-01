@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfbackend"
 )
@@ -26,8 +27,14 @@ var errKernelExit = errors.New("exit status 1")
 // kernel state outlives ifboundd.
 type kernel struct {
 	enabled bool
-	// refs holds the reference tokens of "pfctl -E".
+	// refs holds the reference tokens of "pfctl -E", and born the time
+	// when each one was taken. pf gives a released value again, also to
+	// another process: free holds the released values, and the next
+	// enable takes the last one.
 	refs    []string
+	born    map[string]time.Time
+	free    []string
+	now     func() time.Time
 	nextTok int
 	// mainRules and mainNat are the filter and the NAT rules of the main
 	// ruleset.
@@ -67,6 +74,8 @@ func newKernel() *kernel {
 		},
 		nat:    map[string][]string{},
 		tables: map[string]map[string]map[netip.Prefix]bool{},
+		born:   map[string]time.Time{},
+		now:    time.Now,
 		ifaces: []string{"ALL", "en0", "lo0", "utun4"},
 	}
 }
@@ -178,9 +187,15 @@ func (k *kernel) enableRef() (pfbackend.Output, error) {
 		msg = "pf already enabled\n"
 	}
 	k.enabled = true
-	k.nextTok++
-	tok := strconv.Itoa(7000000 + k.nextTok)
+	var tok string
+	if n := len(k.free); n > 0 {
+		tok, k.free = k.free[n-1], k.free[:n-1]
+	} else {
+		k.nextTok++
+		tok = strconv.Itoa(7000000 + k.nextTok)
+	}
 	k.refs = append(k.refs, tok)
+	k.born[tok] = k.now()
 	return pfbackend.Output{Stderr: []byte("No ALTQ support in kernel\nALTQ related functions disabled\n" + msg + "Token : " + tok + "\n")}, nil
 }
 
@@ -195,6 +210,7 @@ func (k *kernel) releaseRef(tok string) (pfbackend.Output, error) {
 		return failure("pf: token invalid")
 	}
 	k.refs = slices.Delete(k.refs, i, i+1)
+	k.free = append(k.free, tok)
 	if len(k.refs) == 0 {
 		k.enabled = false
 		return pfbackend.Output{Stderr: []byte("pf disabled\n")}, nil
@@ -278,6 +294,10 @@ func (k *kernel) flushCmd(p pfctlArgs) (pfbackend.Output, error) {
 		}
 	case "nat":
 		k.nat[p.anchor] = nil
+	case "Tables":
+		n := len(k.tables[p.anchor])
+		delete(k.tables, p.anchor)
+		return pfbackend.Output{Stderr: []byte(strconv.Itoa(n) + " tables deleted.\n")}, nil
 	default:
 		return failure("kernel model: unmodeled flush " + p.flush)
 	}
@@ -311,12 +331,30 @@ func (k *kernel) showCmd(p pfctlArgs) (pfbackend.Output, error) {
 		return stdout(k.listAnchors(p.anchor, p.verbose)), nil
 	case "T", "Tables":
 		return stdout(joinLines(slices.Sorted(maps.Keys(k.tables[p.anchor])))), nil
+	case "References":
+		return k.showReferences(), nil
 	case "I", "Interfaces":
 		return stdout(joinLines(k.ifaces)), nil
 	case "s", "state", "states":
 		return stdout(k.showStates()), nil
 	}
 	return failure("kernel model: unmodeled show " + p.show)
+}
+
+// showReferences prints the references as "pfctl -s References" does on
+// macOS 27: TIMESTAMP is the age of the reference.
+func (k *kernel) showReferences() pfbackend.Output {
+	if len(k.refs) == 0 {
+		return pfbackend.Output{Stderr: []byte("No pf starter references held\n")}
+	}
+	var b strings.Builder
+	b.WriteString("TOKENS:\nPID      Process Name                 TOKEN                    TIMESTAMP\n")
+	for i, tok := range k.refs {
+		age := int64(k.now().Sub(k.born[tok]).Seconds())
+		fmt.Fprintf(&b, "%-8d %-28s %-24s %d days %02d:%02d:%02d\n", 800+i, "pfctl", tok,
+			age/86400, age/3600%24, age/60%60, age%60)
+	}
+	return stdout(b.String())
 }
 
 // showStates prints the states as "pfctl -s state" does on macOS 27. Each

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The outputs below are captured from pfctl on macOS 27.0 (26A428) in a
@@ -22,7 +23,7 @@ block return-icmp(port-unr, port-unr) out quick from any to <doh>
 block return-icmp(port-unr, port-unr) out quick from any to <doh> user = 299
 block return-icmp(port-unr, port-unr) out quick from any to <bing> ! tagged ifbound.bing
 block drop out quick all label "ifbound-ruleset:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" tagged ifbound-id
-block drop out quick all label "ifbound-token:13772037947654164677" tagged ifbound-id
+block drop out quick all label "ifbound-token:13772037947654164677.1793350000" tagged ifbound-id
 `
 
 // capturedForeign is the same anchor after another tool loaded rules into
@@ -88,22 +89,78 @@ func TestSentinelRoundTrip(t *testing.T) {
 }
 
 func TestTokenRoundTrip(t *testing.T) {
-	tok := "13772037947654164677"
+	tok := token{value: "18446744073709551615", created: 9999999999}
 	r := tokenRule(tok)
 	if label, _, _ := strings.Cut(strings.SplitN(r, `label "`, 2)[1], `"`); len(label) > 63 {
 		t.Errorf("label %q has %d bytes, pf takes at most 63", label, len(label))
 	}
-	if _, got := parseRuleset([]byte(capturedRuleset)); got != tok {
-		t.Errorf("token read back from the captured ruleset = %q, want %q", got, tok)
+	if _, got := parseRuleset([]byte(r)); !slices.Equal(got, []token{tok}) {
+		t.Errorf("tokens read back from %q = %v, want %v", r, got, tok)
+	}
+	want := []token{{value: "13772037947654164677", created: 1793350000}}
+	if _, got := parseRuleset([]byte(capturedRuleset)); !slices.Equal(got, want) {
+		t.Errorf("tokens read back from the captured ruleset = %v, want %v", got, want)
+	}
+	two := capturedRuleset + `block drop out quick all label "ifbound-token:1.2" tagged ifbound-id` + "\n"
+	if _, got := parseRuleset([]byte(two)); len(got) != 2 {
+		t.Errorf("tokens read back from two token rules = %v, want two", got)
 	}
 	for _, out := range []string{
 		"",
-		capturedRuleset + `block drop out quick all label "ifbound-token:1" tagged ifbound-id` + "\n",
-		`block drop out quick all label "ifbound-token:12x" tagged ifbound-id` + "\n",
+		`block drop out quick all label "ifbound-token:13772037947654164677" tagged ifbound-id` + "\n",
+		`block drop out quick all label "ifbound-token:12x.5" tagged ifbound-id` + "\n",
+		`block drop out quick all label "ifbound-token:12.x" tagged ifbound-id` + "\n",
+		`block drop out quick all label "ifbound-token:.5" tagged ifbound-id` + "\n",
 		`block drop out quick all label "ifbound-token:" tagged ifbound-id` + "\n",
 	} {
-		if _, got := parseRuleset([]byte(out)); got != "" {
-			t.Errorf("token read back from %q = %q, want none", out, got)
+		if _, got := parseRuleset([]byte(out)); len(got) != 0 {
+			t.Errorf("tokens read back from %q = %v, want none", out, got)
+		}
+	}
+}
+
+// capturedReferences is "pfctl -s References" with two references, 8 s
+// after the first "pfctl -E".
+const capturedReferences = `TOKENS:
+PID      Process Name                 TOKEN                    TIMESTAMP
+796      pfctl                        3634474195142116324      0 days 00:00:05
+792      pfctl                        9418272877687921726      0 days 00:00:08
+`
+
+func TestParseReferences(t *testing.T) {
+	now := time.Unix(1793350000, 0)
+	want := []token{
+		{value: "3634474195142116324", created: 1793350000 - 5},
+		{value: "9418272877687921726", created: 1793350000 - 8},
+	}
+	if got := parseReferences([]byte(capturedReferences), now); !slices.Equal(got, want) {
+		t.Errorf("parseReferences = %v, want %v", got, want)
+	}
+	long := "801      Some VPN Helper              42                       2 days 03:04:05\n"
+	if got := parseReferences([]byte(long), now); !slices.Equal(got, []token{{value: "42", created: 1793350000 - (2*86400 + 3*3600 + 4*60 + 5)}}) {
+		t.Errorf("parseReferences with a name with spaces = %v", got)
+	}
+	for _, out := range []string{"No pf starter references held\n", "TOKENS:\nPID Process Name TOKEN TIMESTAMP\n"} {
+		if got := parseReferences([]byte(out), now); len(got) != 0 {
+			t.Errorf("parseReferences(%q) = %v, want none", out, got)
+		}
+	}
+}
+
+func TestTokenSame(t *testing.T) {
+	tok := token{value: "7", created: 100}
+	for _, tt := range []struct {
+		r    token
+		want bool
+	}{
+		{token{value: "7", created: 100}, true},
+		{token{value: "7", created: 100 + tokenSkew}, true},
+		{token{value: "7", created: 100 - tokenSkew}, true},
+		{token{value: "7", created: 100 + tokenSkew + 1}, false},
+		{token{value: "8", created: 100}, false},
+	} {
+		if got := tok.same(tt.r); got != tt.want {
+			t.Errorf("%v.same(%v) = %v, want %v", tok, tt.r, got, tt.want)
 		}
 	}
 }
