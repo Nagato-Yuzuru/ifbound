@@ -40,6 +40,7 @@ type World struct {
 	bproblem []reconcile.Problem
 	rproblem []reconcile.Problem
 	writes   int
+	ended    []netip.Prefix
 	before   func(n int) error
 	after    func()
 }
@@ -123,6 +124,16 @@ func (w *World) Writes() int {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.writes
+}
+
+// EndedStates returns, in call order, each entry whose states a Load or
+// an AddEntries ended. Load ends the states to every entry of every
+// table, tables in name order; AddEntries ends the states to the entries
+// that it gets. A failed write ends no state.
+func (w *World) EndedStates() []netip.Prefix {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.ended)
 }
 
 // Ruleset returns the loaded ruleset.
@@ -279,6 +290,10 @@ func (b *Backend) Load(_ context.Context, rs reconcile.Ruleset) error {
 				b.w.tables[name] = make(map[netip.Prefix]struct{})
 			}
 		}
+		tables := b.w.tablesLocked()
+		for _, name := range slices.Sorted(maps.Keys(tables)) {
+			b.w.ended = append(b.w.ended, tables[name]...)
+		}
 	})
 }
 
@@ -293,6 +308,7 @@ func (b *Backend) AddEntries(_ context.Context, table policy.Name, entries []net
 		for _, e := range entries {
 			t[e] = struct{}{}
 		}
+		b.w.ended = append(b.w.ended, entries...)
 	})
 }
 

@@ -442,10 +442,33 @@ func TestCompileProperties(t *testing.T) {
 		checkDeterministic(t, seed, r, w, rs)
 		tables, rules := readRuleset(t, text)
 		checkStructure(t, seed, w, rs, tables, rules)
+		checkSelected(t, seed, w, rs)
 		for range 300 {
 			p := randomPacket(r, w)
 			if got, want := pfBlocks(rules, p), wantBlocks(w, p); got != want {
 				t.Fatalf("seed %d: packet %+v: blocked = %v, want %v\nruleset:\n%s", seed, p, got, want, text)
+			}
+		}
+	}
+}
+
+// checkSelected checks that Ruleset.Selected lists each current
+// interface that the selectors of a policy select, and no other current
+// interface. The Reconciler takes its verdicts from this selection.
+func checkSelected(t *testing.T, seed int, w world, rs reconcile.Ruleset) {
+	t.Helper()
+	for _, pol := range w.policies {
+		sel, ok := rs.Selected(pol.Name)
+		if !ok {
+			t.Fatalf("seed %d: no selection for policy %s", seed, pol.Name)
+		}
+		_, only := pol.Constraint.(policy.OnlyVia)
+		for _, i := range w.ifaces {
+			hit := slices.ContainsFunc(pol.Constraint.Selectors(), func(s policy.InterfaceSelector) bool {
+				return selects(s, i.Name, w.classes, !only)
+			})
+			if got := slices.Contains(sel, i.Name); got != hit {
+				t.Fatalf("seed %d: policy %s: %s in the selection = %v, want %v (selection %v)", seed, pol.Name, i.Name, got, hit, sel)
 			}
 		}
 	}

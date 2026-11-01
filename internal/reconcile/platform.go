@@ -84,6 +84,7 @@ type Ruleset struct {
 	id       string
 	body     []byte
 	problems []Problem
+	selected map[policy.Name][]string
 }
 
 // NewRuleset returns a ruleset with an ID that is a digest of body. Equal
@@ -107,6 +108,26 @@ func (r Ruleset) Body() []byte { return bytes.Clone(r.body) }
 // for example a scope that it dropped because an account is unknown.
 func (r Ruleset) Problems() []Problem { return slices.Clone(r.problems) }
 
+// WithSelected returns a copy of r that reports, for each policy, the
+// names of the interfaces that the selectors of its constraint resolved
+// to: the allowed interfaces of only_via, the denied interfaces of
+// deny_via. The selection does not change the ID.
+func (r Ruleset) WithSelected(selected map[policy.Name][]string) Ruleset {
+	r.selected = make(map[policy.Name][]string, len(selected))
+	for name, ifaces := range selected {
+		r.selected[name] = slices.Clone(ifaces)
+	}
+	return r
+}
+
+// Selected returns a copy of the interface names that the selectors of
+// a policy resolved to. ok is false when the Compiler did not report the
+// policy.
+func (r Ruleset) Selected(name policy.Name) (ifaces []string, ok bool) {
+	ifaces, ok = r.selected[name]
+	return slices.Clone(ifaces), ok
+}
+
 // Compiler turns policies, interfaces, and accounts into a ruleset.
 //
 // Contract:
@@ -119,6 +140,11 @@ func (r Ruleset) Problems() []Problem { return slices.Clone(r.problems) }
 //     not select an interface that is not in ifaces. So only_via fails
 //     closed for a new interface, and deny_via fails open for it until
 //     the next convergence compiles it in. That window is accepted.
+//   - The ruleset reports the selection of each policy (see
+//     Ruleset.WithSelected), as the rules apply it, so the Reconciler
+//     knows which current interfaces each policy denies. For a policy
+//     without a selection, the Reconciler takes every current interface
+//     as denied.
 //   - When the Compiler cannot make a part of a policy hold as written,
 //     it either fails, or it writes a stricter rule and reports the fault
 //     in Ruleset.Problems. It never writes a weaker rule. An uncertain
@@ -165,6 +191,9 @@ type BackendState struct {
 //     rule then uses it.
 //   - After Load or AddEntries, existing connection states obey the new
 //     enforcement: the Backend ends the states that the new rules block.
+//     AddEntries ends the states to each entry that it gets, also to an
+//     entry that the table holds already. The Reconciler uses this to end
+//     states after an interface change that leaves the ruleset the same.
 //   - The rules of ifbound are evaluated before any rule of the main
 //     ruleset that can match the same traffic and end the evaluation. If
 //     the Backend sees that this does not hold (the anchor is not
