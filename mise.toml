@@ -18,11 +18,12 @@ env = { GOOS = "darwin", GOARCH = "arm64", CGO_ENABLED = "0" }
 run = "go test -c -tags e2e -o bin/e2e.test ./e2e"
 
 [tasks.e2e]
-description = "Run end-to-end tests as root on this host. Use only on a disposable host (CI, VM)"
+description = "Run end-to-end tests as root on this host. They run only where /var/db/ifbound-e2e-disposable exists (CI, VM)"
 depends = ["e2e:build"]
+# This task does not create the marker, so that it changes nothing on a
+# development host.
 run = '''
 sudo env \
-  IFBOUND_E2E_DISPOSABLE="${IFBOUND_E2E_DISPOSABLE:-}" \
   IFBOUND_E2E_STRICT="${IFBOUND_E2E_STRICT:-}" \
   ./bin/e2e.test -test.v
 '''
@@ -52,10 +53,11 @@ if ! tart exec "$vm" true 2>/dev/null; then
     sleep 2
   done
 fi
+# The marker tells the tests that this guest is disposable.
+tart exec "$vm" sudo touch /var/db/ifbound-e2e-disposable
 # The guest agent's PATH does not include /sbin, where ifconfig and pfctl are.
 tart exec "$vm" sudo env \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
-  IFBOUND_E2E_DISPOSABLE=1 \
   IFBOUND_E2E_STRICT=1 \
   "/Volumes/My Shared Files/ifbound/bin/e2e.test" -test.v
 '''

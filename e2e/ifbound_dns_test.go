@@ -100,7 +100,6 @@ func renderedWithHosts(t *testing.T, sock string) []byte {
 // as root in the guest. Both queries must wait for the ack: ifbound stands
 // before cache in the rendered Corefile, so a cache hit does not skip it.
 func TestRenderedCorefileHoldsEachAnswerUntilTheAck(t *testing.T) {
-	testenv.RequireDisposableHost(t)
 	testenv.RequireRoot(t)
 	if err := registerPlugin(); err != nil {
 		t.Fatalf("Register: %v", err)
