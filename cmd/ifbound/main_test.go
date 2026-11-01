@@ -274,6 +274,64 @@ func TestApplyBadFileDoesNotCallTheServer(t *testing.T) {
 	}
 }
 
+func TestApplyConfigErrorPrintsFileLineColumn(t *testing.T) {
+	const (
+		dns = "[dns]\nupstream = [\"tls://1.1.1.1@a.b\"]\n"
+		pol = dns + "[[policy]]\nname = \"p\"\nto = [\"1.1.1.1\"]\nonly_via = []\n" // the next line is line 7
+	)
+	tests := []struct {
+		name, config, want string
+	}{
+		{"dotted key typo", pol + "scop.users = [\"a\"]\n", ":7:1: \"policy[0].scop\": unknown key"},
+		{"dotted key in dns", dns + "foo.bar = 1\n", ":3:1: \"dns.foo\": unknown key"},
+		{"dotted key where a string belongs", "[dns]\nlisten.x = 1\n", ":2:1: \"dns.listen\": "},
+		{"implicit table from a header", dns + "[policy.scope]\nusers = [\"a\"]\n", ":3:2: \"policy\": "},
+		{"array of tables where a table belongs", pol + "[[policy.scope]]\nusers = [\"a\"]\n", ":7:10: \"policy[0].scope\": "},
+		{"dotted key: the part that ends the field", pol + "scope.userz = [\"a\"]\n", ":7:7: \"policy[0].scope.userz\": unknown key"},
+		{"subtable header: the last part", dns + "[dns.foo]\n", ":3:6: \"dns.foo\": unknown key"},
+		{"prefix of a header takes its own part", dns + "[dns.foo.bar]\n", ":3:6: \"dns.foo\": unknown key"},
+		{"prefix of a dotted key takes its own part", pol + "scope.userz.x = 1\n", ":7:7: \"policy[0].scope.userz\": unknown key"},
+		{"quoted key that spells an element", pol + "\"to[0]\" = 1\n", ":7:1: \"policy[0].to[0]\": unknown key"},
+		{
+			"quoted key that spells a path in an inline table",
+			"dns = { upstream = [\"tls://1.1.1.1@a.b\"] }\n\"dns.upstream\" = 1\n",
+			":2:1: \"dns.upstream\": unknown key",
+		},
+		{"nested array after a comment", "# c\n[dns]\nupstream = [[\"tls://1.1.1.1@a.b\"]]\n", ":3:1: \"dns.upstream[0]\": "},
+		{"three duplicate keys", dns + "[addrbook]\nretain = \"1h\"\nretain = \"2h\"\nretain = \"3h\"\n", ":5:1: \"addrbook.retain\": "},
+		{"three duplicate tables", dns + "[addrbook]\n[addrbook]\n[addrbook]\n", ":4:2: \"addrbook\": "},
+		{"element of an inline table", pol + "scope = { users = [\"ok\", \"bad user\"] }\n", ":7:26: \"policy[0].scope.users[1]\": "},
+		{"byte column of a field error", pol + "scope = { users = [\"é\"], bad = 1 }\n", ":7:27: \"policy[0].scope.bad\": unknown key"},
+		{"byte column of a syntax error", dns + "listen = \"é\" x\n", ":3:15: "},
+		{"empty key in dns", dns + "\"\" = 1\n", ":3:1: \"dns.\": unknown key"},
+		{"missing bracket", "[dns]\nupstream = [\"tls://1.1.1.1@a.b\"\n", ":2:32: "},
+		{"unknown key", "[dns]\nupstream = [\"tls://1.1.1.1@a.b\"]\ncolour = 1\n", ":3:1: \"dns.colour\": unknown key"},
+		{
+			"invalid address",
+			"[dns]\nupstream = [\"tls://1.1.1.1@a.b\"]\n[[policy]]\nname = \"a\"\nto = [\"1.1.1.1\"]\nonly_via = []\n" +
+				"[[policy]]\nname = \"b\"\nto = [\"bad host\"]\nonly_via = []\n",
+			":9:7: \"policy[1].to[0]\": ",
+		},
+		{
+			// The check of the upstreams runs on the parsed value: the CLI finds the place in the text.
+			"upstream check",
+			"[dns]\nupstream = [\"tls://1.1.1.1@a.b\"]\n[[policy]]\nname = \"p\"\nto = [\"1.1.1.0/24\"]\nonly_via = []\n",
+			":5:1: \"policy[0].to\": ifbound-dns can never reach an upstream",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			file := writeFile(t, tt.config)
+
+			got := execute(t, deps{admin: serveAdmin(t, ready())}, "apply", file)
+
+			if got.code != 1 || !strings.Contains(got.stderr, file+tt.want) {
+				t.Errorf("exit = %d, stderr = %q, want 1 and %q", got.code, got.stderr, file+tt.want)
+			}
+		})
+	}
+}
+
 func TestApplyMissingFileNamesThePathOnce(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "none.toml")
 
