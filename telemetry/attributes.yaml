@@ -4,6 +4,10 @@
 # The annotation go.name is the name of the Go constant that holds the key
 # or the value. Other packages import the constants. The name of a constant
 # for a semantic convention attribute comes from its key.
+#
+# A semantic convention attribute takes the values that ifbound writes from
+# the annotation go.members: each member has a value, a brief, and the name
+# of its Go constant. Each value is snake_case.
 file_format: definition/2
 
 attributes:
@@ -16,7 +20,7 @@ attributes:
           stability: development
           annotations: {go: {name: TriggerStart}}
         - id: ruleset_changed
-          value: "ruleset changed"
+          value: "ruleset_changed"
           brief: A request left a recheck of the ruleset pending.
           stability: development
           annotations: {go: {name: TriggerRulesetChanged}}
@@ -26,7 +30,7 @@ attributes:
           stability: development
           annotations: {go: {name: TriggerInterfaces}}
         - id: self_heal
-          value: "self-heal"
+          value: "self_heal"
           brief: The self-heal timer ticked, after a new read of the accounts.
           stability: development
           annotations: {go: {name: TriggerSelfHeal}}
@@ -36,7 +40,7 @@ attributes:
           stability: development
           annotations: {go: {name: TriggerAccounts}}
         - id: self_test
-          value: "self-test"
+          value: "self_test"
           brief: The warm-up self-test result asked for a convergence.
           stability: development
           annotations: {go: {name: TriggerSelfTest}}
@@ -59,6 +63,12 @@ attributes:
     brief: The number of kernel writes that the convergence made.
     examples: [3]
     annotations: {go: {name: ConvergeWrites}}
+  - key: ifbound.converge.duration_ms
+    type: int
+    stability: development
+    brief: The time that the convergence took, in milliseconds.
+    examples: [12]
+    annotations: {go: {name: ConvergeDurationMS}}
   - key: ifbound.enforcement.state
     type:
       members:
@@ -97,44 +107,24 @@ attributes:
     examples:
       - ["convergence failed: pfctl failed"]
     annotations: {go: {name: EnforcementReasons}}
-  - key: ifbound.account.kind
-    type:
-      members:
-        - id: user
-          value: "user"
-          brief: A user account.
-          stability: development
-          annotations: {go: {name: AccountKindUser}}
-        - id: group
-          value: "group"
-          brief: A group account.
-          stability: development
-          annotations: {go: {name: AccountKindGroup}}
+  - key: ifbound.account.users
+    type: string[]
     stability: development
-    brief: The kind of the account that the daemon looked up.
-    annotations: {go: {name: AccountKind}}
-  - key: ifbound.account.name
-    type: string
+    brief: The user accounts whose lookup failed in the account read.
+    examples:
+      - ["alice", "bob"]
+    annotations: {go: {name: AccountUsers}}
+  - key: ifbound.account.groups
+    type: string[]
     stability: development
-    brief: The name of the user or group account that the daemon looked up.
-    examples: ["alice"]
-    annotations: {go: {name: AccountName}}
-  - key: ifbound.hosts.name
-    type: string
-    stability: development
-    brief: A name from the host file. It is not a DNS query name.
-    examples: ["example.com"]
-    annotations: {go: {name: HostsName}}
-  - key: ifbound.hosts.line
-    type: int
-    stability: development
-    brief: The line number in the host file.
-    examples: [12]
-    annotations: {go: {name: HostsLine}}
+    brief: The group accounts whose lookup failed in the account read.
+    examples:
+      - ["admin"]
+    annotations: {go: {name: AccountGroups}}
   - key: ifbound.hosts.names
     type: string[]
     stability: development
-    brief: The names on a line of the host file.
+    brief: The names from the host file that the event is about.
     examples:
       - ["example.com", "www.example.com"]
     annotations: {go: {name: HostsNames}}
@@ -157,14 +147,194 @@ attributes:
     examples: [50]
     annotations: {go: {name: BackoffMS}}
 
+  - key: ifbound.config.digest
+    type: string
+    stability: development
+    brief: The SHA-256 of the stored configuration file, in lower-case hex.
+    examples: ["9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"]
+    annotations: {go: {name: ConfigDigest}}
+  - key: ifbound.config.previous_digest
+    type: string
+    stability: development
+    brief: >-
+      The SHA-256 of the stored configuration file that ran before the
+      event, in lower-case hex.
+    examples: ["2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"]
+    annotations: {go: {name: ConfigPreviousDigest}}
+  - key: ifbound.policy.names
+    type: string[]
+    stability: development
+    brief: The names of the policies that the event is about.
+    examples:
+      - ["work", "bank"]
+    annotations: {go: {name: PolicyNames}}
+  - key: ifbound.pf.states.cause
+    type:
+      members:
+        - id: narrowed
+          value: "narrowed"
+          brief: >-
+            The verdict of the policy on the interfaces narrowed, so a
+            connection that its rules now block must not go on.
+          stability: development
+          annotations: {go: {name: StatesCauseNarrowed}}
+    stability: development
+    brief: The reason that ifbound ended the pf connection states of the policies.
+    annotations: {go: {name: StatesCause}}
+  - key: ifbound.hosts.lines
+    type: string[]
+    stability: development
+    brief: >-
+      Lines of the host file. Each item is the line number and the names of
+      that line that the event is about.
+    examples:
+      - ["line 3: b..example.net.", "line 7: x..www.example.com"]
+    annotations: {go: {name: HostsLines}}
+  - key: ifbound.warmup.round
+    type: int
+    stability: development
+    brief: >-
+      The number of the warm-up round under the configuration. The first
+      round is 1.
+    examples: [1]
+    annotations: {go: {name: WarmUpRound}}
+  - key: ifbound.warmup.name_count
+    type: int
+    stability: development
+    brief: The number of names in the warm-up round.
+    examples: [4]
+    annotations: {go: {name: WarmUpNameCount}}
+  - key: ifbound.warmup.cancelled
+    type: boolean
+    stability: development
+    brief: >-
+      The round stopped before its end, because the configuration or the
+      state changed. The lists hold only the names that were done.
+    examples: [true]
+    annotations: {go: {name: WarmUpCancelled}}
+  - key: ifbound.warmup.unproven
+    type: string[]
+    stability: development
+    brief: >-
+      The names whose probe did not prove that their queries go to
+      ifbound-dns. The warm-up tries them again in the next round.
+    examples:
+      - ["example.com"]
+    annotations: {go: {name: WarmUpUnproven}}
+  - key: ifbound.warmup.failed
+    type: string[]
+    stability: development
+    brief: The names whose lookup failed after a good probe.
+    examples:
+      - ["example.com"]
+    annotations: {go: {name: WarmUpFailed}}
+  - key: ifbound.warmup.empty
+    type: string[]
+    stability: development
+    brief: >-
+      The names whose lookup gave no addresses in its time budget. This is
+      normal for the domain of a suffix destination.
+    examples:
+      - ["example.com"]
+    annotations: {go: {name: WarmUpEmpty}}
+  - key: ifbound.exit.reason
+    type:
+      members:
+        - id: stopped
+          value: "stopped"
+          brief: The process got a signal to stop.
+          stability: development
+          annotations: {go: {name: ExitStopped}}
+        - id: config_changed
+          value: "config_changed"
+          brief: >-
+            The [dns] section of the stored configuration changed. launchd
+            starts a new process with it.
+          stability: development
+          annotations: {go: {name: ExitConfigChanged}}
+        - id: failed
+          value: "failed"
+          brief: The process failed. error.type tells the class of the failure.
+          stability: development
+          annotations: {go: {name: ExitFailed}}
+    stability: development
+    brief: The reason that the process exits.
+    annotations: {go: {name: ExitReason}}
+
 attribute_groups:
   - id: ifbound.semconv
     visibility: public
     stability: development
     brief: Attributes from OpenTelemetry semantic conventions that ifbound emits.
     attributes:
-      - ref: dns.question.name
       - ref: error.type
+        brief: >-
+          The class of the failure. Each event that has it also has
+          exception.message.
+        examples: ["platform", "config_invalid"]
+        annotations:
+          go:
+            members:
+              - value: canceled
+                name: ErrorTypeCanceled
+                brief: >-
+                  The caller ended before the work started. Nothing changed. No action is needed.
+              - value: config_file
+                name: ErrorTypeConfigFile
+                brief: >-
+                  The stored configuration file cannot be read or written. Check the file, its directory, their owners and modes, and the free space.
+              - value: config_invalid
+                name: ErrorTypeConfigInvalid
+                brief: >-
+                  The configuration does not pass its checks. Nothing changed. Correct the configuration and apply it again.
+              - value: config_not_durable
+                name: ErrorTypeConfigNotDurable
+                brief: >-
+                  The new stored configuration file is in place, but the sync of its directory failed, so a crash can bring back the old file. Check the disk, then apply again.
+              - value: coredns
+                name: ErrorTypeCoreDNS
+                brief: >-
+                  CoreDNS did not start, or its shutdown failed. Check that the listen address is free.
+              - value: hosts_read
+                name: ErrorTypeHostsRead
+                brief: >-
+                  The host file exists, but it cannot be read. Check the file, its owner, and its mode.
+              - value: invariant
+                name: ErrorTypeInvariant
+                brief: >-
+                  A fact that the code relies on is false. The code of ifbound has an error: report it.
+              - value: lookup
+                name: ErrorTypeLookup
+                brief: >-
+                  A lookup of a name in a system service failed: an account name in the directory service, or a DNS name through the system resolver. Check that service.
+              - value: path
+                name: ErrorTypePath
+                brief: >-
+                  A path in the layout cannot go into the Corefile: it has a character that the Corefile does not allow, or the socket path is too long. Change the directory.
+              - value: peer_not_allowed
+                name: ErrorTypePeerNotAllowed
+                brief: >-
+                  A local process whose user ID the socket does not allow tried to connect.
+              - value: pf_token
+                name: ErrorTypePFToken
+                brief: >-
+                  ifbound cannot give back a pf reference token. The token stays in its label, and the next load tries again.
+              - value: platform
+                name: ErrorTypePlatform
+                brief: >-
+                  A read or a write of pf, the system resolver, or the interfaces failed. The self-heal timer tries again.
+              - value: probe
+                name: ErrorTypeProbe
+                brief: >-
+                  No probe proved that the queries for a name go to ifbound-dns. Check that ifbound-dns runs and that the system resolver sends the name to it.
+              - value: snapshot
+                name: ErrorTypeSnapshot
+                brief: >-
+                  The address book snapshot did not load, or the adoption of the kernel entries into it failed. The self-heal timer tries again.
+              - value: socket
+                name: ErrorTypeSocket
+                brief: >-
+                  A socket operation failed: accept, peer credentials, read, write, or the removal of the socket file.
       - ref: exception.message
         brief: The text of the error chain.
       - ref: file.path

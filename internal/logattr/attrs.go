@@ -8,14 +8,23 @@ package logattr
 
 // Log attribute names.
 const (
-	// The kind of the account that the daemon looked up.
-	AccountKind = "ifbound.account.kind"
+	// The group accounts whose lookup failed in the account read.
+	AccountGroups = "ifbound.account.groups"
 
-	// The name of the user or group account that the daemon looked up.
-	AccountName = "ifbound.account.name"
+	// The user accounts whose lookup failed in the account read.
+	AccountUsers = "ifbound.account.users"
 
 	// The wait before the next try, in milliseconds.
 	BackoffMS = "ifbound.backoff_ms"
+
+	// The SHA-256 of the stored configuration file, in lower-case hex.
+	ConfigDigest = "ifbound.config.digest"
+
+	// The SHA-256 of the stored configuration file that ran before the event, in lower-case hex.
+	ConfigPreviousDigest = "ifbound.config.previous_digest"
+
+	// The time that the convergence took, in milliseconds.
+	ConvergeDurationMS = "ifbound.converge.duration_ms"
 
 	// The cause of the convergence.
 	ConvergeTrigger = "ifbound.converge.trigger"
@@ -29,13 +38,13 @@ const (
 	// The enforcement state of the daemon.
 	EnforcementState = "ifbound.enforcement.state"
 
-	// The line number in the host file.
-	HostsLine = "ifbound.hosts.line"
+	// The reason that the process exits.
+	ExitReason = "ifbound.exit.reason"
 
-	// A name from the host file. It is not a DNS query name.
-	HostsName = "ifbound.hosts.name"
+	// Lines of the host file. Each item is the line number and the names of that line that the event is about.
+	HostsLines = "ifbound.hosts.lines"
 
-	// The names on a line of the host file.
+	// The names from the host file that the event is about.
 	HostsNames = "ifbound.hosts.names"
 
 	// The user ID of the process on the other end of a socket.
@@ -44,10 +53,31 @@ const (
 	// The name of the pf anchor that ifbound owns.
 	PFAnchor = "ifbound.pf.anchor"
 
-	// The name being queried.
-	DnsQuestionName = "dns.question.name"
+	// The reason that ifbound ended the pf connection states of the policies.
+	StatesCause = "ifbound.pf.states.cause"
 
-	// Describes a class of error the operation ended with.
+	// The names of the policies that the event is about.
+	PolicyNames = "ifbound.policy.names"
+
+	// The round stopped before its end, because the configuration or the state changed. The lists hold only the names that were done.
+	WarmUpCancelled = "ifbound.warmup.cancelled"
+
+	// The names whose lookup gave no addresses in its time budget. This is normal for the domain of a suffix destination.
+	WarmUpEmpty = "ifbound.warmup.empty"
+
+	// The names whose lookup failed after a good probe.
+	WarmUpFailed = "ifbound.warmup.failed"
+
+	// The number of names in the warm-up round.
+	WarmUpNameCount = "ifbound.warmup.name_count"
+
+	// The number of the warm-up round under the configuration. The first round is 1.
+	WarmUpRound = "ifbound.warmup.round"
+
+	// The names whose probe did not prove that their queries go to ifbound-dns. The warm-up tries them again in the next round.
+	WarmUpUnproven = "ifbound.warmup.unproven"
+
+	// The class of the failure. Each event that has it also has exception.message.
 	ErrorType = "error.type"
 
 	// The text of the error chain.
@@ -63,34 +93,25 @@ const (
 	ServiceVersion = "service.version"
 )
 
-// Values of AccountKind.
-const (
-	// A user account.
-	AccountKindUser = "user"
-
-	// A group account.
-	AccountKindGroup = "group"
-)
-
 // Values of ConvergeTrigger.
 const (
 	// The daemon started.
 	TriggerStart = "start"
 
 	// A request left a recheck of the ruleset pending.
-	TriggerRulesetChanged = "ruleset changed"
+	TriggerRulesetChanged = "ruleset_changed"
 
 	// The network interfaces changed and the debounce ended.
 	TriggerInterfaces = "interfaces"
 
 	// The self-heal timer ticked, after a new read of the accounts.
-	TriggerSelfHeal = "self-heal"
+	TriggerSelfHeal = "self_heal"
 
 	// An account read ended, or its time budget ended.
 	TriggerAccounts = "accounts"
 
 	// The warm-up self-test result asked for a convergence.
-	TriggerSelfTest = "self-test"
+	TriggerSelfTest = "self_test"
 
 	// Address entries expired.
 	TriggerExpiry = "expiry"
@@ -115,4 +136,70 @@ const (
 
 	// The state is not one of the known states.
 	StateUnknown = "unknown"
+)
+
+// Values of ExitReason.
+const (
+	// The process got a signal to stop.
+	ExitStopped = "stopped"
+
+	// The [dns] section of the stored configuration changed. launchd starts a new process with it.
+	ExitConfigChanged = "config_changed"
+
+	// The process failed. error.type tells the class of the failure.
+	ExitFailed = "failed"
+)
+
+// Values of StatesCause.
+const (
+	// The verdict of the policy on the interfaces narrowed, so a connection that its rules now block must not go on.
+	StatesCauseNarrowed = "narrowed"
+)
+
+// Values of ErrorType.
+const (
+	// The caller ended before the work started. Nothing changed. No action is needed.
+	ErrorTypeCanceled = "canceled"
+
+	// The stored configuration file cannot be read or written. Check the file, its directory, their owners and modes, and the free space.
+	ErrorTypeConfigFile = "config_file"
+
+	// The configuration does not pass its checks. Nothing changed. Correct the configuration and apply it again.
+	ErrorTypeConfigInvalid = "config_invalid"
+
+	// The new stored configuration file is in place, but the sync of its directory failed, so a crash can bring back the old file. Check the disk, then apply again.
+	ErrorTypeConfigNotDurable = "config_not_durable"
+
+	// CoreDNS did not start, or its shutdown failed. Check that the listen address is free.
+	ErrorTypeCoreDNS = "coredns"
+
+	// The host file exists, but it cannot be read. Check the file, its owner, and its mode.
+	ErrorTypeHostsRead = "hosts_read"
+
+	// A fact that the code relies on is false. The code of ifbound has an error: report it.
+	ErrorTypeInvariant = "invariant"
+
+	// A lookup of a name in a system service failed: an account name in the directory service, or a DNS name through the system resolver. Check that service.
+	ErrorTypeLookup = "lookup"
+
+	// A path in the layout cannot go into the Corefile: it has a character that the Corefile does not allow, or the socket path is too long. Change the directory.
+	ErrorTypePath = "path"
+
+	// A local process whose user ID the socket does not allow tried to connect.
+	ErrorTypePeerNotAllowed = "peer_not_allowed"
+
+	// ifbound cannot give back a pf reference token. The token stays in its label, and the next load tries again.
+	ErrorTypePFToken = "pf_token"
+
+	// A read or a write of pf, the system resolver, or the interfaces failed. The self-heal timer tries again.
+	ErrorTypePlatform = "platform"
+
+	// No probe proved that the queries for a name go to ifbound-dns. Check that ifbound-dns runs and that the system resolver sends the name to it.
+	ErrorTypeProbe = "probe"
+
+	// The address book snapshot did not load, or the adoption of the kernel entries into it failed. The self-heal timer tries again.
+	ErrorTypeSnapshot = "snapshot"
+
+	// A socket operation failed: accept, peer credentials, read, write, or the removal of the socket file.
+	ErrorTypeSocket = "socket"
 )

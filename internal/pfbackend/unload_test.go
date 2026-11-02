@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfbackend"
 )
 
@@ -165,6 +166,9 @@ func TestLoadKeepsAnOldTokenThatDidNotGoBack(t *testing.T) {
 	r.k.fail = func(args []string) bool { return slices.Contains(args, "-X") }
 	mustLoad(t, r, compileRS(t, testPolicies))
 	r.k.fail = nil
+	if got := r.log.errorTypes(); !slices.Equal(got, []string{logattr.ErrorTypePFToken}) {
+		t.Errorf("warnings with error.type = %q, want one %s", got, logattr.ErrorTypePFToken)
+	}
 	if len(r.k.refs) != 2 {
 		t.Fatalf("refs after a Load whose -X failed = %v, want the old and the new token", r.k.refs)
 	}
@@ -185,6 +189,20 @@ func TestLoadKeepsAnOldTokenThatDidNotGoBack(t *testing.T) {
 	}
 	if len(r.k.refs) != 0 || r.k.enabled {
 		t.Errorf("after Unload: refs %v enabled %v, want no reference", r.k.refs, r.k.enabled)
+	}
+}
+
+// A Load that fails after it took a new token gives the token back. When
+// that fails too, the Backend warns and keeps the token.
+func TestFailedLoadWarnsWhenItCannotGiveBackItsToken(t *testing.T) {
+	r := newRig(t)
+	r.k.fail = func(args []string) bool { return slices.Contains(args, "-X") || slices.Contains(args, "-f") }
+	if err := r.b.Load(t.Context(), compileRS(t, testPolicies)); err == nil {
+		t.Fatal("Load with a failing pfctl -f: nil error")
+	}
+	r.k.fail = nil
+	if got := r.log.errorTypes(); !slices.Equal(got, []string{logattr.ErrorTypePFToken}) {
+		t.Errorf("warnings with error.type = %q, want one %s", got, logattr.ErrorTypePFToken)
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfbackend"
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfrules"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
@@ -53,6 +54,8 @@ func (c *modelClock) now() time.Time { return c.t }
 type warnings struct {
 	mu     sync.Mutex
 	levels []slog.Level
+	// types holds the error.type of each warning that has one.
+	types []string
 }
 
 func (w *warnings) Enabled(context.Context, slog.Level) bool { return true }
@@ -60,10 +63,23 @@ func (w *warnings) Handle(_ context.Context, r slog.Record) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.levels = append(w.levels, r.Level)
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == logattr.ErrorType && r.Level == slog.LevelWarn {
+			w.types = append(w.types, a.Value.String())
+		}
+		return true
+	})
 	return nil
 }
 func (w *warnings) WithAttrs([]slog.Attr) slog.Handler { return w }
 func (w *warnings) WithGroup(string) slog.Handler      { return w }
+
+// errorTypes returns the error.type of each warning that has one.
+func (w *warnings) errorTypes() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.types)
+}
 
 func (w *warnings) count(l slog.Level) int {
 	w.mu.Lock()

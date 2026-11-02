@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/syslookup"
 )
@@ -105,17 +106,19 @@ func (w *warmUp) sync(ctx context.Context, l *loop) {
 
 // run warms up names in passes until each name had a successful probe,
 // or wctx ends. wctx is the life of the warm-up, and ctx is the life of
-// Run.
+// Run. Each pass writes one round event, also a pass that wctx stopped.
 func (w *warmUp) run(wctx, ctx context.Context, names []policy.Domain, gen uint64) {
-	for first := true; ; first = false {
-		tried := len(names)
-		names = w.pass(wctx, ctx, names, first, gen)
-		if len(names) == 0 {
+	for round := 1; ; round++ {
+		r := w.pass(wctx, ctx, names, gen)
+		cancelled := wctx.Err() != nil
+		w.logRound(ctx, round, len(names), cancelled, r)
+		if cancelled || len(r.unproven) == 0 {
 			return
 		}
-		if len(names) == tried && wctx.Err() == nil {
+		if len(r.unproven) == len(names) {
 			w.report(func(r *warmResult) { r.missed = gen })
 		}
+		names = r.unproven
 		select {
 		case <-wctx.Done():
 			return
@@ -124,14 +127,89 @@ func (w *warmUp) run(wctx, ctx context.Context, names []policy.Domain, gen uint6
 	}
 }
 
+// roundResult is the outcome of one pass. failed and empty are names
+// whose probe succeeded; errs holds the errors of the failed probes and
+// lookups.
+type roundResult struct {
+	unproven      []policy.Domain
+	failed, empty []string
+	errs          []error
+}
+
+// warmOutcome is the outcome of the work on one name.
+type warmOutcome uint8
+
+const (
+	warmResolved warmOutcome = iota // the lookup succeeded
+	warmStopped                     // wctx ended during the probe
+	warmUnproven                    // the probe failed
+	warmEmpty                       // the lookup gave no addresses in time
+	warmFailed                      // the lookup failed
+)
+
+// add puts the outcome of the work on name into r.
+func (r *roundResult) add(name policy.Domain, o warmOutcome, err error) {
+	switch o {
+	case warmResolved, warmStopped:
+		return
+	case warmUnproven:
+		r.unproven = append(r.unproven, name)
+	case warmEmpty:
+		r.empty = append(r.empty, name.String())
+		return // normal: see warm
+	case warmFailed:
+		r.failed = append(r.failed, name.String())
+	default:
+		r.failed = append(r.failed, name.String())
+	}
+	r.errs = append(r.errs, err) // the errors of the probe and of the lookup name the name
+}
+
+// logRound writes the event of one warm-up round of count names. A failed
+// lookup is a warning, and so is a failed probe in a first round that
+// was not cancelled. A failed probe in a later round is debug: the
+// warm-up tries the name again at each self-heal, and the self-test
+// reason tells the state.
+func (w *warmUp) logRound(ctx context.Context, round, count int, cancelled bool, r roundResult) {
+	attrs := []slog.Attr{slog.Int(logattr.WarmUpRound, round), slog.Int(logattr.WarmUpNameCount, count)}
+	if cancelled {
+		attrs = append(attrs, slog.Bool(logattr.WarmUpCancelled, true))
+	}
+	if len(r.unproven) > 0 {
+		names := make([]string, len(r.unproven))
+		for i, n := range r.unproven {
+			names[i] = n.String()
+		}
+		attrs = append(attrs, slog.Any(logattr.WarmUpUnproven, names))
+	}
+	if len(r.failed) > 0 {
+		attrs = append(attrs, slog.Any(logattr.WarmUpFailed, r.failed))
+	}
+	if len(r.empty) > 0 {
+		attrs = append(attrs, slog.Any(logattr.WarmUpEmpty, r.empty))
+	}
+	level := slog.LevelDebug
+	if len(r.errs) > 0 {
+		errType := logattr.ErrorTypeProbe
+		if len(r.failed) > 0 {
+			errType = logattr.ErrorTypeLookup
+		}
+		attrs = append(attrs, slog.String(logattr.ErrorType, errType),
+			slog.String(logattr.ExceptionMessage, errors.Join(r.errs...).Error()))
+		if len(r.failed) > 0 || (round == 1 && !cancelled) {
+			level = slog.LevelWarn
+		}
+	}
+	w.log.LogAttrs(ctx, level, "warm-up round", attrs...)
+}
+
 // pass starts the work on one name when a slot is free, until wctx ends.
-// It returns when the work on each started name has ended, with the names
-// whose probe failed.
-func (w *warmUp) pass(wctx, ctx context.Context, names []policy.Domain, first bool, gen uint64) []policy.Domain {
+// It returns when the work on each started name has ended.
+func (w *warmUp) pass(wctx, ctx context.Context, names []policy.Domain, gen uint64) roundResult {
 	var (
-		wg       sync.WaitGroup
-		mu       sync.Mutex
-		unproven []policy.Domain
+		wg sync.WaitGroup
+		mu sync.Mutex
+		r  roundResult
 	)
 	for _, name := range names {
 		if !w.acquire(wctx) {
@@ -139,15 +217,14 @@ func (w *warmUp) pass(wctx, ctx context.Context, names []policy.Domain, first bo
 		}
 		wg.Go(func() {
 			defer func() { <-w.slots }()
-			if !w.warm(wctx, ctx, name, first, gen) {
-				mu.Lock()
-				unproven = append(unproven, name)
-				mu.Unlock()
-			}
+			o, err := w.warm(wctx, ctx, name, gen)
+			mu.Lock()
+			r.add(name, o, err)
+			mu.Unlock()
 		})
 	}
 	wg.Wait()
-	return unproven
+	return r
 }
 
 // acquire takes a slot. It reports false, with no slot, when wctx ends
@@ -167,18 +244,18 @@ func (w *warmUp) acquire(wctx context.Context) bool {
 }
 
 // warm probes below name, and then resolves name when the probe
-// succeeded. It reports whether the probe succeeded. The lookup ends with
+// succeeded. It returns the outcome and its error. The lookup ends with
 // its budget or with ctx, not with wctx: see warmUp.slots.
-func (w *warmUp) warm(wctx, ctx context.Context, name policy.Domain, first bool, gen uint64) bool {
+func (w *warmUp) warm(wctx, ctx context.Context, name policy.Domain, gen uint64) (warmOutcome, error) {
 	pctx, cancel := context.WithTimeout(wctx, WarmUpTimeout)
 	err := w.prove(pctx, name)
 	cancel()
 	if err != nil {
-		if first && wctx.Err() == nil {
-			w.log.WarnContext(ctx, "warm-up: no proof that the queries for the name go to ifbound-dns; the warm-up tries the name again later",
-				slog.String("name", name.String()), slog.Any("error", err))
+		if wctx.Err() != nil {
+			// The warm-up stopped: the failure tells nothing of the name.
+			return warmStopped, nil
 		}
-		return false
+		return warmUnproven, err
 	}
 	w.report(func(r *warmResult) { r.proved = gen })
 	lctx, cancel := context.WithTimeout(ctx, WarmUpTimeout)
@@ -188,16 +265,15 @@ func (w *warmUp) warm(wctx, ctx context.Context, name policy.Domain, first bool,
 	_, err = w.lookup.Resolve(lctx, name.String())
 	switch {
 	case err == nil || ctx.Err() != nil:
+		return warmResolved, nil
 	case errors.Is(err, syslookup.ErrNotFound) || errors.Is(err, context.DeadlineExceeded):
 		// A name without addresses is normal, for example the domain of
 		// a suffix destination. At the deadline, the system lookup and its
 		// report can still complete.
-		w.log.DebugContext(ctx, "warm-up lookup gave no addresses in time",
-			slog.String("name", name.String()), slog.Any("error", err))
+		return warmEmpty, err
 	default:
-		w.log.WarnContext(ctx, "warm-up lookup failed", slog.String("name", name.String()), slog.Any("error", err))
+		return warmFailed, err
 	}
-	return true
 }
 
 // report changes the result with f and tells the loop.

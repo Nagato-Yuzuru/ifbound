@@ -265,6 +265,14 @@ func (l *gatedWarmLookup) state() (int, []string) {
 type capturedLogs struct {
 	mu   sync.Mutex
 	msgs []string
+	evs  []event
+}
+
+// event is one captured log record.
+type event struct {
+	level slog.Level
+	msg   string
+	attrs map[string]slog.Value
 }
 
 func (h *capturedLogs) Enabled(context.Context, slog.Level) bool { return true }
@@ -272,13 +280,30 @@ func (h *capturedLogs) Handle(_ context.Context, r slog.Record) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	msg := r.Level.String() + " " + r.Message
+	ev := event{level: r.Level, msg: r.Message, attrs: make(map[string]slog.Value, r.NumAttrs())}
 	r.Attrs(func(a slog.Attr) bool {
 		msg += " " + a.String()
+		ev.attrs[a.Key] = a.Value.Resolve()
 		return true
 	})
 	h.msgs = append(h.msgs, msg)
+	h.evs = append(h.evs, ev)
 	return nil
 }
+
+// events returns the captured events with the message msg, oldest first.
+func (h *capturedLogs) events(msg string) []event {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []event
+	for _, e := range h.evs {
+		if e.msg == msg {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 func (h *capturedLogs) WithAttrs([]slog.Attr) slog.Handler { return h }
 func (h *capturedLogs) WithGroup(string) slog.Handler      { return h }
 
@@ -321,7 +346,8 @@ func TestWarmUpWaitsForTheProbeAndRetriesLater(t *testing.T) {
 		msgs := slices.Clone(logs.msgs)
 		logs.mu.Unlock()
 		if !slices.ContainsFunc(msgs, func(m string) bool {
-			return strings.HasPrefix(m, "WARN warm-up: no proof") && strings.Contains(m, "error=daemon: probe not seen by ifbound-dns")
+			return strings.HasPrefix(m, "WARN warm-up round") && strings.Contains(m, "error.type=probe") &&
+				strings.Contains(m, "exception.message=daemon: probe not seen by ifbound-dns")
 		}) {
 			t.Errorf("no warning with the probe error for the failed probe: %q", msgs)
 		}

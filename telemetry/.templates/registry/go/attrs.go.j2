@@ -8,15 +8,16 @@
 {%- for g in ctx.registry.metrics %}{% set ns.all = ns.all + (g.attributes | default([])) %}{% endfor -%}
 {%- for g in ctx.registry.entities %}{% set ns.all = ns.all + (g.identity | default([])) + (g.description | default([])) %}{% endfor -%}
 {%- set semconv = ns.all | rejectattr("key", "in", own) | sort(attribute="key") | unique(attribute="key") | list -%}
-{%- macro value_consts(attr, members) -%}
+{#- value_consts renders the values of attr. name is the name of the Go constant of attr. A member of an enum has its Go name in annotations.go.name; a member of the annotation go.members of a semconv attribute has it in name. -#}
+{%- macro value_consts(name, members) -%}
 
-// Values of {{ attr.annotations.go.name }}.
+// Values of {{ name }}.
 const (
 {%- for m in members %}
 {%- if not loop.first %}
 {% endif %}
 	// {{ m.brief | trim | replace("\n", " ") }}
-	{{ m.annotations.go.name }} = "{{ m.value }}"
+	{{ m.name if m.name is defined else m.annotations.go.name }} = "{{ m.value }}"
 {%- endfor %}
 )
 {%- endmacro -%}
@@ -44,5 +45,9 @@ const (
 )
 {%- for attr in ctx.registry.attributes if attr.type.members is defined %}
 
-{{ value_consts(attr, attr.type.members) }}
+{{ value_consts(attr.annotations.go.name, attr.type.members) }}
+{%- endfor %}
+{%- for attr in semconv if attr.annotations and attr.annotations.go and attr.annotations.go.members %}
+
+{{ value_consts(attr.key | pascal_case, attr.annotations.go.members) }}
 {%- endfor %}

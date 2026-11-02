@@ -2,6 +2,8 @@ package daemon
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"iter"
 	"log/slog"
 	"net/netip"
@@ -9,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/hostsfile"
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
@@ -106,7 +109,8 @@ func (l *loop) readHosts(ctx context.Context, v hostsfile.Version) {
 func (l *loop) keepKernelHosts(ctx context.Context, policies []policy.Policy) {
 	found, err := l.rec.Adoptable(ctx, policies)
 	if err != nil {
-		l.log.WarnContext(ctx, "reading the kernel entries for the host file failed", slog.Any("error", err))
+		l.log.WarnContext(ctx, "reading the kernel entries for the host file failed",
+			slog.String(logattr.ErrorType, logattr.ErrorTypePlatform), slog.String(logattr.ExceptionMessage, err.Error()))
 		return
 	}
 	l.hosts.addrs = found
@@ -114,7 +118,8 @@ func (l *loop) keepKernelHosts(ctx context.Context, policies []policy.Policy) {
 
 func (h *hostsState) fail(ctx context.Context, log *slog.Logger, err error) {
 	if h.err == nil {
-		log.WarnContext(ctx, "host file read failed", slog.Any("error", err))
+		log.WarnContext(ctx, "host file read failed",
+			slog.String(logattr.ErrorType, logattr.ErrorTypeHostsRead), slog.String(logattr.ExceptionMessage, err.Error()))
 	}
 	h.err = err
 }
@@ -140,17 +145,18 @@ func (h *hostsState) problem() (reconcile.Problem, bool) {
 // does not leave the host, and a block of it would stop local services,
 // ifbound-dns too.
 //
-// It also logs each line with a name that the entries cannot show, when
-// the name is at or below an apex. Such a line can hold a protected
-// address that no table has.
+// It also logs, in one event, the lines with a name that the entries
+// cannot show, when the name is at or below an apex. Such a line can hold
+// a protected address that no table has.
 func (l *loop) mapHosts(ctx context.Context, conf activeConfig) map[policy.Name][]netip.Addr {
 	g := newHostGraph(l.hosts.good.Entries)
 	out := make(map[policy.Name][]netip.Addr)
+	var bad []string
+	var badErrs []error
 	for name := range g.names() {
 		policies, err := conf.matcher.Match(name)
 		if err != nil {
-			// A name that dnsname built always splits.
-			l.log.ErrorContext(ctx, "host file name does not split", slog.String("name", name), slog.Any("error", err))
+			bad, badErrs = append(bad, name), append(badErrs, err)
 			continue
 		}
 		if len(policies) == 0 {
@@ -165,11 +171,20 @@ func (l *loop) mapHosts(ctx context.Context, conf activeConfig) map[policy.Name]
 		slices.SortFunc(addrs, netip.Addr.Compare)
 		out[p] = slices.Compact(addrs)
 	}
+	if len(bad) > 0 {
+		// A name that dnsname built always splits.
+		l.log.ErrorContext(ctx, "host file names do not split", slog.Any(logattr.HostsNames, bad),
+			slog.String(logattr.ErrorType, logattr.ErrorTypeInvariant), slog.String(logattr.ExceptionMessage, errors.Join(badErrs...).Error()))
+	}
+	var lines []string
 	for _, line := range l.hosts.good.Unrepresentable {
-		if names := belowApex(conf.apexes, line.Names); len(names) > 0 {
-			l.log.WarnContext(ctx, "host file line has a protected name that ifbound cannot read",
-				slog.Int("line", line.Number), slog.Any("names", names))
+		if below := belowApex(conf.apexes, line.Names); len(below) > 0 {
+			lines = append(lines, fmt.Sprintf("line %d: %s", line.Number, strings.Join(below, " ")))
 		}
+	}
+	if len(lines) > 0 {
+		l.log.WarnContext(ctx, "host file lines have a protected name that ifbound cannot read",
+			slog.Any(logattr.HostsLines, lines))
 	}
 	return out
 }

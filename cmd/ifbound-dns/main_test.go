@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -26,6 +28,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/dnsconf"
 	"github.com/Nagato-Yuzuru/ifbound/internal/dnsplugin"
 	"github.com/Nagato-Yuzuru/ifbound/internal/layout"
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
@@ -58,9 +61,43 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
+// testLogger returns a logger with the handler of the binary, and its
+// output.
 func testLogger() (*slog.Logger, *syncBuffer) {
 	buf := new(syncBuffer)
-	return slog.New(slog.NewTextHandler(buf, nil)), buf
+	return slog.New(slog.NewJSONHandler(buf, nil)), buf
+}
+
+// events returns the JSON objects of the log lines with the message msg.
+func (s *syncBuffer) events(t *testing.T, msg string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for line := range strings.Lines(s.String()) {
+		var e map[string]any
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("log line is not JSON: %v: %q", err, line)
+		}
+		if e[slog.MessageKey] == msg {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// wantEvent fails unless logs has exactly one event msg with each field
+// of want.
+func wantEvent(t *testing.T, logs *syncBuffer, msg string, want map[string]any) map[string]any {
+	t.Helper()
+	evs := logs.events(t, msg)
+	if len(evs) != 1 {
+		t.Fatalf("%q events = %d, want 1:\n%s", msg, len(evs), logs.String())
+	}
+	for k, w := range want {
+		if got := evs[0][k]; got != w {
+			t.Errorf("%q event: %s = %v, want %v", msg, k, got, w)
+		}
+	}
+	return evs[0]
 }
 
 // freeAddr returns a loopback address with a port that nothing uses.
@@ -232,11 +269,25 @@ func TestRunFailsWithoutAStoredConfiguration(t *testing.T) {
 	if err := registerOnce(); err != nil {
 		t.Fatal(err)
 	}
-	logger, _ := testLogger()
+	logger, logs := testLogger()
 	err := run(t.Context(), testLayout(t), "", make(ticker), logger)
 	if !errors.Is(err, configstore.ErrNotApplied) {
 		t.Errorf("run = %v, want ErrNotApplied", err)
 	}
+	// The start event names the build also when the start fails.
+	start := wantEvent(t, logs, "start", map[string]any{
+		logattr.ServiceName:    "ifbound-dns",
+		logattr.ServiceVersion: buildVersion(),
+	})
+	if d, ok := start[logattr.ConfigDigest]; ok {
+		t.Errorf("start event: %s = %v without a stored configuration, want none", logattr.ConfigDigest, d)
+	}
+	wantEvent(t, logs, "exit", map[string]any{
+		slog.LevelKey:            "ERROR",
+		logattr.ExitReason:       logattr.ExitFailed,
+		logattr.ErrorType:        logattr.ErrorTypeConfigFile,
+		logattr.ExceptionMessage: err.Error(),
+	})
 }
 
 func TestRunReturnsNilWhenContextEnds(t *testing.T) {
@@ -247,10 +298,21 @@ func TestRunReturnsNilWhenContextEnds(t *testing.T) {
 	store(t, l, freeAddr(t), upstreamA, policyA)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	logger, _ := testLogger()
+	logger, logs := testLogger()
 	if err := run(ctx, l, "", make(ticker), logger); err != nil {
 		t.Errorf("run = %v, want nil", err)
 	}
+	cfg, err := os.ReadFile(l.StoredConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantEvent(t, logs, "start", map[string]any{
+		slog.LevelKey:          "INFO",
+		logattr.ServiceName:    "ifbound-dns",
+		logattr.ServiceVersion: buildVersion(),
+		logattr.ConfigDigest:   configstore.Digest(sha256.Sum256(cfg)).String(),
+	})
+	wantEvent(t, logs, "exit", map[string]any{slog.LevelKey: "INFO", logattr.ExitReason: logattr.ExitStopped})
 }
 
 func TestRunReturnsNilWhenDNSChanges(t *testing.T) {
@@ -260,7 +322,7 @@ func TestRunReturnsNilWhenDNSChanges(t *testing.T) {
 	l := testLayout(t)
 	listen := freeAddr(t)
 	store(t, l, listen, upstreamA, policyA)
-	logger, _ := testLogger()
+	logger, logs := testLogger()
 	ticks := make(ticker)
 	result := make(chan error, 1)
 	go func() { result <- run(t.Context(), l, "", ticks, logger) }()
@@ -275,6 +337,7 @@ func TestRunReturnsNilWhenDNSChanges(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("run did not return after a change in [dns]")
 	}
+	wantEvent(t, logs, "exit", map[string]any{logattr.ExitReason: logattr.ExitConfigChanged})
 }
 
 func TestRunRefusesARunDirWithATooLongSocketPath(t *testing.T) {
@@ -283,10 +346,30 @@ func TestRunRefusesARunDirWithATooLongSocketPath(t *testing.T) {
 	}
 	l := testLayout(t)
 	l.RunDir = filepath.Join(l.RunDir, strings.Repeat("d", 100))
-	logger, _ := testLogger()
+	logger, logs := testLogger()
 	if err := run(t.Context(), l, "", make(ticker), logger); !errors.Is(err, dnsconf.ErrSocketTooLong) {
 		t.Errorf("run = %v, want ErrSocketTooLong", err)
 	}
+	wantEvent(t, logs, "exit", map[string]any{logattr.ExitReason: logattr.ExitFailed, logattr.ErrorType: logattr.ErrorTypePath})
+}
+
+// A listen address that another socket holds stops the start of CoreDNS.
+func TestRunFailsWhenTheListenAddressIsTaken(t *testing.T) {
+	if err := registerOnce(); err != nil {
+		t.Fatal(err)
+	}
+	pc, err := new(net.ListenConfig).ListenPacket(t.Context(), "udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pc.Close() }) //nolint:errcheck // the test is over
+	l := testLayout(t)
+	store(t, l, pc.LocalAddr().String(), upstreamA, policyA)
+	logger, logs := testLogger()
+	if err := run(t.Context(), l, "", make(ticker), logger); err == nil {
+		t.Fatal("run with a taken listen address: nil error")
+	}
+	wantEvent(t, logs, "exit", map[string]any{logattr.ExitReason: logattr.ExitFailed, logattr.ErrorType: logattr.ErrorTypeCoreDNS})
 }
 
 func TestRunNamesATestCA(t *testing.T) {

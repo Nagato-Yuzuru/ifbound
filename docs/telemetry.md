@@ -3,10 +3,14 @@
 # Telemetry
 
 The registry in telemetry/ defines the log attributes of ifbound. This page
-lists them. The log call sites move to these names in steps. A key is a
-contract with the queries of the operator once a call site writes it: the
-key does not change its name after that. The ifbound attributes have the
-stability `development` until the call sites use them.
+lists them. Each log call site of ifbound uses these names through the
+constants of internal/logattr. Lint refuses a literal key at a call site.
+It does not check that a constant comes from internal/logattr, so review
+keeps the keys to these constants. A key is a contract with the queries of
+the operator once a call site writes it: the key does not change its name
+after that. The stability `development` tells that the set of attributes
+can still grow; it does not permit a change to a key that a call site
+writes.
 
 ## ifbound attributes
 
@@ -14,36 +18,40 @@ OpenTelemetry semantic conventions do not define these attributes.
 
 | Key | Type | Stability | Description | Examples |
 | --- | --- | --- | --- | --- |
-| `ifbound.account.kind` | enum | development | The kind of the account that the daemon looked up. |  |
-| `ifbound.account.name` | string | development | The name of the user or group account that the daemon looked up. | `"alice"` |
+| `ifbound.account.groups` | string[] | development | The group accounts whose lookup failed in the account read. | `["admin"]` |
+| `ifbound.account.users` | string[] | development | The user accounts whose lookup failed in the account read. | `["alice","bob"]` |
 | `ifbound.backoff_ms` | int | development | The wait before the next try, in milliseconds. | `50` |
+| `ifbound.config.digest` | string | development | The SHA-256 of the stored configuration file, in lower-case hex. | `"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"` |
+| `ifbound.config.previous_digest` | string | development | The SHA-256 of the stored configuration file that ran before the event, in lower-case hex. | `"2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"` |
+| `ifbound.converge.duration_ms` | int | development | The time that the convergence took, in milliseconds. | `12` |
 | `ifbound.converge.trigger` | enum | development | The cause of the convergence. |  |
 | `ifbound.converge.writes` | int | development | The number of kernel writes that the convergence made. | `3` |
 | `ifbound.enforcement.reasons` | string[] | development | The reasons that the daemon is not ready. | `["convergence failed: pfctl failed"]` |
 | `ifbound.enforcement.state` | enum | development | The enforcement state of the daemon. |  |
-| `ifbound.hosts.line` | int | development | The line number in the host file. | `12` |
-| `ifbound.hosts.name` | string | development | A name from the host file. It is not a DNS query name. | `"example.com"` |
-| `ifbound.hosts.names` | string[] | development | The names on a line of the host file. | `["example.com","www.example.com"]` |
+| `ifbound.exit.reason` | enum | development | The reason that the process exits. |  |
+| `ifbound.hosts.lines` | string[] | development | Lines of the host file. Each item is the line number and the names of that line that the event is about. | `["line 3: b..example.net.","line 7: x..www.example.com"]` |
+| `ifbound.hosts.names` | string[] | development | The names from the host file that the event is about. | `["example.com","www.example.com"]` |
 | `ifbound.peer.uid` | int | development | The user ID of the process on the other end of a socket. | `501` |
 | `ifbound.pf.anchor` | string | development | The name of the pf anchor that ifbound owns. | `"ifbound"` |
-
-### Values of `ifbound.account.kind`
-
-| Value | Description |
-| --- | --- |
-| `user` | A user account. |
-| `group` | A group account. |
+| `ifbound.pf.states.cause` | enum | development | The reason that ifbound ended the pf connection states of the policies. |  |
+| `ifbound.policy.names` | string[] | development | The names of the policies that the event is about. | `["work","bank"]` |
+| `ifbound.warmup.cancelled` | boolean | development | The round stopped before its end, because the configuration or the state changed. The lists hold only the names that were done. | `true` |
+| `ifbound.warmup.empty` | string[] | development | The names whose lookup gave no addresses in its time budget. This is normal for the domain of a suffix destination. | `["example.com"]` |
+| `ifbound.warmup.failed` | string[] | development | The names whose lookup failed after a good probe. | `["example.com"]` |
+| `ifbound.warmup.name_count` | int | development | The number of names in the warm-up round. | `4` |
+| `ifbound.warmup.round` | int | development | The number of the warm-up round under the configuration. The first round is 1. | `1` |
+| `ifbound.warmup.unproven` | string[] | development | The names whose probe did not prove that their queries go to ifbound-dns. The warm-up tries them again in the next round. | `["example.com"]` |
 
 ### Values of `ifbound.converge.trigger`
 
 | Value | Description |
 | --- | --- |
 | `start` | The daemon started. |
-| `ruleset changed` | A request left a recheck of the ruleset pending. |
+| `ruleset_changed` | A request left a recheck of the ruleset pending. |
 | `interfaces` | The network interfaces changed and the debounce ended. |
-| `self-heal` | The self-heal timer ticked, after a new read of the accounts. |
+| `self_heal` | The self-heal timer ticked, after a new read of the accounts. |
 | `accounts` | An account read ended, or its time budget ended. |
-| `self-test` | The warm-up self-test result asked for a convergence. |
+| `self_test` | The warm-up self-test result asked for a convergence. |
 | `expiry` | Address entries expired. |
 | `config` | A new configuration was applied. |
 
@@ -57,6 +65,20 @@ OpenTelemetry semantic conventions do not define these attributes.
 | `unenforced` | The ruleset is not installed, or a problem voids it. |
 | `unknown` | The state is not one of the known states. |
 
+### Values of `ifbound.exit.reason`
+
+| Value | Description |
+| --- | --- |
+| `stopped` | The process got a signal to stop. |
+| `config_changed` | The [dns] section of the stored configuration changed. launchd starts a new process with it. |
+| `failed` | The process failed. error.type tells the class of the failure. |
+
+### Values of `ifbound.pf.states.cause`
+
+| Value | Description |
+| --- | --- |
+| `narrowed` | The verdict of the policy on the interfaces narrowed, so a connection that its rules now block must not go on. |
+
 ## Semantic convention attributes
 
 These attributes come from
@@ -64,9 +86,28 @@ These attributes come from
 
 | Key | Type | Stability | Description | Examples |
 | --- | --- | --- | --- | --- |
-| `dns.question.name` | string | development | The name being queried. | `"www.example.com"`, `"opentelemetry.io"` |
-| `error.type` | enum | stable | Describes a class of error the operation ended with. | `"timeout"`, `"java.net.UnknownHostException"`, `"server_certificate_invalid"`, `"500"` |
+| `error.type` | enum | stable | The class of the failure. Each event that has it also has exception.message. | `"platform"`, `"config_invalid"` |
 | `exception.message` | string | stable | The text of the error chain. | `"Division by zero"`, `"Can't convert 'int' object to str implicitly"` |
 | `file.path` | string | development | Full path to the file, including the filename. It should include the drive letter, when appropriate. | `"/home/alice/example.png"`, `"C:\\Program Files\\MyApp\\myapp.exe"` |
 | `service.name` | string | stable | Logical name of the service. | `"ifbound"` |
 | `service.version` | string | stable | The version string of the service component. The format is not defined by these conventions. | `"2.0.0"`, `"a01dbef8a"` |
+
+### Values of `error.type`
+
+| Value | Description |
+| --- | --- |
+| `canceled` | The caller ended before the work started. Nothing changed. No action is needed. |
+| `config_file` | The stored configuration file cannot be read or written. Check the file, its directory, their owners and modes, and the free space. |
+| `config_invalid` | The configuration does not pass its checks. Nothing changed. Correct the configuration and apply it again. |
+| `config_not_durable` | The new stored configuration file is in place, but the sync of its directory failed, so a crash can bring back the old file. Check the disk, then apply again. |
+| `coredns` | CoreDNS did not start, or its shutdown failed. Check that the listen address is free. |
+| `hosts_read` | The host file exists, but it cannot be read. Check the file, its owner, and its mode. |
+| `invariant` | A fact that the code relies on is false. The code of ifbound has an error: report it. |
+| `lookup` | A lookup of a name in a system service failed: an account name in the directory service, or a DNS name through the system resolver. Check that service. |
+| `path` | A path in the layout cannot go into the Corefile: it has a character that the Corefile does not allow, or the socket path is too long. Change the directory. |
+| `peer_not_allowed` | A local process whose user ID the socket does not allow tried to connect. |
+| `pf_token` | ifbound cannot give back a pf reference token. The token stays in its label, and the next load tries again. |
+| `platform` | A read or a write of pf, the system resolver, or the interfaces failed. The self-heal timer tries again. |
+| `probe` | No probe proved that the queries for a name go to ifbound-dns. Check that ifbound-dns runs and that the system resolver sends the name to it. |
+| `snapshot` | The address book snapshot did not load, or the adoption of the kernel entries into it failed. The self-heal timer tries again. |
+| `socket` | A socket operation failed: accept, peer credentials, read, write, or the removal of the socket file. |

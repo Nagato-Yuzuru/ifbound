@@ -2,12 +2,14 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
 	"slices"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
@@ -120,7 +122,7 @@ func (l *loop) accountsOverdue(ctx context.Context) {
 	a := &l.accounts
 	a.overdue, a.timeout = true, nil
 	if !a.late {
-		l.log.WarnContext(ctx, "account read takes longer than its budget", slog.Duration("budget", AccountReadTimeout))
+		l.log.WarnContext(ctx, "account read takes longer than its budget")
 	}
 }
 
@@ -134,17 +136,15 @@ func (l *loop) applyAccounts(ctx context.Context, r accountsRead) bool {
 	a.late = a.overdue
 	a.reading, a.overdue, a.timeout, a.done = false, false, nil, true
 
-	type failure struct {
-		kind, name string
-		err        error
-	}
-	var failures []failure
-	merge := func(kind string, res map[string]lookup, last map[string]uint32) map[string]uint32 {
+	var users, groups []string
+	var errs []error
+	merge := func(kind string, failed *[]string, res map[string]lookup, last map[string]uint32) map[string]uint32 {
 		out := make(map[string]uint32, len(res))
 		for name, lk := range res {
 			switch {
 			case lk.err != nil:
-				failures = append(failures, failure{kind, name, lk.err})
+				*failed = append(*failed, name)
+				errs = append(errs, fmt.Errorf("%s %s: %w", kind, name, lk.err))
 				if id, ok := last[name]; ok {
 					out[name] = id
 				}
@@ -155,18 +155,27 @@ func (l *loop) applyAccounts(ctx context.Context, r accountsRead) bool {
 		return out
 	}
 	a.snap = reconcile.Accounts{
-		Users:  merge("user", r.users, before.Users),
-		Groups: merge("group", r.groups, before.Groups),
+		Users:  merge("user", &users, r.users, before.Users),
+		Groups: merge("group", &groups, r.groups, before.Groups),
 	}
-	a.failed = len(failures)
-	if wasFailed == 0 {
+	a.failed = len(errs)
+	if wasFailed == 0 && len(errs) > 0 {
 		// The details go to the log at the first read that fails after a
 		// good one. The problem text has only the count, so it does not
 		// change with them.
-		for _, f := range failures {
-			l.log.WarnContext(ctx, "account lookup failed",
-				slog.String("kind", f.kind), slog.String("name", f.name), slog.Any("error", f.err))
+		slices.Sort(users)
+		slices.Sort(groups)
+		attrs := []slog.Attr{
+			slog.String(logattr.ErrorType, logattr.ErrorTypeLookup),
+			slog.String(logattr.ExceptionMessage, errors.Join(errs...).Error()),
 		}
+		if len(users) > 0 {
+			attrs = append(attrs, slog.Any(logattr.AccountUsers, users))
+		}
+		if len(groups) > 0 {
+			attrs = append(attrs, slog.Any(logattr.AccountGroups, groups))
+		}
+		l.log.LogAttrs(ctx, slog.LevelWarn, "account lookups failed", attrs...)
 	}
 	if a.again {
 		a.again = false

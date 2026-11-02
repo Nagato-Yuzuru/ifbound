@@ -13,6 +13,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
@@ -71,6 +72,10 @@ type loop struct {
 	// report sets it when it finds a loaded ruleset that is not the
 	// installed one.
 	recheck bool
+	// failed is the error.type and the error text of the last
+	// convergence, or "" when it succeeded. A failure that repeats is
+	// logged at debug.
+	failed string
 }
 
 func newLoop(c Config, store storeFunc, pub *atomic.Pointer[Status]) *loop {
@@ -146,6 +151,21 @@ func (l *loop) policies() []policy.Policy {
 	}
 }
 
+// activeDigest returns the digest of the active configuration. It
+// returns false when the daemon has no configuration.
+func (l *loop) activeDigest() (configstore.Digest, bool) {
+	switch m := l.mode.(type) {
+	case unconfiguredMode:
+		return configstore.Digest{}, false
+	case loadingMode:
+		return m.conf.digest, true
+	case runningMode:
+		return m.conf.digest, true
+	default:
+		return configstore.Digest{}, false
+	}
+}
+
 func policyNames(cfg policy.Config) []policy.Name {
 	names := make([]policy.Name, len(cfg.Policies))
 	for i, p := range cfg.Policies {
@@ -160,12 +180,16 @@ func policyNames(cfg policy.Config) []policy.Name {
 //
 // The host file comes first: adoption must know which kernel entries are
 // host addresses. Without a configuration, it does nothing.
+//
+// Each pass that it starts writes one convergence event (see
+// logConverge), and one more event when it ended pf states.
 func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	var (
 		conf   activeConfig
 		retain time.Duration
 		book   *addrbook.AddrBook
 	)
+	began := time.Now()
 	switch m := l.mode.(type) {
 	case unconfiguredMode:
 		return errNoConfig
@@ -175,6 +199,7 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		b, err := l.loadBook(ctx, conf, retain)
 		if err != nil {
 			l.setPhase(ctx, startingPhase(err.Error()))
+			l.logConverge(ctx, trigger, time.Since(began), reconcile.Report{}, logattr.ErrorTypeSnapshot, err)
 			return err
 		}
 		book = b
@@ -198,10 +223,7 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		// find its addresses.
 		book.Prune(policyNames(conf.cfg))
 	}
-	if rep.Writes > 0 {
-		l.log.InfoContext(ctx, "enforcement changed",
-			slog.String("trigger", trigger), slog.Int("writes", rep.Writes), slog.Bool("complete", err == nil))
-	}
+	l.logStatesEnded(ctx, logattr.StatesCauseNarrowed, rep.Narrowed)
 	if p, ok := l.hosts.problem(); ok {
 		rep.Problems = append(rep.Problems, p)
 	}
@@ -224,7 +246,53 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	// The book is loaded, so the daemon runs from now on, also when the
 	// convergence failed.
 	l.setMode(ctx, runningMode{conf: conf, retain: retain, book: book, phase: p})
+	l.logConverge(ctx, trigger, time.Since(began), rep, logattr.ErrorTypePlatform, err)
 	return err
+}
+
+// logConverge writes the event of one convergence pass, after the pass
+// set the phase. A failure is a warning when it starts or changes, and
+// debug while the same failure repeats: the self-heal timer starts one
+// pass every SelfHealInterval, and the state changed event shows the
+// recovery. A pass that wrote to the kernel is info, and a pass that
+// found nothing to do is debug. errType is the error.type of a non-nil
+// err.
+func (l *loop) logConverge(ctx context.Context, trigger string, took time.Duration, rep reconcile.Report, errType string, err error) {
+	attrs := []slog.Attr{
+		slog.String(logattr.ConvergeTrigger, trigger),
+		slog.Int(logattr.ConvergeWrites, rep.Writes),
+		slog.Int64(logattr.ConvergeDurationMS, took.Milliseconds()),
+		slog.String(logattr.EnforcementState, l.phase().state.String()),
+	}
+	level := slog.LevelDebug
+	failed := ""
+	switch {
+	case err != nil:
+		failed = errType + ": " + err.Error()
+		if failed != l.failed {
+			level = slog.LevelWarn
+		}
+		attrs = append(attrs, slog.String(logattr.ErrorType, errType), slog.String(logattr.ExceptionMessage, err.Error()))
+	case rep.Writes > 0:
+		level = slog.LevelInfo
+	}
+	l.failed = failed
+	l.log.LogAttrs(ctx, level, "convergence", attrs...)
+}
+
+// logStatesEnded writes one event for the policies whose pf connection
+// states a convergence ended for cause. It writes nothing when policies
+// is empty. An end of states cannot be undone, so the event is info.
+func (l *loop) logStatesEnded(ctx context.Context, cause string, policies []policy.Name) {
+	if len(policies) == 0 {
+		return
+	}
+	names := make([]string, len(policies))
+	for i, p := range policies {
+		names[i] = string(p)
+	}
+	l.log.LogAttrs(ctx, slog.LevelInfo, "pf states ended",
+		slog.String(logattr.StatesCause, cause), slog.Any(logattr.PolicyNames, names))
 }
 
 // loadBook builds a book from the snapshot. A snapshot without addresses
@@ -334,7 +402,7 @@ func (l *loop) setMode(ctx context.Context, m mode) {
 		level = slog.LevelInfo
 	}
 	l.log.LogAttrs(ctx, level, "state changed",
-		slog.String("state", p.state.String()), slog.Any("reasons", p.reasons))
+		slog.String(logattr.EnforcementState, p.state.String()), slog.Any(logattr.EnforcementReasons, p.reasons))
 }
 
 func (l *loop) armExpiry(t *time.Timer) {
@@ -353,7 +421,7 @@ func (l *loop) armExpiry(t *time.Timer) {
 
 func (l *loop) expire(ctx context.Context) {
 	if m, ok := l.mode.(runningMode); ok && len(m.book.Expire()) > 0 {
-		_ = l.reconcile(ctx, "expiry") //nolint:errcheck // the phase holds the outcome
+		_ = l.reconcile(ctx, logattr.TriggerExpiry) //nolint:errcheck // the phase holds the outcome
 	}
 }
 
@@ -368,7 +436,7 @@ func (l *loop) reconfigure(ctx context.Context, cfg policy.Config, digest config
 	l.setPhase(ctx, unenforcedPhase("the new configuration is not installed yet"))
 	l.publish()
 	l.readAccounts(ctx)
-	return l.reconcile(ctx, "config")
+	return l.reconcile(ctx, logattr.TriggerConfig)
 }
 
 // apply stores data and then reconfigures. It does not start the store
@@ -377,19 +445,54 @@ func (l *loop) reconfigure(ctx context.Context, cfg policy.Config, digest config
 // before the store. A refused or failed store changes nothing and
 // returns a zero Status. A store whose directory sync failed is in
 // place, so it applies, and its error wraps configstore.ErrNotDurable.
+// Each call writes one apply event.
 func (l *loop) apply(ctx, caller context.Context, data []byte) (Status, error) {
+	previous, hadConfig := l.activeDigest()
 	if err := caller.Err(); err != nil {
-		return Status{}, fmt.Errorf("apply not started: %w", err)
+		err = fmt.Errorf("apply not started: %w", err)
+		l.logApply(ctx, previous, hadConfig, logattr.ErrorTypeCanceled, err)
+		return Status{}, err
 	}
 	cfg, digest, err := l.storeFn(l.store, data, l.storeGID)
 	if err != nil && !errors.Is(err, configstore.ErrNotDurable) {
+		l.logApply(ctx, previous, hadConfig, storeErrType(err), err)
 		return Status{}, err
 	}
-	if err != nil {
-		l.log.WarnContext(ctx, "the applied configuration is not durable", slog.Any("error", err))
-	}
 	_ = l.reconfigure(ctx, cfg, digest) //nolint:errcheck // the phase holds the outcome, and Status reports it
+	l.logApply(ctx, previous, hadConfig, logattr.ErrorTypeConfigNotDurable, err)
 	return l.status(), err
+}
+
+// storeErrType returns the error.type of an error of configstore.Store
+// that changed nothing.
+func storeErrType(err error) string {
+	if _, ok := errors.AsType[*policy.FieldError](err); ok {
+		return logattr.ErrorTypeConfigInvalid
+	}
+	return logattr.ErrorTypeConfigFile
+}
+
+// logApply writes the event of one Apply. The digest is the one of the
+// configuration that runs after the Apply: after a refused store, it is
+// the one that still runs. previous is the digest of the configuration
+// that ran before, when hadConfig. errType is the error.type of a non-nil
+// err. A caller that left before the start is info: nothing is degraded.
+func (l *loop) logApply(ctx context.Context, previous configstore.Digest, hadConfig bool, errType string, err error) {
+	attrs := []slog.Attr{slog.String(logattr.EnforcementState, l.phase().state.String())}
+	if digest, ok := l.activeDigest(); ok {
+		attrs = append(attrs, slog.String(logattr.ConfigDigest, digest.String()))
+	}
+	if hadConfig {
+		attrs = append(attrs, slog.String(logattr.ConfigPreviousDigest, previous.String()))
+	}
+	level := slog.LevelInfo
+	if err != nil {
+		if errType != logattr.ErrorTypeCanceled {
+			level = slog.LevelWarn
+		}
+		attrs = append(attrs, slog.String(logattr.ErrorType, errType), slog.String(logattr.ExceptionMessage, err.Error()))
+	}
+	l.log.LogAttrs(ctx, level, "apply", attrs...)
 }
 
 // selfTestResult takes the latest results of the warm-up. Only a result

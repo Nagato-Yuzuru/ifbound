@@ -12,10 +12,13 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 )
 
 // TestHelperEMFILEServer runs a real server, then uses up its file
@@ -186,18 +189,18 @@ func keepConnecting(t *testing.T, path string, d time.Duration) {
 	}
 }
 
-var delayRE = regexp.MustCompile(`accept failed; retrying.*delay=(\S+)`)
+var delayRE = regexp.MustCompile(`accept failed; retrying.*` + regexp.QuoteMeta(logattr.BackoffMS) + `=(\d+)`)
 
 // checkBackoff checks the logged delays: 5 ms first, doubling, 1 s cap.
 func checkBackoff(t *testing.T, log string) {
 	t.Helper()
 	var delays []time.Duration
 	for _, m := range delayRE.FindAllStringSubmatch(log, -1) {
-		d, err := time.ParseDuration(m[1])
+		ms, err := strconv.Atoi(m[1])
 		if err != nil {
 			t.Fatal(err)
 		}
-		delays = append(delays, d)
+		delays = append(delays, time.Duration(ms)*time.Millisecond)
 	}
 	if len(delays) == 0 {
 		t.Fatalf("no accept failure was logged:\n%s", log)
