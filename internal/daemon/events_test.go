@@ -62,6 +62,22 @@ func (h *harness) last(msg string) event {
 	return evs[len(evs)-1]
 }
 
+// wantConvergedBy fails when no convergence event after the first
+// before events has the trigger. Other passes, such as the self-test
+// pass of the warm-up, can run after the pass under test.
+func (h *harness) wantConvergedBy(before int, trigger string) {
+	h.t.Helper()
+	var got []string
+	for _, e := range h.logs.events("convergence")[before:] {
+		v := e.attrs[logattr.ConvergeTrigger].String()
+		if v == trigger {
+			return
+		}
+		got = append(got, v)
+	}
+	h.t.Errorf("convergence events after the change have triggers %v, want one %s", got, trigger)
+}
+
 // Each convergence pass writes one event. Its level tells the outcome: a
 // pass with kernel writes is info, a pass with nothing to do is debug,
 // and a failed pass is a warning with the class and the text of the
@@ -148,6 +164,7 @@ func TestStatesEndedEvent(t *testing.T) {
 		defer h.stop()
 		h.wantState(daemon.StateReady)
 		before := len(h.logs.events("pf states ended"))
+		convergences := len(h.logs.events("convergence"))
 
 		// utun0 is new and both policies deny it.
 		h.inv.Set(en0, utun0)
@@ -165,7 +182,7 @@ func TestStatesEndedEvent(t *testing.T) {
 			logattr.StatesCause: logattr.StatesCauseNarrowed,
 			logattr.PolicyNames: []string{"web", "ads"},
 		})
-		wantAttrs(t, h.last("convergence"), map[string]any{logattr.ConvergeTrigger: logattr.TriggerInterfaces})
+		h.wantConvergedBy(convergences, logattr.TriggerInterfaces)
 	})
 }
 
@@ -177,6 +194,7 @@ func TestApplyEvent(t *testing.T) {
 		h := newHarness(t, configV1)
 		defer h.stop()
 		h.wantState(daemon.StateReady)
+		convergences := len(h.logs.events("convergence"))
 
 		st, err := h.d.Apply(t.Context(), []byte(configV2))
 		if err != nil {
@@ -195,7 +213,7 @@ func TestApplyEvent(t *testing.T) {
 			logattr.EnforcementState:     st.State.String(),
 		})
 		wantNoAttrs(t, evs[0], logattr.ErrorType, logattr.ExceptionMessage)
-		wantAttrs(t, h.last("convergence"), map[string]any{logattr.ConvergeTrigger: logattr.TriggerConfig})
+		h.wantConvergedBy(convergences, logattr.TriggerConfig)
 
 		if _, err := h.d.Apply(t.Context(), []byte("[[policy]]\nname = 1\n")); err == nil {
 			t.Fatal("Apply of an invalid configuration: nil error")
