@@ -314,10 +314,22 @@ func (rg *rig) checkObserve(r *rand.Rand) (rechecked bool) {
 		if !errors.Is(err, daemon.ErrUnenforced) {
 			rg.fatalf("in unenforced: err = %v, want ErrUnenforced", err)
 		}
-	case len(want) == 0, len(o.Addrs) == 0:
-		// A report without an address only asks for the protected flag,
-		// so its ack promises nothing about the platform.
+	case len(want) == 0:
 		rg.checkUnmatched(err, st.State, tablesBefore, snapBefore)
+	case len(o.Addrs) == 0:
+		// A report without an address writes nothing. Only a ruleset
+		// that changed outside can make it fail, and then with
+		// ErrUnenforced. The ack gets the loaded ruleset check as any
+		// other protected ack.
+		if err != nil {
+			if !rg.f.tampered || !errors.Is(err, daemon.ErrUnenforced) {
+				rg.fatalf("matched name without an address in %v, tampered %v: err = %v, want an ack", st.State, rg.f.tampered, err)
+			}
+			rg.stats["matched no-address tampered"]++
+			return true
+		}
+		rg.checkAck(o, want, start)
+		rg.checkNoWrites(tablesBefore, snapBefore)
 	case err != nil:
 		if rg.f.healthy() {
 			rg.fatalf("matched name in %v without a fault: err = %v, want an ack", st.State, err)
@@ -329,19 +341,24 @@ func (rg *rig) checkObserve(r *rand.Rand) (rechecked bool) {
 	return false
 }
 
-// checkUnmatched pins today's behavior: an unmatched name, and a report
-// without an address, is acked in ready and degraded, and changes no
-// table and no snapshot.
+// checkUnmatched pins today's behavior: an unmatched name is acked in
+// ready and degraded, and changes no table and no snapshot.
 func (rg *rig) checkUnmatched(err error, state daemon.State, tablesBefore map[policy.Name][]netip.Prefix, snapBefore []byte) {
 	rg.t.Helper()
 	if err != nil {
 		rg.fatalf("unmatched name in %v: err = %v, want an ack", state, err)
 	}
+	rg.checkNoWrites(tablesBefore, snapBefore)
+}
+
+// checkNoWrites checks that a report changed no table and no snapshot.
+func (rg *rig) checkNoWrites(tablesBefore map[policy.Name][]netip.Prefix, snapBefore []byte) {
+	rg.t.Helper()
 	if after := rg.world.Tables(); !maps.EqualFunc(after, tablesBefore, slices.Equal) {
-		rg.fatalf("unmatched name changed the tables: %v -> %v", tablesBefore, after)
+		rg.fatalf("the report changed the tables: %v -> %v", tablesBefore, after)
 	}
 	if after, _ := os.ReadFile(rg.snap); !bytes.Equal(after, snapBefore) { //nolint:errcheck // a missing snapshot reads as empty, as before
-		rg.fatalf("unmatched name changed the snapshot")
+		rg.fatalf("the report changed the snapshot")
 	}
 }
 
@@ -570,7 +587,7 @@ func TestAckInvariantUnderRandomEvents(t *testing.T) {
 	for _, k := range []string{
 		"matched ready ack", "matched degraded ack", "matched ready reject",
 		"matched unenforced reject", "unmatched ready ack", "unmatched unenforced reject",
-		"malformed ready reject",
+		"malformed ready reject", "matched no-address tampered",
 	} {
 		if stats[k] == 0 {
 			t.Errorf("no %q case in the random runs", k)

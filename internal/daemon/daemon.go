@@ -316,12 +316,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 }
 
-// Observe implements ipc.Handler. It returns a nil error, the
-// acknowledgement, only when every address is in the table of each
-// matching policy, in the saved snapshot, and the installed ruleset is
-// still loaded. The ack is protected when the name matches at least one
-// policy. A name that matches no policy is acknowledged as not protected
-// and not stored. It returns ErrNotReady in StateStarting, ErrUnenforced
+// Observe implements ipc.Handler. A name that matches no policy gets a
+// nil error and an unprotected ack. The address list and the ruleset are
+// not checked then. For a name that matches a policy, a nil error means
+// that every address is in the table of each matching policy and in the
+// saved snapshot, and that the installed ruleset is loaded. The ack is
+// then protected. It returns ErrNotReady in StateStarting, ErrUnenforced
 // when enforcement is not installed, an error that wraps
 // matcher.ErrMalformedName for a name that cannot be classified, and the
 // platform error otherwise. See call for ctx.Err() and ErrStopped.

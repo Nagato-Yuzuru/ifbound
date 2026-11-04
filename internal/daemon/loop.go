@@ -383,17 +383,15 @@ func (l *loop) selfTestProblem() (reconcile.Problem, bool) {
 }
 
 // observe handles one DNS report. The report is untrusted: only the
-// policies that match its name get its addresses. The order keeps the
-// acknowledgement honest: book, tables, snapshot, a check that the
-// installed ruleset is still loaded, and only then nil. The check costs
-// one LoadedID read per report that matches a policy. After a failure the
-// book keeps the addresses, so the next report or convergence completes
-// the work.
+// policies that match its name get its addresses.
 //
-// The ack is protected when the name matches a policy: ifbound-dns then
-// removes the aliases from the reply. A report without an address only
-// asks for that flag. The ack promises nothing about addresses then, so
-// it needs no platform call; the phase checks still apply.
+// A name that matches no policy gets an unprotected ack, with no check.
+// For a name that matches a policy, the order is: record the addresses,
+// check that the installed ruleset is loaded, and only then ack as
+// protected. A report without an address skips record but not the check.
+// The check costs one LoadedID read per report that matches a policy.
+// ifbound-dns removes the aliases from the reply when the ack is
+// protected.
 func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
 	switch {
 	case l.phase.state == StateStarting:
@@ -405,17 +403,24 @@ func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) 
 	if err != nil {
 		return ipc.Ack{}, fmt.Errorf("classifying qname: %w", err)
 	}
-	if len(names) == 0 || len(o.Addrs) == 0 {
-		return ipc.Ack{Protected: len(names) > 0}, nil
+	if len(names) == 0 {
+		return ipc.Ack{}, nil
 	}
-	if err := l.record(ctx, names, o); err != nil {
+	if len(o.Addrs) > 0 {
+		if err := l.record(ctx, names, o); err != nil {
+			return ipc.Ack{}, err
+		}
+	}
+	if err := l.checkInstalled(ctx); err != nil {
 		return ipc.Ack{}, err
 	}
 	return ipc.Ack{Protected: true}, nil
 }
 
 // record puts the addresses of o in the book, the tables, and the
-// snapshot of each policy in names.
+// snapshot of each policy in names, in this order. After a failure, the
+// book keeps the addresses. The next report or convergence completes the
+// work.
 func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observation) error {
 	addrs := canonical(o.Addrs)
 	needSave := false
@@ -436,12 +441,13 @@ func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observatio
 			return fmt.Errorf("saving snapshot: %w", err)
 		}
 	}
-	return l.checkInstalled(ctx)
+	return nil
 }
 
-// checkInstalled confirms that the Backend still has the installed
-// ruleset loaded. If not, something outside ifbound changed it: the phase
-// stops acknowledging, and Run converges right after this request.
+// checkInstalled returns nil when the Backend has the installed ruleset
+// loaded. Otherwise something outside ifbound changed it. The phase then
+// stops acknowledging, and Run converges right after this request. It
+// returns ErrUnenforced in this case.
 func (l *loop) checkInstalled(ctx context.Context) error {
 	id, err := l.rec.Backend.LoadedID(ctx)
 	if err != nil {
