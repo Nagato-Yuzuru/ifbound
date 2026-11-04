@@ -227,6 +227,32 @@ func TestHostEntriesFollowConfiguration(t *testing.T) {
 	})
 }
 
+// A configuration change while the snapshot does not load maps the host
+// file again under the new configuration.
+func TestConfigChangeWhileStartingMapsTheHostFileAgain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newUnloadableSpec(t, configV1)
+		s.hosts = &fakeHosts{}
+		s.hosts.set(true, "10.1.1.1 mail.example.org\n", nil)
+		h := launch(t, s)
+		defer h.stop()
+		h.wantState(daemon.StateStarting)
+
+		if err := h.d.Reconfigure(t.Context(), parse(t, configV2)); err == nil {
+			t.Fatal("Reconfigure = nil, want the snapshot error")
+		}
+		h.wantState(daemon.StateStarting)
+		if err := os.Remove(s.snapshot); err != nil {
+			t.Fatal(err)
+		}
+		heal()
+		h.status()
+		if !h.hasEntry("mail", host("10.1.1.1")) {
+			t.Errorf("mail table = %v, want the host address", h.world.Tables()["mail"])
+		}
+	})
+}
+
 // A host file that exists but cannot be read is a problem that does not
 // void enforcement. The addresses of the last good read stay until a
 // read succeeds.

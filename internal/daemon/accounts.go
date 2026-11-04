@@ -179,9 +179,9 @@ func (l *loop) applyAccounts(ctx context.Context, r accountsRead) bool {
 // accountsProblem returns the Problem of the account snapshot, if there
 // is one. It does not void enforcement: a scope that the snapshot cannot
 // resolve is dropped, and the policy then applies to all traffic.
-func (l *loop) accountsProblem() (reconcile.Problem, bool) {
+func (l *loop) accountsProblem(policies []policy.Policy) (reconcile.Problem, bool) {
 	a := &l.accounts
-	if users, groups := scopeNames(l.policies()); len(users) == 0 && len(groups) == 0 {
+	if users, groups := scopeNames(policies); len(users) == 0 && len(groups) == 0 {
 		return reconcile.Problem{}, false
 	}
 	var text string

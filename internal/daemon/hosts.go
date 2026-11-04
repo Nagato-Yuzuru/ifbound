@@ -60,10 +60,10 @@ type HostsReader interface {
 
 // refreshHosts reads the host file again when it changed or the last
 // read failed, and maps its entries again when the content or the
-// configuration changed. run is the running configuration. A file that
+// configuration changed. conf is the active configuration. A file that
 // exists but cannot be read keeps the addresses of the last good read:
 // other readers can still read it, so its entries can be in use.
-func (l *loop) refreshHosts(ctx context.Context, run running) {
+func (l *loop) refreshHosts(ctx context.Context, conf activeConfig) {
 	h := &l.hosts
 	if v, err := h.reader.Version(); err != nil {
 		h.fail(ctx, l.log, err)
@@ -72,10 +72,10 @@ func (l *loop) refreshHosts(ctx context.Context, run running) {
 	}
 	switch {
 	case !h.read:
-		l.keepKernelHosts(ctx, run.cfg.Policies)
-	case h.dirty || h.gen != run.gen:
-		h.addrs = l.mapHosts(ctx, run)
-		h.gen, h.dirty = run.gen, false
+		l.keepKernelHosts(ctx, conf.cfg.Policies)
+	case h.dirty || h.gen != conf.gen:
+		h.addrs = l.mapHosts(ctx, conf)
+		h.gen, h.dirty = conf.gen, false
 	}
 }
 
@@ -143,11 +143,11 @@ func (h *hostsState) problem() (reconcile.Problem, bool) {
 // It also logs each line with a name that the entries cannot show, when
 // the name is at or below an apex. Such a line can hold a protected
 // address that no table has.
-func (l *loop) mapHosts(ctx context.Context, run running) map[policy.Name][]netip.Addr {
+func (l *loop) mapHosts(ctx context.Context, conf activeConfig) map[policy.Name][]netip.Addr {
 	g := newHostGraph(l.hosts.good.Entries)
 	out := make(map[policy.Name][]netip.Addr)
 	for name := range g.names() {
-		policies, err := run.matcher.Match(name)
+		policies, err := conf.matcher.Match(name)
 		if err != nil {
 			// A name that dnsname built always splits.
 			l.log.ErrorContext(ctx, "host file name does not split", slog.String("name", name), slog.Any("error", err))
@@ -166,7 +166,7 @@ func (l *loop) mapHosts(ctx context.Context, run running) map[policy.Name][]neti
 		out[p] = slices.Compact(addrs)
 	}
 	for _, line := range l.hosts.good.Unrepresentable {
-		if names := belowApex(run.apexes, line.Names); len(names) > 0 {
+		if names := belowApex(conf.apexes, line.Names); len(names) > 0 {
 			l.log.WarnContext(ctx, "host file line has a protected name that ifbound cannot read",
 				slog.Int("line", line.Number), slog.Any("names", names))
 		}
