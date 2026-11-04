@@ -106,9 +106,8 @@ type Config struct {
 	ConfigGID int
 	// Snapshot is the path of the address book snapshot.
 	Snapshot string
-	// HostsFile is the path of the host file. Empty means the host file
-	// of layout.Default.
-	HostsFile string
+	// Hosts reads the host file. It is required.
+	Hosts HostsReader
 	// Platform converges the platform state. All its fields are required.
 	Platform reconcile.Reconciler
 	// Lookup sends the probe names and the warm-up names through the
@@ -183,6 +182,8 @@ func (c Config) check() error {
 		return fmt.Errorf("%w: ConfigPath %q is not an absolute clean path", ErrBadConfig, c.ConfigPath)
 	case c.ConfigGID == 0:
 		return fmt.Errorf("%w: ConfigGID is zero", ErrBadConfig)
+	case c.Hosts == nil:
+		return fmt.Errorf("%w: Hosts is nil", ErrBadConfig)
 	default:
 		return nil
 	}
@@ -207,8 +208,8 @@ func (c Config) check() error {
 // save them before it leaves StateStarting. The self-heal timer retries
 // the load and the convergence until both succeed.
 //
-// Each convergence first checks the modification time and the size of
-// the host file, and reads it again when they changed. While the file
+// Each convergence first asks Config.Hosts for the version of the host
+// file, and reads it again when the version changed. While the file
 // has an entry for a name that matches a policy, the table of the policy
 // holds the address of the entry; when the entry goes away, the next
 // convergence removes the address. A missing file has no entries. A

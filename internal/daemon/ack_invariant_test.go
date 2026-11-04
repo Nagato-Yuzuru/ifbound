@@ -156,8 +156,8 @@ func newRig(t *testing.T, world *reconciletest.World, dir string, cfgText string
 		ConfigPath: storeConfig(t, t.TempDir(), cfgText),
 		ConfigGID:  -1,
 		Snapshot:   rg.snap,
-		// No host file: the tests here do not depend on the host file of the machine.
-		HostsFile: filepath.Join(filepath.Dir(rg.snap), "hosts"),
+		// A missing host file: the tests here do not read the host file of the machine.
+		Hosts: &fakeHosts{},
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
 			Backend:   world.Backend(),

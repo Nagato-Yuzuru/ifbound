@@ -759,8 +759,8 @@ func (r *omRun) start() {
 		ConfigPath: r.store,
 		ConfigGID:  -1,
 		Snapshot:   r.snap,
-		// No host file: the tests here do not depend on the host file of the machine.
-		HostsFile: filepath.Join(filepath.Dir(r.snap), "hosts"),
+		// A missing host file: the tests here do not read the host file of the machine.
+		Hosts: &fakeHosts{},
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
 			Backend:   &omBackend{in: r.world.Backend(), r: r},

@@ -294,8 +294,8 @@ func TestWarmUpWaitsForTheProbeAndRetriesLater(t *testing.T) {
 			ConfigPath: storeConfig(t, t.TempDir(), rigCfgA),
 			ConfigGID:  -1,
 			Snapshot:   filepath.Join(t.TempDir(), "addrbook.json"),
-			// No host file: the test does not depend on the host file of the machine.
-			HostsFile: filepath.Join(t.TempDir(), "hosts"),
+			// A missing host file: the tests here do not read the host file of the machine.
+			Hosts: &fakeHosts{},
 			Platform: reconcile.Reconciler{
 				Compiler: reconciletest.Compiler{}, Backend: w.Backend(), Resolver: w.Resolver(),
 				Inventory: reconciletest.NewInventory(rigEn0),
