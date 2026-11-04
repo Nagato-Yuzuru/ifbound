@@ -1,7 +1,11 @@
 package daemon
 
 import (
+	"time"
+
+	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
+	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
@@ -120,3 +124,66 @@ func convergedPhase(rep reconcile.Report, err error) phase {
 
 // acks reports whether the phase acknowledges reports.
 func (p phase) acks() bool { return p.installed != "" }
+
+// mode is the lifecycle of the loop: exactly one of unconfiguredMode,
+// loadingMode, and runningMode. Only runningMode has a book.
+//
+//sumtype:decl
+type mode interface{ isMode() }
+
+// unconfiguredMode: the daemon has no configuration. It does not
+// converge, so it keeps the platform state that it found.
+type unconfiguredMode struct{ phase phase }
+
+// loadingMode: the daemon has a configuration, but no load of the
+// snapshot succeeded yet. It does not converge: an empty book would
+// remove every learned address.
+type loadingMode struct {
+	run   running
+	phase phase
+}
+
+// runningMode: the daemon has a configuration and the book of the
+// loaded snapshot. It converges, and its phase can acknowledge reports.
+type runningMode struct {
+	run   running
+	book  *addrbook.AddrBook
+	phase phase
+}
+
+func (unconfiguredMode) isMode() {}
+func (loadingMode) isMode()      {}
+func (runningMode) isMode()      {}
+
+// running is what one configuration gives the daemon. newRunning builds
+// it, and a new configuration replaces it as a whole.
+type running struct {
+	cfg policy.Config
+	// digest is the digest of the stored file of cfg, or zero.
+	digest  configstore.Digest
+	matcher *matcher.Matcher
+	apexes  []policy.Domain
+	// upstream is the error of the upstream check for cfg, or nil.
+	upstream error
+	warnings []policy.Warning
+	// gen counts the configurations. A warm-up runs only under the
+	// configuration that it started with.
+	gen uint64
+	// retain is the retain of the book. The first configuration fixes
+	// it, and each later one copies it.
+	retain time.Duration
+}
+
+func newRunning(cfg policy.Config, digest configstore.Digest, gen uint64, retain time.Duration) running {
+	m := matcher.New(cfg.Policies)
+	return running{
+		cfg:      cfg,
+		digest:   digest,
+		matcher:  m,
+		apexes:   m.Apexes(),
+		upstream: cfg.CheckUpstreams(),
+		warnings: cfg.Warnings(),
+		gen:      gen,
+		retain:   retain,
+	}
+}

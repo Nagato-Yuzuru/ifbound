@@ -86,18 +86,20 @@ func newWarmUp(lookup SystemResolver, prove func(context.Context, policy.Domain)
 // acking. A warm-up starts again from its first name when the phase acks
 // again: the reports of its lookups were not acked meanwhile.
 func (w *warmUp) sync(ctx context.Context, l *loop) {
-	if w.cancel != nil && (w.gen != l.gen || !l.phase.acks()) {
+	m, isRunning := l.mode.(runningMode)
+	acks := isRunning && m.phase.acks()
+	if w.cancel != nil && (!acks || w.gen != m.run.gen) {
 		w.cancel()
 		w.cancel = nil
 	}
-	if w.cancel != nil || !l.phase.acks() {
+	if w.cancel != nil || !acks {
 		return
 	}
-	names := warmUpNames(l.cfg)
+	names := warmUpNames(m.run.cfg)
 	var wctx context.Context
 	wctx, w.cancel = context.WithCancel(ctx)
-	w.gen = l.gen
-	gen := l.gen
+	w.gen = m.run.gen
+	gen := m.run.gen
 	w.wg.Go(func() { w.run(wctx, ctx, names, gen) })
 }
 

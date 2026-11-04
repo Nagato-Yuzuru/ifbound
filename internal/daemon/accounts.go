@@ -88,7 +88,7 @@ func (l *loop) readAccounts(ctx context.Context) {
 	}
 	a.reading, a.overdue = true, false
 	a.timeout = time.After(AccountReadTimeout)
-	users, groups := scopeNames(l.cfg.Policies)
+	users, groups := scopeNames(l.policies())
 	r, results := a.reader, a.results
 	// Run does not wait for this goroutine. A lookup that still runs when
 	// Run returns goes on until the system call returns, and its result
@@ -181,7 +181,7 @@ func (l *loop) applyAccounts(ctx context.Context, r accountsRead) bool {
 // resolve is dropped, and the policy then applies to all traffic.
 func (l *loop) accountsProblem() (reconcile.Problem, bool) {
 	a := &l.accounts
-	if users, groups := scopeNames(l.cfg.Policies); len(users) == 0 && len(groups) == 0 {
+	if users, groups := scopeNames(l.policies()); len(users) == 0 && len(groups) == 0 {
 		return reconcile.Problem{}, false
 	}
 	var text string
