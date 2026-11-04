@@ -185,11 +185,9 @@ func (m *amModel) observe() {
 }
 
 // checkAcked checks the invariant for the acked addresses of policy p:
-// a report without an address is acked for the protected flag only.
+// the loaded ruleset refers to p, and each address is in the table and in
+// the snapshot. A report without an address has no address to check.
 func (m *amModel) checkAcked(q string, p policy.Name, addrs []netip.Addr) {
-	if len(addrs) == 0 {
-		return
-	}
 	if !m.h.references(p) {
 		m.fatalf("ack of %s: the loaded ruleset does not refer to %s (%v)", q, p, m.h.world.Referenced())
 	}

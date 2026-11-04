@@ -582,15 +582,14 @@ func TestForeignRulesetStopsAcksAndConvergesAtOnce(t *testing.T) {
 	})
 }
 
-// A report without an address asks only for the protected flag. Its ack
-// reads nothing from the platform: a foreign ruleset, which a report with
-// an address finds, goes unnoticed, and nothing is written.
+// A report without an address asks only for the protected flag. It writes
+// nothing, but its protected ack still needs the loaded ruleset check. A
+// name without a policy needs no check.
 func TestObserveWithoutAddressAsksOnlyForTheFlag(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, configV1)
 		defer h.stop()
 		h.wantState(daemon.StateReady)
-		h.world.ExternalLoad([]byte("pass all\n"))
 		writes := h.world.Writes()
 
 		for name, want := range map[string]bool{"www.example.net": true, "www.example.org": false} {
@@ -603,8 +602,37 @@ func TestObserveWithoutAddressAsksOnlyForTheFlag(t *testing.T) {
 		if h.world.Writes() != writes {
 			t.Error("a report without an address wrote to the platform")
 		}
-		if _, err := h.d.Observe(t.Context(), obs("www.example.net", "203.0.113.1")); !errors.Is(err, daemon.ErrUnenforced) {
-			t.Errorf("Observe with an address = %v, want ErrUnenforced: the fixture is broken", err)
+
+		h.world.ExternalLoad([]byte("pass all\n"))
+		ack, err := h.d.Observe(t.Context(), obs("www.example.org"))
+		if err != nil || ack.Protected {
+			t.Errorf("Observe of an unmatched name with a foreign ruleset = %+v, %v; want an unprotected ack", ack, err)
+		}
+	})
+}
+
+// A report without an address for a protected name gets the loaded
+// ruleset check as a report with addresses does.
+func TestForeignRulesetStopsAckOfReportWithoutAddress(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, configV1)
+		defer h.stop()
+		h.wantState(daemon.StateReady)
+		installed := h.world.Ruleset().ID()
+		h.world.ExternalLoad([]byte("pass all\n"))
+
+		ack, err := h.d.Observe(t.Context(), obs("www.example.net"))
+		if !errors.Is(err, daemon.ErrUnenforced) || ack.Protected {
+			t.Fatalf("Observe without an address, foreign ruleset = %+v, %v; want an unprotected ack and ErrUnenforced", ack, err)
+		}
+		synctest.Wait() // no time passes: this is not the self-heal
+
+		if h.world.Ruleset().ID() != installed {
+			t.Error("the daemon did not load its ruleset again after the report")
+		}
+		h.wantState(daemon.StateReady)
+		if ack, err := h.d.Observe(t.Context(), obs("www.example.net")); err != nil || !ack.Protected {
+			t.Errorf("Observe after the repair = %+v, %v; want a protected ack", ack, err)
 		}
 	})
 }
@@ -1032,6 +1060,48 @@ func TestFirstLoadFailureIsUnenforcedUntilRepaired(t *testing.T) {
 		}
 		if err := h.observe(obs("www.example.net", "203.0.113.2")); err != nil {
 			t.Errorf("Observe after repair = %v, want an ack", err)
+		}
+	})
+}
+
+// loadedIDFails is a Backend whose LoadedID fails while fail is set.
+type loadedIDFails struct {
+	*reconciletest.Backend
+	fail *atomic.Bool
+}
+
+func (b loadedIDFails) LoadedID(ctx context.Context) (string, error) {
+	if b.fail.Load() {
+		return "", reconciletest.ErrInjected
+	}
+	return b.Backend.LoadedID(ctx)
+}
+
+// When the daemon cannot read the loaded ruleset, a name that matches a
+// policy gets no protected ack, with or without an address. A name that
+// matches no policy needs no check.
+func TestUnreadableLoadedRulesetGivesNoProtectedAck(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		world := reconciletest.NewWorld()
+		var fail atomic.Bool
+		h := startOn(t, world, loadedIDFails{world.Backend(), &fail}, reconciletest.NewInventory(en0),
+			filepath.Join(t.TempDir(), "s.json"), configV1)
+		defer h.stop()
+		h.wantState(daemon.StateReady)
+		fail.Store(true)
+
+		for name, o := range map[string]ipc.Observation{
+			"matched, no address": obs("www.example.net"),
+			"matched, address":    obs("www.example.net", "203.0.113.1"),
+		} {
+			ack, err := h.d.Observe(t.Context(), o)
+			if err == nil || ack.Protected {
+				t.Errorf("%s = %+v, %v; want an error and no protected ack", name, ack, err)
+			}
+		}
+		ack, err := h.d.Observe(t.Context(), obs("www.example.org"))
+		if err != nil || ack != (ipc.Ack{}) {
+			t.Errorf("unmatched = %+v, %v; want ipc.Ack{} and nil", ack, err)
 		}
 	})
 }
