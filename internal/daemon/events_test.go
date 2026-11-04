@@ -12,6 +12,7 @@ import (
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
+	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
@@ -320,5 +321,118 @@ func TestWarmUpRoundEvent(t *testing.T) {
 			t.Errorf("%s = %v, want %v", logattr.WarmUpEmpty, empty, want)
 		}
 		wantNoAttrs(t, evs[0], logattr.WarmUpCancelled, logattr.WarmUpUnproven, logattr.ErrorType)
+	})
+}
+
+// lastReport makes one report and returns the report event that it
+// wrote.
+func (h *harness) lastReport(o ipc.Observation) event {
+	h.t.Helper()
+	before := len(h.logs.events("report"))
+	_ = h.observe(o) //nolint:errcheck // the event holds the outcome
+	evs := h.logs.events("report")
+	if len(evs) != before+1 {
+		h.t.Fatalf("report events = %d after one report, want %d", len(evs), before+1)
+	}
+	return evs[before]
+}
+
+// Each report writes one debug event with its result, the wait for the
+// loop, and the time on the loop. A report that the loop did not take has
+// no time on the loop.
+func TestReportEvent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, configV1)
+		h.wantState(daemon.StateReady)
+
+		for _, tc := range []struct {
+			o    ipc.Observation
+			want string
+		}{
+			{obs("www.example.net", "203.0.113.1"), logattr.ReportProtected},
+			{obs("www.example.net"), logattr.ReportProtected},
+			{obs("unmatched.test", "203.0.113.2"), logattr.ReportUnprotected},
+		} {
+			e := h.lastReport(tc.o)
+			if e.level != slog.LevelDebug {
+				t.Errorf("%s: level = %v, want debug", tc.o.QName, e.level)
+			}
+			wantAttrs(t, e, map[string]any{logattr.ReportResult: tc.want})
+			for _, k := range []string{logattr.ReportWaitUS, logattr.ReportObserveUS} {
+				if v, ok := e.attrs[k]; !ok || v.Kind() != slog.KindInt64 {
+					t.Errorf("%s: %s = %v, want an int", tc.o.QName, k, v)
+				}
+			}
+		}
+
+		h.world.FlushAll()
+		h.failWrites()
+		heal()
+		h.wantState(daemon.StateUnenforced)
+		e := h.lastReport(obs("www.example.net", "203.0.113.1"))
+		wantAttrs(t, e, map[string]any{logattr.ReportResult: logattr.ReportNotAcknowledged})
+		if _, ok := e.attrs[logattr.ReportObserveUS]; !ok {
+			t.Errorf("refused report has no %s", logattr.ReportObserveUS)
+		}
+
+		h.stop()
+		e = h.lastReport(obs("www.example.net", "203.0.113.1"))
+		wantAttrs(t, e, map[string]any{logattr.ReportResult: logattr.ReportNotAcknowledged})
+		wantNoAttrs(t, e, logattr.ReportObserveUS)
+	})
+}
+
+// A report that arrives during a convergence waits for its end. Its wait
+// is the rest of the convergence, and its time on the loop excludes the
+// wait. The bubble clock makes both exact.
+func TestReportWaitsBehindConvergence(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const perWrite = 40 * time.Millisecond
+		h := newHarness(t, configV1)
+		defer h.stop()
+		h.wantState(daemon.StateReady)
+
+		h.world.FlushAll()
+		h.world.SetBeforeWrite(func(int) error {
+			time.Sleep(perWrite)
+			return nil
+		})
+		before := len(h.logs.events("report"))
+		done := make(chan error, 1)
+		var total time.Duration
+		go func() {
+			time.Sleep(daemon.SelfHealInterval + time.Millisecond)
+			began := time.Now()
+			err := h.observe(obs("www.example.net", "203.0.113.1"))
+			total = time.Since(began)
+			done <- err
+		}()
+		heal()
+		if err := <-done; err != nil {
+			t.Fatalf("Observe: %v", err)
+		}
+
+		conv := h.last("convergence")
+		wantAttrs(t, conv, map[string]any{logattr.ConvergeTrigger: logattr.TriggerSelfHeal})
+		convMS := conv.attrs[logattr.ConvergeDurationMS].Int64()
+		if convMS == 0 {
+			t.Fatal("the self-heal took no time; the test proves nothing")
+		}
+		evs := h.logs.events("report")
+		if len(evs) != before+1 {
+			t.Fatalf("report events = %d, want %d", len(evs), before+1)
+		}
+		e := evs[before]
+		wantAttrs(t, e, map[string]any{
+			logattr.ReportResult: logattr.ReportProtected,
+			logattr.ReportWaitUS: int(convMS*1000 - time.Millisecond.Microseconds()),
+		})
+		wait, onLoop := e.attrs[logattr.ReportWaitUS].Int64(), e.attrs[logattr.ReportObserveUS].Int64()
+		if onLoop < perWrite.Microseconds() {
+			t.Errorf("%s = %d, want at least one write of %v", logattr.ReportObserveUS, onLoop, perWrite)
+		}
+		if wait+onLoop != total.Microseconds() {
+			t.Errorf("%s + %s = %d, want the time of Observe, %d", logattr.ReportWaitUS, logattr.ReportObserveUS, wait+onLoop, total.Microseconds())
+		}
 	})
 }
