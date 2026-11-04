@@ -9,7 +9,6 @@ import (
 	"maps"
 	"net/netip"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -189,8 +188,8 @@ func startWarm(t *testing.T, world *reconciletest.World, snapshot, cfgText strin
 		ConfigPath: storeConfig(t, t.TempDir(), cfgText),
 		ConfigGID:  -1,
 		Snapshot:   snapshot,
-		// No host file: the tests here do not depend on the host file of the machine.
-		HostsFile: filepath.Join(filepath.Dir(snapshot), "hosts"),
+		// A missing host file: the tests here do not read the host file of the machine.
+		Hosts: &fakeHosts{},
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
 			Backend:   world.Backend(),

@@ -347,15 +347,22 @@ func TestRunRefusesABadConfig(t *testing.T) {
 		name string
 		path string
 		gid  int
+		// noHosts leaves Config.Hosts nil.
+		noHosts bool
 	}{
-		{"relative path", "state/config.toml", -1},
-		{"path not clean", "/var/db/ifbound/../ifbound/config.toml", -1},
-		{"empty path", "", -1},
-		{"zero gid", "/var/db/ifbound/config.toml", 0},
+		{"relative path", "state/config.toml", -1, false},
+		{"path not clean", "/var/db/ifbound/../ifbound/config.toml", -1, false},
+		{"empty path", "", -1, false},
+		{"zero gid", "/var/db/ifbound/config.toml", 0, false},
+		{"nil hosts", "/var/db/ifbound/config.toml", -1, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			d := daemon.New(daemon.Config{ConfigPath: tt.path, ConfigGID: tt.gid})
+			cfg := daemon.Config{ConfigPath: tt.path, ConfigGID: tt.gid}
+			if !tt.noHosts {
+				cfg.Hosts = &fakeHosts{}
+			}
+			d := daemon.New(cfg)
 			if err := d.Run(t.Context()); !errors.Is(err, daemon.ErrBadConfig) {
 				t.Errorf("Run = %v, want ErrBadConfig", err)
 			}

@@ -13,7 +13,6 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
-	"github.com/Nagato-Yuzuru/ifbound/internal/layout"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
@@ -104,12 +103,9 @@ func newLoop(c Config, store storeFunc, pub *atomic.Pointer[Status]) *loop {
 		log:      c.Logger,
 		pub:      pub,
 		phase:    startingPhase(reasonNotLoaded),
-		hosts:    hostsState{path: c.HostsFile},
+		hosts:    hostsState{reader: c.Hosts},
 		accounts: newAccountsState(c.Accounts),
 		matcher:  matcher.New(nil),
-	}
-	if l.hosts.path == "" {
-		l.hosts.path = layout.Default().HostsFile
 	}
 	return l
 }

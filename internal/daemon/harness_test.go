@@ -95,13 +95,12 @@ type harness struct {
 	snapshot string
 	// store is the stored configuration of the daemon.
 	store string
-	// hosts is the host file of the daemon. It is next to the snapshot,
-	// so a restart on the same snapshot reads the same file.
-	hosts       string
-	hostsWrites int
-	logs        *capturedLogs
-	d           *daemon.Daemon
-	stop        func()
+	// hosts is the host file of the daemon. A restart with launch(t,
+	// h.spec) reads the same file.
+	hosts *fakeHosts
+	logs  *capturedLogs
+	d     *daemon.Daemon
+	stop  func()
 	// spec is what the daemon runs on. restart keeps it.
 	spec harnessSpec
 }
@@ -116,6 +115,10 @@ type harnessSpec struct {
 	store    string
 	accounts daemon.AccountReader
 	dns      *sysNet
+	// hosts is the host file. Nil means a new missing one at launch.
+	hosts *fakeHosts
+	// reader, when not nil, is the host file reader in place of hosts.
+	reader daemon.HostsReader
 }
 
 // newSpec returns a spec on a new World, with cfgText as the stored
@@ -161,6 +164,14 @@ func startWith(t *testing.T, world *reconciletest.World, be reconcile.Backend, i
 	})
 }
 
+// hostsReader returns the host file reader of s.
+func hostsReader(s harnessSpec) daemon.HostsReader {
+	if s.reader != nil {
+		return s.reader
+	}
+	return s.hosts
+}
+
 // launch runs a daemon on s until stop, and waits until the daemon blocks
 // for events.
 func launch(t *testing.T, s harnessSpec) *harness {
@@ -172,13 +183,15 @@ func launch(t *testing.T, s harnessSpec) *harness {
 // daemon before Run.
 func launchHook(t *testing.T, s harnessSpec, hook func(*daemon.Daemon)) *harness {
 	t.Helper()
-	hosts := filepath.Join(filepath.Dir(s.snapshot), "hosts")
+	if s.hosts == nil {
+		s.hosts = &fakeHosts{}
+	}
 	logs := &capturedLogs{}
 	d := daemon.New(daemon.Config{
 		ConfigPath: s.store,
 		ConfigGID:  -1,
 		Snapshot:   s.snapshot,
-		HostsFile:  hosts,
+		Hosts:      hostsReader(s),
 		Logger:     slog.New(logs),
 		Platform: reconcile.Reconciler{
 			Compiler:  scopeCompiler{},
@@ -205,7 +218,7 @@ func launchHook(t *testing.T, s harnessSpec, hook func(*daemon.Daemon)) *harness
 	}
 	return &harness{
 		t: t, world: s.world, inv: s.inv, snapshot: s.snapshot, store: s.store,
-		hosts: hosts, logs: logs, d: d, stop: stop, spec: s,
+		hosts: s.hosts, logs: logs, d: d, stop: stop, spec: s,
 	}
 }
 

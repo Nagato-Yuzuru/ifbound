@@ -27,6 +27,7 @@ import (
 	"github.com/miekg/dns"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
+	"github.com/Nagato-Yuzuru/ifbound/internal/hostsfile/hostsfs"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
@@ -155,6 +156,8 @@ func pvStack(t *testing.T, timeout time.Duration) (*handler, *pvCounter, *reconc
 		ConfigPath: store,
 		ConfigGID:  -1,
 		Snapshot:   filepath.Join(t.TempDir(), "addrbook.json"),
+		// A missing host file: the test does not read the host file of the machine.
+		Hosts: hostsfs.Reader{Path: filepath.Join(t.TempDir(), "hosts")},
 		Platform: reconcile.Reconciler{
 			Compiler: reconciletest.Compiler{}, Backend: world.Backend(), Resolver: world.Resolver(),
 			Inventory: reconciletest.NewInventory(reconcile.Interface{Name: "en0", Class: policy.ClassHardware}),
