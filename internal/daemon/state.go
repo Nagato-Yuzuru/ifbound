@@ -5,6 +5,7 @@ import (
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
@@ -38,19 +39,20 @@ const (
 	StateUnenforced
 )
 
-// String returns the lower-case state name.
+// String returns the lower-case state name: the value of the log
+// attribute logattr.EnforcementState.
 func (s State) String() string {
 	switch s {
 	case StateStarting:
-		return "starting"
+		return logattr.StateStarting
 	case StateReady:
-		return "ready"
+		return logattr.StateReady
 	case StateDegraded:
-		return "degraded"
+		return logattr.StateDegraded
 	case StateUnenforced:
-		return "unenforced"
+		return logattr.StateUnenforced
 	default:
-		return "unknown"
+		return logattr.StateUnknown
 	}
 }
 

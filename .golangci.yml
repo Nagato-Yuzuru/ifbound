@@ -41,6 +41,9 @@ linters:
       errorf: false # deliberate %v keeps foreign causes out of the %w contract chain
     sloglint:
       static-msg: true # variables go in attrs, not the message
+      attr-only: true # typed attributes only, no key-value pairs
+      no-raw-keys: true # a key must be a constant, not a literal; review keeps keys to internal/logattr
+      key-naming-case: snake
     nolintlint:
       require-explanation: true
       require-specific: true

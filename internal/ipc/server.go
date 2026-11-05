@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 )
 
 const (
@@ -324,7 +326,9 @@ func (s *Server) Serve(ctx context.Context) error {
 				return nil
 			}
 			backoff = min(max(backoff*2, acceptBackoffMin), acceptBackoffMax)
-			s.log.Warn("accept failed; retrying", "err", err, "delay", backoff)
+			s.log.LogAttrs(ctx, slog.LevelWarn, "accept failed; retrying",
+				slog.Int64(logattr.BackoffMS, backoff.Milliseconds()),
+				slog.String(logattr.ErrorType, logattr.ErrorTypeSocket), slog.String(logattr.ExceptionMessage, err.Error()))
 			select {
 			case <-time.After(backoff):
 			case <-ctx.Done():
@@ -384,7 +388,8 @@ func (s *Server) removeOwnSocket() {
 		return
 	}
 	if err := os.Remove(s.path); err != nil {
-		s.log.Warn("removing socket failed", "err", err)
+		s.log.Warn("removing socket failed", slog.String(logattr.FilePath, s.path),
+			slog.String(logattr.ErrorType, logattr.ErrorTypeSocket), slog.String(logattr.ExceptionMessage, err.Error()))
 	}
 }
 
@@ -406,15 +411,17 @@ func (s *Server) untrack(c net.Conn) {
 }
 
 // serveConn reads one request, replies once, and returns. One deadline
-// covers the whole connection.
+// covers the whole connection. A request that fails before its reply is
+// written writes one event; a rejection is a reply, and the peer gets
+// its reason.
 func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 	uid, err := peerUID(c)
 	if err != nil {
-		s.log.Log(ctx, s.peerLvl, "peer credentials unavailable", "err", err)
+		s.logFailed(ctx, s.peerLvl, logattr.ErrorTypeSocket, err)
 		return
 	}
 	if !s.admit(uid) {
-		s.log.Warn("peer uid not allowed", "uid", uid)
+		s.logFailed(ctx, slog.LevelWarn, logattr.ErrorTypePeerNotAllowed, errPeerNotAllowed, slog.Int64(logattr.PeerUID, int64(uid)))
 		return
 	}
 	deadline := time.Now().Add(s.connTimeout)
@@ -431,13 +438,24 @@ func (s *Server) serveConn(ctx context.Context, c net.Conn) {
 		reply = s.reject(err.Error())
 	default:
 		if !errors.Is(err, io.EOF) {
-			s.log.Debug("reading request failed", "err", err)
+			s.logFailed(ctx, slog.LevelDebug, logattr.ErrorTypeSocket, err, slog.Int64(logattr.PeerUID, int64(uid)))
 		}
 		return
 	}
 	if err := writeFrame(c, reply); err != nil {
-		s.log.Log(ctx, s.peerLvl, "writing reply failed", "err", err)
+		s.logFailed(ctx, s.peerLvl, logattr.ErrorTypeSocket, err, slog.Int64(logattr.PeerUID, int64(uid)))
 	}
+}
+
+// errPeerNotAllowed is the exception.message of a peer whose uid the
+// socket does not admit. The server closes the connection, so no caller
+// sees it.
+var errPeerNotAllowed = errors.New("peer uid not allowed")
+
+// logFailed writes the one event of a request that failed.
+func (s *Server) logFailed(ctx context.Context, level slog.Level, errType string, err error, attrs ...slog.Attr) {
+	attrs = append(attrs, slog.String(logattr.ErrorType, errType), slog.String(logattr.ExceptionMessage, err.Error()))
+	s.log.LogAttrs(ctx, level, "ipc request failed", attrs...)
 }
 
 func (s *Server) dispatch(ctx context.Context, req envelope) envelope {

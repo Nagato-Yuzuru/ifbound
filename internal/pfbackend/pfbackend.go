@@ -62,6 +62,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
@@ -230,7 +231,8 @@ func (b *Backend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 		// The new token keeps pf enabled. An old token that stays only
 		// keeps pf enabled after uninstall, and its label keeps it known,
 		// so Load goes on.
-		b.log.WarnContext(ctx, "cannot give back an old pf token", slog.String("error", err.Error()))
+		b.log.WarnContext(ctx, "cannot give back an old pf token",
+			slog.String(logattr.ErrorType, logattr.ErrorTypePFToken), slog.String(logattr.ExceptionMessage, err.Error()))
 	}
 	b.tokens = append([]token{tok}, kept...)
 	if err := b.flushSubAnchors(ctx); err != nil {
@@ -290,7 +292,7 @@ func (b *Backend) reference(ctx context.Context, enabled bool) (token, error) {
 		return token{}, err
 	}
 	if !enabled {
-		b.log.WarnContext(ctx, "pf was disabled; ifbound enabled it", slog.String("anchor", Anchor))
+		b.log.WarnContext(ctx, "pf was disabled; ifbound enabled it", slog.String(logattr.PFAnchor, Anchor))
 	}
 	return token{value: value, created: b.now().Unix()}, nil
 }
@@ -304,7 +306,8 @@ func (b *Backend) abandon(ctx context.Context, t token) {
 	defer cancel()
 	kept, err := b.giveBack(ctx, []token{t})
 	if err != nil {
-		b.log.WarnContext(ctx, "cannot give back a new pf token", slog.String("error", err.Error()))
+		b.log.WarnContext(ctx, "cannot give back a new pf token",
+			slog.String(logattr.ErrorType, logattr.ErrorTypePFToken), slog.String(logattr.ExceptionMessage, err.Error()))
 	}
 	b.tokens = append(b.tokens, kept...)
 }

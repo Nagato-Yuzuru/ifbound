@@ -14,6 +14,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/hostsfile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/hostsfile/hostsfs"
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
@@ -316,9 +317,17 @@ func TestUnrepresentableHostLines(t *testing.T) {
 			"10.1.1.2 x..www.EXAMPLE.net.\n")
 		heal()
 
-		w := h.warnings()
-		if len(w) != 1 || !strings.Contains(w[0], "line=2") || !strings.Contains(w[0], "x..www.EXAMPLE.net.") {
+		if w := h.warnings(); len(w) != 1 {
 			t.Errorf("warnings = %q, want one for line 2", w)
+		}
+		evs := h.logs.events("host file lines have a protected name that ifbound cannot read")
+		if len(evs) != 1 {
+			t.Fatalf("events = %v, want one", evs)
+		}
+		got := evs[0].attrs
+		want := []string{"line 2: x..www.EXAMPLE.net."}
+		if lines, ok := got[logattr.HostsLines].Any().([]string); !ok || !slices.Equal(lines, want) {
+			t.Errorf("%s = %v, want %q", logattr.HostsLines, got[logattr.HostsLines], want)
 		}
 		h.wantState(daemon.StateReady)
 	})

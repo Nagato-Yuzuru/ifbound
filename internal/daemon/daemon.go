@@ -51,6 +51,7 @@ import (
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
@@ -275,7 +276,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	var debounce <-chan time.Time
 	changes := d.cfg.Platform.Inventory.Changes()
 
-	_ = l.reconcile(ctx, "start") //nolint:errcheck // the phase holds the outcome
+	_ = l.reconcile(ctx, logattr.TriggerStart) //nolint:errcheck // the phase holds the outcome
 	l.readAccounts(ctx)
 	for {
 		l.armExpiry(expiry)
@@ -288,7 +289,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			req(ctx, l)
 			if l.recheck {
 				l.recheck = false
-				_ = l.reconcile(ctx, "ruleset changed") //nolint:errcheck // the phase holds the outcome
+				_ = l.reconcile(ctx, logattr.TriggerRulesetChanged) //nolint:errcheck // the phase holds the outcome
 			}
 		case <-changes:
 			if debounce == nil {
@@ -296,22 +297,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		case <-debounce:
 			debounce = nil
-			_ = l.reconcile(ctx, "interfaces") //nolint:errcheck // the phase holds the outcome
+			_ = l.reconcile(ctx, logattr.TriggerInterfaces) //nolint:errcheck // the phase holds the outcome
 		case <-heal.C:
 			l.readAccounts(ctx)
-			_ = l.reconcile(ctx, "self-heal") //nolint:errcheck // the phase holds the outcome
+			_ = l.reconcile(ctx, logattr.TriggerSelfHeal) //nolint:errcheck // the phase holds the outcome
 		case <-expiry.C:
 			l.expire(ctx)
 		case r := <-l.accounts.results:
 			if l.applyAccounts(ctx, r) {
-				_ = l.reconcile(ctx, "accounts") //nolint:errcheck // the phase holds the outcome
+				_ = l.reconcile(ctx, logattr.TriggerAccounts) //nolint:errcheck // the phase holds the outcome
 			}
 		case <-l.accounts.timeout:
 			l.accountsOverdue(ctx)
-			_ = l.reconcile(ctx, "accounts") //nolint:errcheck // the phase holds the outcome
+			_ = l.reconcile(ctx, logattr.TriggerAccounts) //nolint:errcheck // the phase holds the outcome
 		case <-warm.results:
 			if l.selfTestResult(warm.result()) {
-				_ = l.reconcile(ctx, "self-test") //nolint:errcheck // the phase holds the outcome
+				_ = l.reconcile(ctx, logattr.TriggerSelfTest) //nolint:errcheck // the phase holds the outcome
 			}
 		}
 	}

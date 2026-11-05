@@ -31,10 +31,14 @@
 # Telemetry
 
 The registry in telemetry/ defines the log attributes of ifbound. This page
-lists them. The log call sites move to these names in steps. A key is a
-contract with the queries of the operator once a call site writes it: the
-key does not change its name after that. The ifbound attributes have the
-stability `development` until the call sites use them.
+lists them. Each log call site of ifbound uses these names through the
+constants of internal/logattr. Lint refuses a literal key at a call site.
+It does not check that a constant comes from internal/logattr, so review
+keeps the keys to these constants. A key is a contract with the queries of
+the operator once a call site writes it: the key does not change its name
+after that. The stability `development` tells that the set of attributes
+can still grow; it does not permit a change to a key that a call site
+writes.
 
 ## ifbound attributes
 
@@ -59,3 +63,6 @@ These attributes come from
 {% for attr in semconv %}
 | `{{ attr.key }}` | {{ type_name(attr) }} | {{ attr.stability }} | {{ cell(attr.brief) }} | {{ examples(attr) }} |
 {% endfor %}
+{% for attr in semconv if attr.annotations and attr.annotations.go and attr.annotations.go.members %}
+{{ values(attr, attr.annotations.go.members) }}
+{%- endfor %}
