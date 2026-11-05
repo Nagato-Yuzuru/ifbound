@@ -134,6 +134,17 @@ func newSpec(t *testing.T, cfgText string) harnessSpec {
 	}
 }
 
+// newUnloadableSpec is newSpec with a snapshot that does not load, so
+// the daemon stays in StateStarting until the test repairs it.
+func newUnloadableSpec(t *testing.T, cfgText string) harnessSpec {
+	t.Helper()
+	s := newSpec(t, cfgText)
+	if err := os.WriteFile(s.snapshot, []byte("not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 func newHarness(t *testing.T, cfgText string) *harness {
 	t.Helper()
 	return launch(t, newSpec(t, cfgText))

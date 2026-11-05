@@ -3,6 +3,7 @@ package daemon_test
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -450,6 +451,27 @@ func TestSlowDirectoryKeepsOneProblem(t *testing.T) {
 
 // The first convergence does not wait for the accounts: it installs the
 // ruleset with every scope dropped (fail closed). The read then applies.
+// The accounts of a scoped configuration are read while the snapshot
+// does not load, so the first convergence after the repair has them.
+func TestScopedAccountsAreReadWhileTheSnapshotDoesNotLoad(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newUnloadableSpec(t, configScoped)
+		s.accounts = newAccounts()
+		h := launch(t, s)
+		defer h.stop()
+		h.wantState(daemon.StateStarting)
+
+		if err := os.Remove(s.snapshot); err != nil {
+			t.Fatal(err)
+		}
+		heal()
+		st := h.status()
+		if body := string(h.world.Ruleset().Body()); !strings.Contains(body, mailOwner) {
+			t.Errorf("first ruleset after the repair has no %q; state %v, reasons %q", mailOwner, st.State, st.Reasons)
+		}
+	})
+}
+
 func TestStartDoesNotWaitForTheAccounts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		accts := newAccounts()

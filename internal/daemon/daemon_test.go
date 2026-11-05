@@ -107,6 +107,53 @@ func TestSnapshotLoadErrorKeepsStartingUntilRepaired(t *testing.T) {
 	})
 }
 
+// The first configuration fixes the retain, also when a second one comes
+// before the snapshot loads.
+func TestConfigChangeWhileStartingKeepsTheFirstRetain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := launch(t, newUnloadableSpec(t, configV1))
+		defer h.stop()
+
+		cfg := parse(t, strings.Replace(configV1, `retain = "1h"`, `retain = "2h"`, 1))
+		if err := h.d.Reconfigure(t.Context(), cfg); err == nil {
+			t.Fatal("Reconfigure = nil, want the snapshot error")
+		}
+		if st := h.status(); !st.RetainRestart {
+			t.Error("RetainRestart = false, want true")
+		}
+	})
+}
+
+// A first convergence that installs the ruleset and then fails a later
+// write keeps the loaded book: the daemon acknowledges reports.
+func TestFirstConvergenceThatFailsAfterTheInstallAcks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// n is the write count of a clean start. A fault at write n hits
+		// a resolver write of the first convergence, after the install.
+		ref := newHarness(t, configV1)
+		n := ref.world.Writes()
+		ref.stop()
+
+		world := reconciletest.NewWorld()
+		world.SetBeforeWrite(func(k int) error {
+			if k == n {
+				return reconciletest.ErrInjected
+			}
+			return nil
+		})
+		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(t.TempDir(), "addrbook.json"), configV1)
+		defer h.stop()
+		world.SetBeforeWrite(nil)
+
+		if st := h.status(); st.State != daemon.StateReady {
+			t.Errorf("state = %v (reasons %q), want ready after the self-test", st.State, st.Reasons)
+		}
+		if err := h.observe(obs("www.example.net", "203.0.113.1")); err != nil {
+			t.Errorf("Observe = %v, want an ack", err)
+		}
+	})
+}
+
 func TestStartWithoutSnapshotAdoptsKernelEntries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		world := reconciletest.NewWorld()

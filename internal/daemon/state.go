@@ -1,7 +1,11 @@
 package daemon
 
 import (
+	"time"
+
+	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
+	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
@@ -83,18 +87,28 @@ type phase struct {
 	reasons   []string
 }
 
-func startingPhase(reason string) phase {
-	return phase{state: StateStarting, reasons: []string{reason}}
+// waitPhase is a phase that does not acknowledge reports: it has no
+// installed ruleset. It is the phase of a mode without a book.
+type waitPhase struct {
+	state   State
+	reasons []string
+}
+
+// asPhase returns w as a phase without an installed ruleset.
+func (w waitPhase) asPhase() phase { return phase{state: w.state, reasons: w.reasons} }
+
+func startingPhase(reason string) waitPhase {
+	return waitPhase{state: StateStarting, reasons: []string{reason}}
 }
 
 // unconfiguredPhase is the phase of a daemon that has no configuration.
 // It does not converge, so it keeps the platform state that it found.
-func unconfiguredPhase(reason string) phase {
-	return phase{state: StateUnenforced, reasons: []string{reason}}
+func unconfiguredPhase(reason string) waitPhase {
+	return waitPhase{state: StateUnenforced, reasons: []string{reason}}
 }
 
-func unenforcedPhase(reason string) phase {
-	return phase{state: StateUnenforced, reasons: []string{reason}}
+func unenforcedPhase(reason string) waitPhase {
+	return waitPhase{state: StateUnenforced, reasons: []string{reason}}
 }
 
 // convergedPhase is the phase after a convergence attempt.
@@ -120,3 +134,69 @@ func convergedPhase(rep reconcile.Report, err error) phase {
 
 // acks reports whether the phase acknowledges reports.
 func (p phase) acks() bool { return p.installed != "" }
+
+// mode is the lifecycle of the loop: exactly one of unconfiguredMode,
+// loadingMode, and runningMode. Only runningMode has a book, and only its
+// phase can have an installed ruleset.
+//
+//sumtype:decl
+type mode interface{ isMode() }
+
+// unconfiguredMode: the daemon has no configuration. It does not
+// converge, so it keeps the platform state that it found.
+type unconfiguredMode struct{ phase waitPhase }
+
+// loadingMode: the daemon has a configuration, but no load of the
+// snapshot succeeded yet. It does not converge: an empty book would
+// remove every learned address.
+type loadingMode struct {
+	conf activeConfig
+	// retain is the retain of the book to load. The first configuration
+	// fixes it for the life of the daemon.
+	retain time.Duration
+	phase  waitPhase
+}
+
+// runningMode: the daemon has a configuration and the book of the
+// loaded snapshot. It converges, and its phase can acknowledge reports.
+type runningMode struct {
+	conf activeConfig
+	// retain is the retain of book.
+	retain time.Duration
+	book   *addrbook.AddrBook
+	phase  phase
+}
+
+func (unconfiguredMode) isMode() {}
+func (loadingMode) isMode()      {}
+func (runningMode) isMode()      {}
+
+// activeConfig is the configuration that the daemon uses, with what the
+// daemon derives from it. newActiveConfig builds it, and a new
+// configuration replaces it as a whole.
+type activeConfig struct {
+	cfg policy.Config
+	// digest is the digest of the stored file of cfg, or zero.
+	digest  configstore.Digest
+	matcher *matcher.Matcher
+	apexes  []policy.Domain
+	// upstream is the error of the upstream check for cfg, or nil.
+	upstream error
+	warnings []policy.Warning
+	// gen counts the configurations. A warm-up runs only under the
+	// configuration that it started with.
+	gen uint64
+}
+
+func newActiveConfig(cfg policy.Config, digest configstore.Digest, gen uint64) activeConfig {
+	m := matcher.New(cfg.Policies)
+	return activeConfig{
+		cfg:      cfg,
+		digest:   digest,
+		matcher:  m,
+		apexes:   m.Apexes(),
+		upstream: cfg.CheckUpstreams(),
+		warnings: cfg.Warnings(),
+		gen:      gen,
+	}
+}

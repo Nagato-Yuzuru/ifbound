@@ -13,7 +13,6 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
-	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
@@ -57,36 +56,17 @@ type loop struct {
 	log      *slog.Logger
 	// pub receives the status that Daemon.Status returns.
 	pub *atomic.Pointer[Status]
-	// retain is the retain of every book. The first configuration fixes
-	// it.
-	retain time.Duration
 
-	// book is nil until the first complete load of the snapshot. The
-	// daemon never converges without it: an empty book would remove every
-	// learned address.
-	book *addrbook.AddrBook
+	// mode is the lifecycle of the daemon.
+	mode mode
 
-	// configured is false until the daemon has a configuration. Until
-	// then it does not converge.
-	configured bool
-	cfg        policy.Config
-	digest     configstore.Digest
-	matcher    *matcher.Matcher
-	apexes     []policy.Domain
-	// upstream is the error of the upstream check for cfg, or nil.
-	upstream error
-	warnings []policy.Warning
-	// gen counts the configuration changes. A warm-up runs only under
-	// the configuration that it started with.
-	gen uint64
-
-	// selfTest is the self-test of cfg.
+	// selfTest is the self-test of the active configuration. A new
+	// configuration resets it.
 	selfTest selfTest
 
 	hosts    hostsState
 	accounts accountsState
 
-	phase phase
 	// recheck asks Run for a convergence after the current request. A
 	// report sets it when it finds a loaded ruleset that is not the
 	// installed one.
@@ -102,10 +82,9 @@ func newLoop(c Config, store storeFunc, pub *atomic.Pointer[Status]) *loop {
 		storeFn:  store,
 		log:      c.Logger,
 		pub:      pub,
-		phase:    startingPhase(reasonNotLoaded),
+		mode:     unconfiguredMode{phase: startingPhase(reasonNotLoaded)},
 		hosts:    hostsState{reader: c.Hosts},
 		accounts: newAccountsState(c.Accounts),
-		matcher:  matcher.New(nil),
 	}
 	return l
 }
@@ -115,8 +94,6 @@ func (l *loop) publish() {
 	st := l.status()
 	l.pub.Store(&st)
 }
-
-func (l *loop) newBook() *addrbook.AddrBook { return addrbook.New(l.retain, time.Now) }
 
 // loadStored loads the stored configuration at start. A configuration
 // that does not load leaves the daemon without one: it then keeps the
@@ -132,28 +109,46 @@ func (l *loop) loadStored(ctx context.Context) {
 	l.setConfig(cfg, digest)
 }
 
-// setConfig makes cfg the running configuration. digest is the digest of
-// its stored file, or zero when it is not stored.
+// setConfig makes cfg the active configuration. digest is the digest of
+// its stored file, or zero when it is not stored. The phase does not
+// change. A daemon without a configuration goes to loadingMode. The
+// first configuration fixes the retain. A runningMode keeps its book: the
+// book keeps the entries of removed policies until reconcile prunes them.
 func (l *loop) setConfig(cfg policy.Config, digest configstore.Digest) {
-	if !l.configured {
-		l.configured = true
-		l.retain = cfg.AddrBook.Retain
+	switch m := l.mode.(type) {
+	case unconfiguredMode:
+		l.mode = loadingMode{conf: newActiveConfig(cfg, digest, 1), retain: cfg.AddrBook.Retain, phase: m.phase}
+	case loadingMode:
+		l.mode = loadingMode{conf: newActiveConfig(cfg, digest, m.conf.gen+1), retain: m.retain, phase: m.phase}
+	case runningMode:
+		l.mode = runningMode{conf: newActiveConfig(cfg, digest, m.conf.gen+1), retain: m.retain, book: m.book, phase: m.phase}
+	default:
+		panic(fmt.Sprintf("daemon: setConfig in unknown mode %T", l.mode))
 	}
-	l.cfg, l.digest = cfg, digest
-	l.gen++
-	l.matcher = matcher.New(cfg.Policies)
-	l.apexes = l.matcher.Apexes()
-	l.upstream = cfg.CheckUpstreams()
-	l.warnings = cfg.Warnings()
 	l.selfTest = selfTestNone
 	if len(warmUpNames(cfg)) > 0 {
 		l.selfTest = selfTestNotRun
 	}
 }
 
-func (l *loop) policyNames() []policy.Name {
-	names := make([]policy.Name, len(l.cfg.Policies))
-	for i, p := range l.cfg.Policies {
+// policies returns the policies of the active configuration. It
+// returns nil when the daemon has no configuration.
+func (l *loop) policies() []policy.Policy {
+	switch m := l.mode.(type) {
+	case unconfiguredMode:
+		return nil
+	case loadingMode:
+		return m.conf.cfg.Policies
+	case runningMode:
+		return m.conf.cfg.Policies
+	default:
+		return nil
+	}
+}
+
+func policyNames(cfg policy.Config) []policy.Name {
+	names := make([]policy.Name, len(cfg.Policies))
+	for i, p := range cfg.Policies {
 		names[i] = p.Name
 	}
 	return names
@@ -166,31 +161,42 @@ func (l *loop) policyNames() []policy.Name {
 // The host file comes first: adoption must know which kernel entries are
 // host addresses. Without a configuration, it does nothing.
 func (l *loop) reconcile(ctx context.Context, trigger string) error {
-	if !l.configured {
+	var (
+		conf   activeConfig
+		retain time.Duration
+		book   *addrbook.AddrBook
+	)
+	switch m := l.mode.(type) {
+	case unconfiguredMode:
 		return errNoConfig
-	}
-	l.refreshHosts(ctx)
-	if l.book == nil {
-		book, err := l.loadBook(ctx)
+	case loadingMode:
+		conf, retain = m.conf, m.retain
+		l.refreshHosts(ctx, conf)
+		b, err := l.loadBook(ctx, conf, retain)
 		if err != nil {
 			l.setPhase(ctx, startingPhase(err.Error()))
 			return err
 		}
-		l.book = book
+		book = b
+	case runningMode:
+		conf, retain, book = m.conf, m.retain, m.book
+		l.refreshHosts(ctx, conf)
+	default:
+		return errNoConfig
 	}
 	rep, err := l.rec.Converge(ctx, reconcile.Inputs{
-		Policies: l.cfg.Policies,
-		Book:     l.book,
+		Policies: conf.cfg.Policies,
+		Book:     book,
 		Hosts:    l.hosts.addrs,
-		Apexes:   l.apexes,
-		Listen:   l.cfg.DNS.Listen,
+		Apexes:   conf.apexes,
+		Listen:   conf.cfg.DNS.Listen,
 		Accounts: l.accounts.snap,
 	})
 	if rep.Installed != "" {
 		// No loaded rule refers to a removed policy now, and its table is
 		// gone. Until this point a revert of the configuration must still
 		// find its addresses.
-		l.book.Prune(l.policyNames())
+		book.Prune(policyNames(conf.cfg))
 	}
 	if rep.Writes > 0 {
 		l.log.InfoContext(ctx, "enforcement changed",
@@ -199,14 +205,14 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	if p, ok := l.hosts.problem(); ok {
 		rep.Problems = append(rep.Problems, p)
 	}
-	if p, ok := l.accountsProblem(); ok {
+	if p, ok := l.accountsProblem(conf.cfg.Policies); ok {
 		rep.Problems = append(rep.Problems, p)
 	}
-	if l.upstream != nil {
+	if conf.upstream != nil {
 		// Only the stored file at start can fail the check: Apply refuses
 		// such a configuration. The check protects only DNS, so the
 		// daemon enforces the file.
-		rep.Problems = append(rep.Problems, reconcile.Problem{Text: "the configuration fails the upstream check: " + l.upstream.Error()})
+		rep.Problems = append(rep.Problems, reconcile.Problem{Text: "the configuration fails the upstream check: " + conf.upstream.Error()})
 	}
 	p := convergedPhase(rep, err)
 	if st, ok := l.selfTestProblem(); ok && p.acks() {
@@ -215,7 +221,9 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		rep.Problems = append(rep.Problems, st)
 		p = convergedPhase(rep, err)
 	}
-	l.setPhase(ctx, p)
+	// The book is loaded, so the daemon runs from now on, also when the
+	// convergence failed.
+	l.setMode(ctx, runningMode{conf: conf, retain: retain, book: book, phase: p})
 	return err
 }
 
@@ -235,13 +243,13 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 // file, its addresses are not adopted: they leave the tables with their
 // host entries. Before a good read, they are adopted. Entries that expired while the
 // daemon was down leave the book here.
-func (l *loop) loadBook(ctx context.Context) (*addrbook.AddrBook, error) {
-	book := l.newBook()
+func (l *loop) loadBook(ctx context.Context, conf activeConfig, retain time.Duration) (*addrbook.AddrBook, error) {
+	book := addrbook.New(retain, time.Now)
 	if err := book.Load(l.snapshot); err != nil {
 		return nil, fmt.Errorf("loading snapshot: %w", err)
 	}
-	if !slices.ContainsFunc(l.policyNames(), func(n policy.Name) bool { return len(book.Addrs(n)) > 0 }) {
-		if err := l.adopt(ctx, book); err != nil {
+	if !slices.ContainsFunc(policyNames(conf.cfg), func(n policy.Name) bool { return len(book.Addrs(n)) > 0 }) {
+		if err := l.adopt(ctx, book, conf.cfg.Policies); err != nil {
 			return nil, err
 		}
 	}
@@ -249,8 +257,8 @@ func (l *loop) loadBook(ctx context.Context) (*addrbook.AddrBook, error) {
 	return book, nil
 }
 
-func (l *loop) adopt(ctx context.Context, book *addrbook.AddrBook) error {
-	found, err := l.rec.Adoptable(ctx, l.cfg.Policies)
+func (l *loop) adopt(ctx context.Context, book *addrbook.AddrBook, policies []policy.Policy) error {
+	found, err := l.rec.Adoptable(ctx, policies)
 	if err != nil {
 		return fmt.Errorf("adopting kernel entries: %w", err)
 	}
@@ -280,11 +288,47 @@ func (l *loop) adopt(ctx context.Context, book *addrbook.AddrBook) error {
 	return nil
 }
 
-func (l *loop) setPhase(ctx context.Context, p phase) {
-	if p.state == l.phase.state && p.installed == l.phase.installed && slices.Equal(p.reasons, l.phase.reasons) {
+// phase returns the phase of the current mode. An unknown mode has an
+// unenforced phase.
+func (l *loop) phase() phase {
+	switch m := l.mode.(type) {
+	case unconfiguredMode:
+		return m.phase.asPhase()
+	case loadingMode:
+		return m.phase.asPhase()
+	case runningMode:
+		return m.phase
+	default:
+		return unenforcedPhase("unknown mode").asPhase()
+	}
+}
+
+// setPhase gives the current mode the phase p. Only reconcile gives a
+// runningMode a phase that acknowledges.
+func (l *loop) setPhase(ctx context.Context, p waitPhase) {
+	switch m := l.mode.(type) {
+	case unconfiguredMode:
+		m.phase = p
+		l.setMode(ctx, m)
+	case loadingMode:
+		m.phase = p
+		l.setMode(ctx, m)
+	case runningMode:
+		m.phase = p.asPhase()
+		l.setMode(ctx, m)
+	default:
+		panic(fmt.Sprintf("daemon: setPhase in unknown mode %T", l.mode))
+	}
+}
+
+// setMode makes m the current mode, and logs a change of the phase.
+func (l *loop) setMode(ctx context.Context, m mode) {
+	old := l.phase()
+	l.mode = m
+	p := l.phase()
+	if p.state == old.state && p.installed == old.installed && slices.Equal(p.reasons, old.reasons) {
 		return
 	}
-	l.phase = p
 	level := slog.LevelWarn
 	if p.state == StateReady {
 		level = slog.LevelInfo
@@ -294,11 +338,12 @@ func (l *loop) setPhase(ctx context.Context, p phase) {
 }
 
 func (l *loop) armExpiry(t *time.Timer) {
-	if l.book == nil {
+	m, ok := l.mode.(runningMode)
+	if !ok {
 		t.Stop()
 		return
 	}
-	next, ok := l.book.NextExpiry()
+	next, ok := m.book.NextExpiry()
 	if !ok {
 		t.Stop()
 		return
@@ -307,7 +352,7 @@ func (l *loop) armExpiry(t *time.Timer) {
 }
 
 func (l *loop) expire(ctx context.Context) {
-	if l.book != nil && len(l.book.Expire()) > 0 {
+	if m, ok := l.mode.(runningMode); ok && len(m.book.Expire()) > 0 {
 		_ = l.reconcile(ctx, "expiry") //nolint:errcheck // the phase holds the outcome
 	}
 }
@@ -348,15 +393,22 @@ func (l *loop) apply(ctx, caller context.Context, data []byte) (Status, error) {
 }
 
 // selfTestResult takes the latest results of the warm-up. Only a result
-// for the running configuration counts, and a pass is final for it. It
+// for the active configuration counts, and a pass is final for it. It
 // reports whether the self-test changed.
 func (l *loop) selfTestResult(r warmResult) bool {
+	// The warm-up runs only in runningMode, so a result for the active
+	// configuration comes only there.
+	m, ok := l.mode.(runningMode)
+	if !ok {
+		return false
+	}
+	gen := m.conf.gen
 	before := l.selfTest
 	switch {
 	case l.selfTest == selfTestNone || l.selfTest == selfTestPassed:
-	case r.proved == l.gen:
+	case r.proved == gen:
 		l.selfTest = selfTestPassed
-	case r.missed == l.gen:
+	case r.missed == gen:
 		l.selfTest = selfTestFailed
 	}
 	return l.selfTest != before
@@ -389,13 +441,14 @@ func (l *loop) selfTestProblem() (reconcile.Problem, bool) {
 // ifbound-dns removes the aliases from the reply when the ack is
 // protected.
 func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
+	m, ok := l.mode.(runningMode)
 	switch {
-	case l.phase.state == StateStarting:
+	case l.phase().state == StateStarting:
 		return ipc.Ack{}, ErrNotReady
-	case !l.phase.acks():
+	case !ok || !m.phase.acks():
 		return ipc.Ack{}, ErrUnenforced
 	}
-	names, err := l.matcher.Match(o.QName)
+	names, err := m.conf.matcher.Match(o.QName)
 	if err != nil {
 		return ipc.Ack{}, fmt.Errorf("classifying qname: %w", err)
 	}
@@ -403,7 +456,7 @@ func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) 
 		return ipc.Ack{}, nil
 	}
 	if len(o.Addrs) > 0 {
-		if err := l.record(ctx, names, o); err != nil {
+		if err := l.record(ctx, m.book, names, o); err != nil {
 			return ipc.Ack{}, err
 		}
 	}
@@ -417,11 +470,11 @@ func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) 
 // snapshot of each policy in names, in this order. After a failure, the
 // book keeps the addresses. The next report or convergence completes the
 // work.
-func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observation) error {
+func (l *loop) record(ctx context.Context, book *addrbook.AddrBook, names []policy.Name, o ipc.Observation) error {
 	addrs := canonical(o.Addrs)
 	needSave := false
 	for _, name := range names {
-		ns, err := l.book.Observe(name, addrs, o.TTL)
+		ns, err := book.Observe(name, addrs, o.TTL)
 		if err != nil {
 			return fmt.Errorf("recording addresses: %w", err)
 		}
@@ -433,7 +486,7 @@ func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observatio
 		}
 	}
 	if needSave {
-		if err := l.book.Save(l.snapshot); err != nil {
+		if err := book.Save(l.snapshot); err != nil {
 			return fmt.Errorf("saving snapshot: %w", err)
 		}
 	}
@@ -441,15 +494,17 @@ func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observatio
 }
 
 // checkInstalled returns nil when the Backend has the installed ruleset
-// loaded. Otherwise something outside ifbound changed it. The phase then
-// stops acknowledging, and Run converges right after this request. It
-// returns ErrUnenforced in this case.
+// of the current phase loaded. It reads the phase after the read of the
+// Backend, so it never trusts an older phase. Otherwise something outside
+// ifbound changed the ruleset, or the phase does not acknowledge. The
+// phase then stops acknowledging, and Run converges right after this
+// request. It returns ErrUnenforced in this case.
 func (l *loop) checkInstalled(ctx context.Context) error {
 	id, err := l.rec.Backend.LoadedID(ctx)
 	if err != nil {
 		return fmt.Errorf("reading the loaded ruleset: %w", err)
 	}
-	if id != l.phase.installed {
+	if m, ok := l.mode.(runningMode); !ok || !m.phase.acks() || id != m.phase.installed {
 		l.setPhase(ctx, unenforcedPhase("the loaded ruleset changed outside ifbound"))
 		l.recheck = true
 		return ErrUnenforced
@@ -471,19 +526,24 @@ func canonical(addrs []netip.Addr) []netip.Addr {
 // status costs one map lookup per policy, so the loop can publish it at
 // each pass.
 func (l *loop) status() Status {
-	n := 0
-	for _, p := range l.cfg.Policies {
-		if l.book != nil {
-			n += l.book.Len(p.Name)
+	p := l.phase()
+	st := Status{State: p.state, Reasons: slices.Clone(p.reasons)}
+	withConf := func(conf activeConfig, retain time.Duration) {
+		st.Policies = len(conf.cfg.Policies)
+		st.RetainRestart = conf.cfg.AddrBook.Retain != retain
+		st.Config = conf.digest
+		st.Warnings = slices.Clone(conf.warnings)
+	}
+	switch m := l.mode.(type) {
+	case unconfiguredMode:
+	case loadingMode:
+		withConf(m.conf, m.retain)
+	case runningMode:
+		withConf(m.conf, m.retain)
+		for _, pol := range m.conf.cfg.Policies {
+			st.Addrs += m.book.Len(pol.Name)
 		}
+	default:
 	}
-	return Status{
-		State:         l.phase.state,
-		Reasons:       slices.Clone(l.phase.reasons),
-		Policies:      len(l.cfg.Policies),
-		Addrs:         n,
-		RetainRestart: l.cfg.AddrBook.Retain != l.retain,
-		Config:        l.digest,
-		Warnings:      slices.Clone(l.warnings),
-	}
+	return st
 }
