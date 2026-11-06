@@ -69,6 +69,44 @@ attributes:
     brief: The time that the convergence took, in milliseconds.
     examples: [12]
     annotations: {go: {name: ConvergeDurationMS}}
+  - key: ifbound.report.result
+    type:
+      members:
+        - id: protected
+          value: "protected"
+          brief: The name matches a policy, and the daemon acknowledged the report.
+          stability: development
+          annotations: {go: {name: ReportProtected}}
+        - id: unprotected
+          value: "unprotected"
+          brief: The name matches no policy, and the daemon acknowledged the report.
+          stability: development
+          annotations: {go: {name: ReportUnprotected}}
+        - id: not_acknowledged
+          value: "not_acknowledged"
+          brief: The daemon returned an error and did not acknowledge the report.
+          stability: development
+          annotations: {go: {name: ReportNotAcknowledged}}
+    stability: development
+    brief: The outcome of a DNS report from ifbound-dns.
+    annotations: {go: {name: ReportResult}}
+  - key: ifbound.report.wait_us
+    type: int
+    stability: development
+    brief: >-
+      The time that a DNS report waited for the loop of the daemon, in
+      microseconds. A report waits while the loop runs a convergence or
+      other requests.
+    examples: [80000]
+    annotations: {go: {name: ReportWaitUS}}
+  - key: ifbound.report.observe_us
+    type: int
+    stability: development
+    brief: >-
+      The time that the loop took to handle a DNS report, in microseconds.
+      It is not set when the loop did not take the report.
+    examples: [6900]
+    annotations: {go: {name: ReportObserveUS}}
   - key: ifbound.enforcement.state
     type:
       members:

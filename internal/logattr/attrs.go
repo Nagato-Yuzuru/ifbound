@@ -59,6 +59,15 @@ const (
 	// The names of the policies that the event is about.
 	PolicyNames = "ifbound.policy.names"
 
+	// The time that the loop took to handle a DNS report, in microseconds. It is not set when the loop did not take the report.
+	ReportObserveUS = "ifbound.report.observe_us"
+
+	// The outcome of a DNS report from ifbound-dns.
+	ReportResult = "ifbound.report.result"
+
+	// The time that a DNS report waited for the loop of the daemon, in microseconds. A report waits while the loop runs a convergence or other requests.
+	ReportWaitUS = "ifbound.report.wait_us"
+
 	// The round stopped before its end, because the configuration or the state changed. The lists hold only the names that were done.
 	WarmUpCancelled = "ifbound.warmup.cancelled"
 
@@ -154,6 +163,18 @@ const (
 const (
 	// The verdict of the policy on the interfaces narrowed, so a connection that its rules now block must not go on.
 	StatesCauseNarrowed = "narrowed"
+)
+
+// Values of ReportResult.
+const (
+	// The name matches a policy, and the daemon acknowledged the report.
+	ReportProtected = "protected"
+
+	// The name matches no policy, and the daemon acknowledged the report.
+	ReportUnprotected = "unprotected"
+
+	// The daemon returned an error and did not acknowledge the report.
+	ReportNotAcknowledged = "not_acknowledged"
 )
 
 // Values of ErrorType.

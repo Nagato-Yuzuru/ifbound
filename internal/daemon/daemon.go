@@ -329,17 +329,49 @@ func (d *Daemon) Run(ctx context.Context) error {
 // platform error otherwise. See call for ctx.Err() and ErrStopped.
 func (d *Daemon) Observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
 	type result struct {
-		ack ipc.Ack
-		err error
+		ack  ipc.Ack
+		err  error
+		wait time.Duration
+		took time.Duration
 	}
+	queued := time.Now()
 	r, cerr := call(ctx, d, func(ctx context.Context, l *loop) result {
+		began := time.Now()
 		ack, err := l.observe(ctx, o)
-		return result{ack, err}
+		return result{ack, err, began.Sub(queued), time.Since(began)}
 	})
 	if cerr != nil {
+		d.logReport(ctx, logattr.ReportNotAcknowledged, time.Since(queued), -1)
 		return ipc.Ack{}, cerr
 	}
+	outcome := logattr.ReportUnprotected
+	switch {
+	case r.err != nil:
+		outcome = logattr.ReportNotAcknowledged
+	case r.ack.Protected:
+		outcome = logattr.ReportProtected
+	}
+	d.logReport(ctx, outcome, r.wait, r.took)
 	return r.ack, r.err
+}
+
+// logReport writes the debug event of one Observe call. wait is the time
+// before the loop took the report, and took is the time that the loop
+// spent on it. A negative took means that the loop did not take the
+// report. The call writes the event after the reply, on the goroutine of
+// the caller, so the event adds no time to the loop.
+//
+// The event is debug because each report from ifbound-dns makes one. A convergence on the loop shows as a long wait of the reports
+// that arrive during it.
+func (d *Daemon) logReport(ctx context.Context, outcome string, wait, took time.Duration) {
+	attrs := []slog.Attr{
+		slog.String(logattr.ReportResult, outcome),
+		slog.Int64(logattr.ReportWaitUS, wait.Microseconds()),
+	}
+	if took >= 0 {
+		attrs = append(attrs, slog.Int64(logattr.ReportObserveUS, took.Microseconds()))
+	}
+	d.cfg.Logger.LogAttrs(ctx, slog.LevelDebug, "report", attrs...)
 }
 
 // Apply checks, stores, and applies the configuration in data. It runs

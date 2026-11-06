@@ -35,6 +35,9 @@ OpenTelemetry semantic conventions do not define these attributes.
 | `ifbound.pf.anchor` | string | development | The name of the pf anchor that ifbound owns. | `"ifbound"` |
 | `ifbound.pf.states.cause` | enum | development | The reason that ifbound ended the pf connection states of the policies. |  |
 | `ifbound.policy.names` | string[] | development | The names of the policies that the event is about. | `["work","bank"]` |
+| `ifbound.report.observe_us` | int | development | The time that the loop took to handle a DNS report, in microseconds. It is not set when the loop did not take the report. | `6900` |
+| `ifbound.report.result` | enum | development | The outcome of a DNS report from ifbound-dns. |  |
+| `ifbound.report.wait_us` | int | development | The time that a DNS report waited for the loop of the daemon, in microseconds. A report waits while the loop runs a convergence or other requests. | `80000` |
 | `ifbound.warmup.cancelled` | boolean | development | The round stopped before its end, because the configuration or the state changed. The lists hold only the names that were done. | `true` |
 | `ifbound.warmup.empty` | string[] | development | The names whose lookup gave no addresses in its time budget. This is normal for the domain of a suffix destination. | `["example.com"]` |
 | `ifbound.warmup.failed` | string[] | development | The names whose lookup failed after a good probe. | `["example.com"]` |
@@ -78,6 +81,14 @@ OpenTelemetry semantic conventions do not define these attributes.
 | Value | Description |
 | --- | --- |
 | `narrowed` | The verdict of the policy on the interfaces narrowed, so a connection that its rules now block must not go on. |
+
+### Values of `ifbound.report.result`
+
+| Value | Description |
+| --- | --- |
+| `protected` | The name matches a policy, and the daemon acknowledged the report. |
+| `unprotected` | The name matches no policy, and the daemon acknowledged the report. |
+| `not_acknowledged` | The daemon returned an error and did not acknowledge the report. |
 
 ## Semantic convention attributes
 
