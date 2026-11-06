@@ -33,6 +33,16 @@ linters:
           deny:
             - pkg: github.com/pelletier/go-toml/v2/unstable
               desc: walk the TOML text only in internal/policy/position.go (newIndex)
+        pf-standalone:
+          # pf is a public package that other tools can import. It does not
+          # depend on ifbound. Every other package of the module is below
+          # internal/ or cmd/.
+          files: ["**/pf/*.go"]
+          deny:
+            - pkg: github.com/Nagato-Yuzuru/ifbound/internal
+              desc: pf must not depend on ifbound
+            - pkg: github.com/Nagato-Yuzuru/ifbound/cmd
+              desc: pf must not depend on ifbound
     errcheck:
       check-blank: true # a blank drop needs //nolint:errcheck with a reason; nolintlint enforces the reason
     godox:
