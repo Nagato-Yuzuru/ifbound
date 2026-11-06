@@ -73,7 +73,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # The macOS runners are the newest supported macOS on arm64 and the
+        # oldest on Intel. Explicit labels: when macos-latest moves to a new
+        # macOS, the tested versions do not change without a review.
+        os: [ubuntu-latest, macos-26, macos-15-intel]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -88,8 +91,8 @@ jobs:
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.gocache.outputs.dir }}
-          key: gocache-${{ runner.os }}-${{ github.sha }}
-          restore-keys: gocache-${{ runner.os }}-
+          key: gocache-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: gocache-${{ runner.os }}-${{ runner.arch }}-
       - run: go test -race ./...
 
   test-root:
@@ -113,11 +116,18 @@ jobs:
           ! grep -E -- '--- SKIP: (TestCrossUID|TestCrossUIDImpostor) ' root-test.log
 
   e2e:
-    name: e2e (macOS, root)
+    name: e2e (macOS ${{ matrix.macos }}, ${{ matrix.arch }}, root)
     # A failed changes job gives no output, so the tests run.
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      # The oldest and the newest supported macOS, each on arm64 and Intel.
+      # Intel Macs get no macOS after 26, so only CI tests Intel.
+      matrix:
+        macos: ["15", "26"]
+        arch: [arm64, intel]
+    runs-on: macos-${{ matrix.macos }}${{ matrix.arch == 'intel' && '-intel' || '' }}
     timeout-minutes: 20
     env:
       # Strict mode turns an unmet requirement into a failure, so that a
