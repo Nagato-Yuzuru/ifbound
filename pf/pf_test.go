@@ -28,6 +28,10 @@ func TestLayout(t *testing.T) {
 		{"DIOCRDELADDRS", diocRDelAddrs, unsafe.Sizeof(pfiocTable{})},
 		{"DIOCRGETADDRS", diocRGetAddrs, unsafe.Sizeof(pfiocTable{})},
 		{"DIOCKILLSTATES", diocKillStates, unsafe.Sizeof(pfiocStateKill{})},
+		{"DIOCGETRULES", diocGetRules, unsafe.Sizeof(pfiocRule{})},
+		{"DIOCGETRULE", diocGetRule, unsafe.Sizeof(pfiocRule{})},
+		{"DIOCGETRULESETS", diocGetRulesets, unsafe.Sizeof(pfiocRuleset{})},
+		{"DIOCGETRULESET", diocGetRuleset, unsafe.Sizeof(pfiocRuleset{})},
 	}
 	for _, tt := range tests {
 		if got := ioctlSize(tt.req); got != tt.size {
@@ -38,6 +42,12 @@ func TestLayout(t *testing.T) {
 	// of the union of struct pf_addr_wrap.
 	if got := unsafe.Sizeof(pfAddrWrap{}.V); got != 32 {
 		t.Errorf("the union of pf_addr_wrap has size %d, want 32", got)
+	}
+	if got := unsafe.Sizeof(pfiocRule{}); got != sizeofPfiocRule {
+		t.Errorf("pfiocRule has size %d, C has %d", got, sizeofPfiocRule)
+	}
+	if offIocRuleRule+sizeofPfRule != sizeofPfiocRule {
+		t.Errorf("struct pf_rule is not the last field of struct pfioc_rule")
 	}
 }
 
@@ -76,6 +86,8 @@ func TestMapErrno(t *testing.T) {
 		err  error
 		want error
 	}{
+		// DIOCGETRULE with a stale ticket.
+		{syscall.EBUSY, ErrChanged},
 		{syscall.ENODEV, ErrLayout},
 		{syscall.EPERM, fs.ErrPermission},
 		{syscall.EACCES, fs.ErrPermission},
