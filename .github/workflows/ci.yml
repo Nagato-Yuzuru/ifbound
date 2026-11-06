@@ -76,7 +76,7 @@ jobs:
         # The macOS runners are the newest supported macOS on arm64 and the
         # oldest on Intel. Explicit labels: when macos-latest moves to a new
         # macOS, the tested versions do not change without a review.
-        os: [ubuntu-latest, macos-26, macos-15-intel]
+        os: [ubuntu-latest, macos-26, macos-15-intel, macos-15]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
@@ -93,6 +93,44 @@ jobs:
           path: ${{ steps.gocache.outputs.dir }}
           key: gocache-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           restore-keys: gocache-${{ runner.os }}-${{ runner.arch }}-
+      # TEMPORARY: diagnose the mDNS test on the macOS runners. Remove before the merge.
+      - if: ${{ runner.os == 'macOS' }}
+        run: |
+          h=$(scutil --get LocalHostName) || true
+          echo "LocalHostName=$h"; sw_vers -productVersion; uname -m; uptime
+          echo "--- /etc/hosts"; ls -l /etc/hosts; cat /etc/hosts
+          echo "--- inet6"; ifconfig | grep -E '^[a-z]|inet6' || true
+          for fam in v4 v6 v4v6; do
+            echo "--- dns-sd -G $fam (3 s)"
+            dns-sd -G "$fam" "$h.local" & p=$!; sleep 3; kill $p || true
+          done
+          mkdir -p "$RUNNER_TEMP/probe"
+          cat > "$RUNNER_TEMP/probe/main.go" <<'GO'
+          package main
+
+          import (
+          	"context"
+          	"fmt"
+          	"net"
+          	"os"
+          	"time"
+          )
+
+          func main() {
+          	name := os.Args[1] + ".local."
+          	for i := 0; i < 3; i++ {
+          		for _, nw := range []string{"ip4", "ip6", "ip"} {
+          			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+          			t := time.Now()
+          			a, err := net.DefaultResolver.LookupNetIP(ctx, nw, name)
+          			cancel()
+          			fmt.Printf("%d %-3s %6dms %v %v\n", i, nw, time.Since(t).Milliseconds(), a, err)
+          		}
+          	}
+          }
+          GO
+          (cd "$RUNNER_TEMP/probe" && go mod init probe >/dev/null 2>&1 && go run . "$h")
+          go test -count=5 -v -run TestResolveOwnLocalHostNameThroughMDNSResponder ./internal/syslookup || true
       - run: go test -race ./...
 
   test-root:
