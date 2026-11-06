@@ -4,6 +4,8 @@
 //
 // The package does only these operations:
 //
+//   - tables: create a table, add, delete, clear, and list addresses;
+//   - states: end the states to a destination prefix;
 //   - status: whether pf is enabled.
 //
 // It cannot load rules. Most operations need root.
