@@ -12,12 +12,19 @@ import (
 	"unsafe"
 )
 
-// ErrLayout: the kernel does not know the ioctl. The struct layout of
-// this package does not agree with the running kernel. Callers can test
-// it with errors.Is.
-var ErrLayout = errors.New("struct layout does not agree with the kernel")
+// Errors that callers can test with errors.Is.
+var (
+	// ErrNotFound: the table or the anchor does not exist.
+	ErrNotFound = errors.New("not found")
+	// ErrLayout: the kernel does not know the ioctl. The struct layout of
+	// this package does not agree with the running kernel.
+	ErrLayout = errors.New("struct layout does not agree with the kernel")
+)
 
-var errIoctl = errors.New("ioctl failed")
+var (
+	errName  = errors.New("name is too long or holds a NUL byte")
+	errIoctl = errors.New("ioctl failed")
+)
 
 // Handle is an open /dev/pf. Its methods are safe for concurrent use.
 type Handle struct {
@@ -39,22 +46,54 @@ type Status struct {
 func (h *Handle) Status() (Status, error) {
 	var s pfStatus
 	if err := h.ioctl(diocGetStatus, unsafe.Pointer(&s)); err != nil {
-		return Status{}, fmt.Errorf("pf: reading status: %w", mapErrno(err))
+		return Status{}, fmt.Errorf("pf: reading status: %w", mapErrno(err, 0))
 	}
 	return Status{Running: s.Running != 0}, nil
 }
 
+// setName copies s into the C char array dst. It leaves room for the NUL.
+func setName[T int8 | byte](dst []T, s string) error {
+	if len(s) >= len(dst) {
+		return errName
+	}
+	for i := range len(s) {
+		if s[i] == 0 {
+			return errName
+		}
+		dst[i] = T(s[i])
+	}
+	clear(dst[len(s):])
+	return nil
+}
+
+// cString returns the text of the C char array b up to the first NUL.
+func cString[T int8 | byte](b []T) string {
+	s := make([]byte, 0, len(b))
+	for _, c := range b {
+		if c == 0 {
+			break
+		}
+		s = append(s, byte(c))
+	}
+	return string(s)
+}
+
 // mapErrno turns an error of an ioctl into the errors of this package.
-func mapErrno(err error) error {
+// notFound is the errno that means a missing table or anchor for this
+// ioctl, or 0.
+func mapErrno(err error, notFound syscall.Errno) error {
 	errno, ok := errors.AsType[syscall.Errno](err)
 	if !ok {
 		return err
 	}
-	if errno == syscall.ENODEV {
+	switch {
+	case notFound != 0 && errno == notFound:
+		return ErrNotFound
+	case errno == syscall.ENODEV:
 		return ErrLayout
-	}
-	if errno == syscall.EPERM || errno == syscall.EACCES {
+	case errno == syscall.EPERM, errno == syscall.EACCES:
 		return fmt.Errorf("%w: %v", fs.ErrPermission, errno)
+	default:
+		return fmt.Errorf("%w: %v", errIoctl, errno)
 	}
-	return fmt.Errorf("%w: %v", errIoctl, errno)
 }
