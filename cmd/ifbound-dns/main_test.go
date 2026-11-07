@@ -100,18 +100,6 @@ func wantEvent(t *testing.T, logs *syncBuffer, msg string, want map[string]any) 
 	return evs[0]
 }
 
-// waitEvent waits until logs has an event msg.
-func waitEvent(t *testing.T, logs *syncBuffer, msg string) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for len(logs.events(t, msg)) == 0 {
-		if time.Now().After(deadline) {
-			t.Fatalf("no %q event:\n%s", msg, logs.String())
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-}
-
 // freeAddr returns a loopback address with a port that nothing uses.
 func freeAddr(t *testing.T) string {
 	t.Helper()
@@ -336,21 +324,22 @@ func TestRunReturnsNilWhenDNSChanges(t *testing.T) {
 	store(t, l, listen, upstreamA, policyA)
 	logger, logs := testLogger()
 	ticks := make(ticker)
-	result := make(chan error, 1)
-	go func() { result <- run(t.Context(), l, "", ticks, logger) }()
+	var err error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err = run(t.Context(), l, "", ticks, logger)
+	}()
 
-	// run reads the stored configuration before the start event. A change
-	// before that read is the configuration that run starts with.
-	waitEvent(t, logs, "start")
-	store(t, l, listen, upstreamB, policyA)
+	// run takes a tick only in watch, after it read the stored
+	// configuration. So the change comes after that read.
 	ticks.tick(t)
-	select {
-	case err := <-result:
-		if err != nil {
-			t.Errorf("run = %v, want nil (exit 0)", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("run did not return after a change in [dns]")
+	store(t, l, listen, upstreamB, policyA)
+	// watch can see the change at the first tick already.
+	ticks.tickOrDone(done)
+	requireReturns(t, done)
+	if err != nil {
+		t.Errorf("run = %v, want nil (exit 0)", err)
 	}
 	wantEvent(t, logs, "exit", map[string]any{logattr.ExitReason: logattr.ExitConfigChanged})
 }
