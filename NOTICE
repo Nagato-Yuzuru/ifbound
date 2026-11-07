@@ -45,3 +45,15 @@ internal/hostsfile/testdata/readers.c
     Apple Inc. Licensed under the Apple Public Source License,
     Version 2.0: LICENSES/APSL-2.0.txt. The source of the changes is the
     file itself.
+
+pf/xnu/net/pfvar.h, pf/xnu/libkern/tree.h, pf/zdefs.go
+
+  Headers from XNU (tag xnu-12377.121.6): bsd/net/pfvar.h and
+  libkern/libkern/tree.h, without changes. They are not compiled into a
+  binary: cgo -godefs reads them at generation time to make pf/zdefs.go,
+  which holds the struct layouts and constants of pf.
+
+  Copyright (c) 2007-2024 Apple Inc. and Copyright (c) 2009-2019 Apple
+  Inc. Licensed under the Apple Public Source License, Version 2.0:
+  LICENSES/APSL-2.0.txt. pfvar.h also contains code by Daniel Hartmeier
+  and Viagenie Inc. under the BSD license that the file states.

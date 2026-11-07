@@ -62,7 +62,7 @@ func compilePolicies(t *testing.T, config string, ifaces ...reconcile.Interface)
 	return rs
 }
 
-func pfctl(t *testing.T, args ...string) string {
+func pfctl(t testing.TB, args ...string) string {
 	t.Helper()
 	out, err := exec.CommandContext(t.Context(), pfbackend.Path, args...).CombinedOutput()
 	if err != nil {
@@ -298,7 +298,7 @@ func TestPfBackendAddEndsStates(t *testing.T) {
 
 // loadAnchor loads rules into an anchor of another tool, and flushes the
 // anchor at the end of the test.
-func loadAnchor(t *testing.T, anchor, rules string) {
+func loadAnchor(t testing.TB, anchor, rules string) {
 	t.Helper()
 	cmd := exec.CommandContext(t.Context(), pfbackend.Path, "-a", anchor, "-f", "-")
 	cmd.Stdin = strings.NewReader(rules)
