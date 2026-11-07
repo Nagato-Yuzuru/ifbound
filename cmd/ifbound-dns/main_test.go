@@ -324,18 +324,22 @@ func TestRunReturnsNilWhenDNSChanges(t *testing.T) {
 	store(t, l, listen, upstreamA, policyA)
 	logger, logs := testLogger()
 	ticks := make(ticker)
-	result := make(chan error, 1)
-	go func() { result <- run(t.Context(), l, "", ticks, logger) }()
+	var err error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		err = run(t.Context(), l, "", ticks, logger)
+	}()
 
-	store(t, l, listen, upstreamB, policyA)
+	// run takes a tick only in watch, after it read the stored
+	// configuration. So the change comes after that read.
 	ticks.tick(t)
-	select {
-	case err := <-result:
-		if err != nil {
-			t.Errorf("run = %v, want nil (exit 0)", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("run did not return after a change in [dns]")
+	store(t, l, listen, upstreamB, policyA)
+	// watch can see the change at the first tick already.
+	ticks.tickOrDone(done)
+	requireReturns(t, done)
+	if err != nil {
+		t.Errorf("run = %v, want nil (exit 0)", err)
 	}
 	wantEvent(t, logs, "exit", map[string]any{logattr.ExitReason: logattr.ExitConfigChanged})
 }
