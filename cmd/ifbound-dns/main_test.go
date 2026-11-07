@@ -100,6 +100,18 @@ func wantEvent(t *testing.T, logs *syncBuffer, msg string, want map[string]any) 
 	return evs[0]
 }
 
+// waitEvent waits until logs has an event msg.
+func waitEvent(t *testing.T, logs *syncBuffer, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(logs.events(t, msg)) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("no %q event:\n%s", msg, logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // freeAddr returns a loopback address with a port that nothing uses.
 func freeAddr(t *testing.T) string {
 	t.Helper()
@@ -327,6 +339,9 @@ func TestRunReturnsNilWhenDNSChanges(t *testing.T) {
 	result := make(chan error, 1)
 	go func() { result <- run(t.Context(), l, "", ticks, logger) }()
 
+	// run reads the stored configuration before the start event. A change
+	// before that read is the configuration that run starts with.
+	waitEvent(t, logs, "start")
 	store(t, l, listen, upstreamB, policyA)
 	ticks.tick(t)
 	select {
