@@ -6,7 +6,9 @@
 //
 //   - tables: create a table, add, delete, clear, and list addresses;
 //   - states: end the states to a destination prefix;
-//   - status: whether pf is enabled.
+//   - status: whether pf is enabled;
+//   - rules: the rules of a ruleset (the action, the label, and the anchor
+//     call of each rule), and the child anchors of an anchor.
 //
 // It cannot load rules. Most operations need root.
 //
