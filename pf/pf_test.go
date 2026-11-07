@@ -22,16 +22,55 @@ func TestLayout(t *testing.T) {
 		size uintptr
 	}{
 		{"DIOCGETSTATUS", diocGetStatus, unsafe.Sizeof(pfStatus{})},
+		{"DIOCRADDTABLES", diocRAddTables, unsafe.Sizeof(pfiocTable{})},
+		{"DIOCRCLRADDRS", diocRClrAddrs, unsafe.Sizeof(pfiocTable{})},
+		{"DIOCRADDADDRS", diocRAddAddrs, unsafe.Sizeof(pfiocTable{})},
+		{"DIOCRDELADDRS", diocRDelAddrs, unsafe.Sizeof(pfiocTable{})},
+		{"DIOCRGETADDRS", diocRGetAddrs, unsafe.Sizeof(pfiocTable{})},
+		{"DIOCKILLSTATES", diocKillStates, unsafe.Sizeof(pfiocStateKill{})},
 	}
 	for _, tt := range tests {
 		if got := ioctlSize(tt.req); got != tt.size {
 			t.Errorf("%s encodes size %d, Go struct has %d", tt.name, got, tt.size)
 		}
 	}
+	// The kernel reads the address and the mask of psk_dst from the start
+	// of the union of struct pf_addr_wrap.
+	if got := unsafe.Sizeof(pfAddrWrap{}.V); got != 32 {
+		t.Errorf("the union of pf_addr_wrap has size %d, want 32", got)
+	}
+}
+
+func TestSetName(t *testing.T) {
+	var dst [8]int8
+	for i := range dst {
+		dst[i] = 'x'
+	}
+	if err := setName(dst[:], "abc"); err != nil {
+		t.Fatal(err)
+	}
+	if got := cString(dst[:]); got != "abc" {
+		t.Errorf("cString after setName = %q, want %q", got, "abc")
+	}
+	if dst[7] != 0 {
+		t.Errorf("setName left old bytes after the name: %v", dst)
+	}
+	if err := setName(dst[:], "1234567"); err != nil {
+		t.Errorf("setName of the longest name: %v", err)
+	}
+	for _, bad := range []string{"12345678", "a\x00b"} {
+		if err := setName(dst[:], bad); !errors.Is(err, errName) {
+			t.Errorf("setName(%q): got %v, want errName", bad, err)
+		}
+	}
+	full := [3]byte{'a', 'b', 'c'}
+	if got := cString(full[:]); got != "abc" {
+		t.Errorf("cString of an array with no NUL = %q, want %q", got, "abc")
+	}
 }
 
 // TestMapErrno covers the errnos that the e2e tests cannot cause on a
-// real kernel.
+// real kernel. The e2e tests check ESRCH and EINVAL.
 func TestMapErrno(t *testing.T) {
 	tests := []struct {
 		err  error
@@ -43,13 +82,13 @@ func TestMapErrno(t *testing.T) {
 		{fs.ErrClosed, fs.ErrClosed},
 	}
 	for _, tt := range tests {
-		if got := mapErrno(tt.err); !errors.Is(got, tt.want) {
+		if got := mapErrno(tt.err, 0); !errors.Is(got, tt.want) {
 			t.Errorf("mapErrno(%v) = %v, want %v", tt.err, got, tt.want)
 		}
 	}
 	// An errno without a meaning in this package does not become a part
 	// of the error contract.
-	if got := mapErrno(syscall.ESRCH); errors.Is(got, syscall.ESRCH) {
-		t.Errorf("mapErrno(ESRCH) = %v, want an opaque error", got)
+	if got := mapErrno(syscall.ESRCH, 0); errors.Is(got, syscall.ESRCH) || errors.Is(got, ErrNotFound) {
+		t.Errorf("mapErrno(ESRCH, 0) = %v, want an opaque error", got)
 	}
 }
