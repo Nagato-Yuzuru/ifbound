@@ -16,6 +16,8 @@ import (
 var (
 	// ErrNotFound: the table or the anchor does not exist.
 	ErrNotFound = errors.New("not found")
+	// ErrChanged: the ruleset changed while Handle.Rules read it.
+	ErrChanged = errors.New("ruleset changed during the read")
 	// ErrLayout: the kernel does not know the ioctl. The struct layout of
 	// this package does not agree with the running kernel.
 	ErrLayout = errors.New("struct layout does not agree with the kernel")
@@ -89,6 +91,8 @@ func mapErrno(err error, notFound syscall.Errno) error {
 	switch {
 	case notFound != 0 && errno == notFound:
 		return ErrNotFound
+	case errno == syscall.EBUSY:
+		return ErrChanged
 	case errno == syscall.ENODEV:
 		return ErrLayout
 	case errno == syscall.EPERM, errno == syscall.EACCES:
