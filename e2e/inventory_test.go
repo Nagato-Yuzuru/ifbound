@@ -93,7 +93,8 @@ func startInventory(t *testing.T) *macinventory.Inventory {
 
 // quiet takes the signals of earlier changes, and returns when no signal
 // came for three times Debounce. A signal after quiet then comes from the
-// next change.
+// next change. The inventory has no event for the end of the changes, so
+// only a time without a signal shows it.
 func quiet(t *testing.T, inv *macinventory.Inventory) {
 	t.Helper()
 	deadline := time.After(signalWait)
