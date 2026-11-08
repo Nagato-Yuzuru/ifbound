@@ -2,7 +2,8 @@ package ipc
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net"
@@ -111,7 +112,7 @@ func (c *Client) ReportProbe(ctx context.Context, qname string) error {
 
 // exchange sends one request on its own connection, in one of slots, and
 // reads the reply. It returns the body of the ack.
-func (c *Client) exchange(ctx context.Context, slots chan struct{}, qname string, req func(context.Context) envelope) (json.RawMessage, error) {
+func (c *Client) exchange(ctx context.Context, slots chan struct{}, qname string, req func(context.Context) envelope) (jsontext.Value, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, DefaultTimeout)
@@ -131,7 +132,7 @@ func (c *Client) exchange(ctx context.Context, slots chan struct{}, qname string
 	return body, err
 }
 
-func (c *Client) roundTrip(ctx context.Context, req envelope) (json.RawMessage, error) {
+func (c *Client) roundTrip(ctx context.Context, req envelope) (jsontext.Value, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", c.path)
 	if err != nil {
@@ -144,7 +145,7 @@ func (c *Client) roundTrip(ctx context.Context, req envelope) (json.RawMessage, 
 // exchangeOn sends req on conn and returns the body of the ack. The
 // server must run as serverUID, and its reply must have the given
 // protocol version.
-func exchangeOn(ctx context.Context, conn net.Conn, serverUID uint32, version int, req envelope) (json.RawMessage, error) {
+func exchangeOn(ctx context.Context, conn net.Conn, serverUID uint32, version int, req envelope) (jsontext.Value, error) {
 	uid, err := peerUID(conn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
@@ -204,7 +205,7 @@ func wrapIO(err error) error {
 // interpretReply returns the body of an ack, and an error for every
 // other reply. A reply of another version than version is an error also
 // when it is an ack: its body can mean something else.
-func interpretReply(env envelope, version int) (json.RawMessage, error) {
+func interpretReply(env envelope, version int) (jsontext.Value, error) {
 	if env.Version != version {
 		return nil, fmt.Errorf("%w: reply version %d", ErrProtocol, env.Version)
 	}
@@ -224,7 +225,7 @@ func interpretReply(env envelope, version int) (json.RawMessage, error) {
 
 // decodeAck reads the body of the ack to an observation. An ack without
 // the protected flag is a protocol error, so the caller fails closed.
-func decodeAck(body json.RawMessage) (Ack, error) {
+func decodeAck(body jsontext.Value) (Ack, error) {
 	var b ackBody
 	if err := json.Unmarshal(body, &b); err != nil {
 		return Ack{}, fmt.Errorf("%w: ack body: %v", ErrProtocol, err)

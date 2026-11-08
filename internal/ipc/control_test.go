@@ -585,9 +585,13 @@ func TestControlClientAcceptsStatusAtTheBounds(t *testing.T) {
 	for i := range reasons {
 		reasons[i] = "r"
 	}
-	want := StatusReport{Daemon: text, State: StateUnenforced, Reasons: reasons}
+	sent := StatusReport{Daemon: text, State: StateUnenforced, Reasons: reasons}
+	// The wire sends an empty list as [], and the client reads it as an
+	// empty slice, not as nil.
+	want := sent
+	want.Warnings, want.Policies = []Warning{}, []PolicyCount{}
 	path := shortPath(t)
-	listenStatus(t, path, &fakeControl{status: want})
+	listenStatus(t, path, &fakeControl{status: sent})
 
 	got, err := NewControlClient(path, self()).Status(t.Context())
 

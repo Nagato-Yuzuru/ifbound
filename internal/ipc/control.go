@@ -2,7 +2,8 @@ package ipc
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -195,7 +196,7 @@ type applyBody struct {
 
 // decodeApply reads an apply body. A missing or empty config is an error:
 // it must not read as a configuration without policies.
-func decodeApply(raw json.RawMessage) ([]byte, time.Time, error) {
+func decodeApply(raw jsontext.Value) ([]byte, time.Time, error) {
 	var b applyBody
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return nil, time.Time{}, fmt.Errorf("malformed apply body: %w", err)
@@ -280,7 +281,7 @@ func (c *ControlClient) call(ctx context.Context, req func(context.Context) enve
 	return decodeStatus(body)
 }
 
-func (c *ControlClient) roundTrip(ctx context.Context, req envelope) (json.RawMessage, error) {
+func (c *ControlClient) roundTrip(ctx context.Context, req envelope) (jsontext.Value, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "unix", c.path)
 	switch {

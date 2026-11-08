@@ -28,7 +28,8 @@ package ipc
 
 import (
 	"encoding/binary"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -77,9 +78,9 @@ var (
 )
 
 type envelope struct {
-	Version int             `json:"v"`
-	Type    string          `json:"type"`
-	Body    json.RawMessage `json:"body,omitempty"`
+	Version int            `json:"v"`
+	Type    string         `json:"type"`
+	Body    jsontext.Value `json:"body,omitempty"`
 }
 
 type observeBody struct {
