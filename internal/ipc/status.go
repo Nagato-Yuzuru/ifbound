@@ -3,7 +3,8 @@ package ipc
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"slices"
 	"strings"
@@ -199,7 +200,7 @@ func cutText(s string, limit int) string {
 
 // decodeStatus reads the status in the body of an ack. A body out of
 // bounds is a protocol error.
-func decodeStatus(raw json.RawMessage) (StatusReport, error) {
+func decodeStatus(raw jsontext.Value) (StatusReport, error) {
 	var b statusBody
 	if err := json.Unmarshal(raw, &b); err != nil {
 		return StatusReport{}, fmt.Errorf("%w: status body: %v", ErrProtocol, err)

@@ -3,6 +3,7 @@ package ipc
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"testing"
 )
 
@@ -56,7 +57,7 @@ func TestFrameGolden(t *testing.T) {
 		{
 			name: "status with empty lists",
 			env:  envelopeIn(controlVersion, typeAck, boundStatus(StatusReport{Daemon: "dev", State: StateReady, Config: "ab"})),
-			want: `{"v":1,"type":"ack","body":{"daemon":"dev","state":"ready","reasons":null,"warnings":null,"policies":null,"retain_restart":false,"config":"ab"}}`,
+			want: `{"v":1,"type":"ack","body":{"daemon":"dev","state":"ready","reasons":[],"warnings":[],"policies":[],"retain_restart":false,"config":"ab"}}`,
 		},
 		{
 			name: "status with lists",
@@ -92,4 +93,33 @@ func TestFrameGolden(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestReadFrameIsStrict records the input that readFrame refuses or reads
+// differently from a lenient decoder: a duplicate member, a member name in
+// other case, and invalid UTF-8.
+func TestReadFrameIsStrict(t *testing.T) {
+	frame := func(payload string) *bytes.Reader {
+		b := binary.BigEndian.AppendUint32(nil, uint32(len(payload))) //nolint:gosec // test payloads are short
+		return bytes.NewReader(append(b, payload...))
+	}
+	for name, payload := range map[string]string{
+		"duplicate member": `{"v":3,"type":"ack","type":"reject"}`,
+		"invalid UTF-8":    "{\"v\":3,\"type\":\"ack\xff\"}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := readFrame(frame(payload)); !errors.Is(err, ErrProtocol) {
+				t.Errorf("err = %v, want %v", err, ErrProtocol)
+			}
+		})
+	}
+	t.Run("member name in other case", func(t *testing.T) {
+		env, err := readFrame(frame(`{"V":3,"Type":"ack"}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if env.Version != 0 || env.Type != "" {
+			t.Errorf("envelope = %+v, want the zero version and type", env)
+		}
+	})
 }
