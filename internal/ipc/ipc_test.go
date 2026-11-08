@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -181,40 +182,80 @@ func TestRejection(t *testing.T) {
 	}
 }
 
+// A Report whose handler never replies ends at the ctx deadline.
 func TestTimeout(t *testing.T) {
-	release := make(chan struct{})
-	c, _ := start(t, handlerFunc(func(context.Context, Observation) error {
-		<-release
-		return nil
-	}))
-	t.Cleanup(func() { close(release) }) // runs before the server cleanup
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		c, _ := pipeReport(t, ServerConfig{Handler: handlerFunc(func(context.Context, Observation) error {
+			<-release // no reply before the client gives up
+			return nil
+		})})
+		t.Cleanup(func() { close(release) }) // runs before the server cleanup
+		begin := time.Now()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
-	defer cancel()
-	_, err := c.Report(ctx, Observation{QName: "slow.test."})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("err = %v, want DeadlineExceeded", err)
-	}
+		ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+		defer cancel()
+		_, err := c.Report(ctx, Observation{QName: "slow.test."})
+
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want DeadlineExceeded", err)
+		}
+		if got := time.Since(begin); got != 100*time.Millisecond {
+			t.Errorf("Report returned after %v, want 100ms", got)
+		}
+	})
 }
 
 func TestHandlerContextCarriesClientDeadline(t *testing.T) {
-	var remaining atomic.Int64
-	c, _ := start(t, handlerFunc(func(ctx context.Context, _ Observation) error {
-		dl, ok := ctx.Deadline()
-		if ok {
-			remaining.Store(int64(time.Until(dl)))
+	synctest.Test(t, func(t *testing.T) {
+		var got time.Duration
+		c, _ := pipeReport(t, ServerConfig{Handler: handlerFunc(func(ctx context.Context, _ Observation) error {
+			if dl, ok := ctx.Deadline(); ok {
+				got = time.Until(dl)
+			}
+			return nil
+		})})
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+		defer cancel()
+
+		if _, err := c.Report(ctx, Observation{QName: "a.test."}); err != nil {
+			t.Fatal(err)
 		}
-		return nil
-	}))
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
-	defer cancel()
-	if _, err := c.Report(ctx, Observation{QName: "a.test."}); err != nil {
-		t.Fatal(err)
-	}
-	got := time.Duration(remaining.Load())
-	if got < 2*time.Second || got > 3*time.Second {
-		t.Errorf("handler deadline in %v, want within (2s, 3s]", got)
-	}
+
+		// The reply comes after the handler returns, so got is set.
+		if got != 3*time.Second {
+			t.Errorf("handler deadline in %v, want 3s", got)
+		}
+	})
+}
+
+// A Report whose ctx has no deadline gives up after 2 s, also when the
+// handler ignores its ctx, and gives the handler the same deadline.
+func TestReportDefaultTimeoutIsTwoSeconds(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		deadline := make(chan time.Duration, 1)
+		c, _ := pipeReport(t, ServerConfig{Handler: handlerFunc(func(ctx context.Context, _ Observation) error {
+			dl, _ := ctx.Deadline()
+			deadline <- time.Until(dl)
+			<-release // the handler ignores ctx: only the client deadline ends the call
+			return nil
+		})})
+		t.Cleanup(func() { close(release) }) // runs before the server cleanup
+		begin := time.Now()
+
+		_, err := c.Report(t.Context(), Observation{QName: "a.test."})
+
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want DeadlineExceeded", err)
+		}
+		if got := time.Since(begin); got != 2*time.Second {
+			t.Errorf("Report returned after %v, want 2s", got)
+		}
+		if got := <-deadline; got != 2*time.Second {
+			t.Errorf("handler deadline in %v, want 2s", got)
+		}
+	})
 }
 
 func TestInvalidObservationsAreRejectedBeforeHandler(t *testing.T) {
@@ -528,55 +569,95 @@ func TestBurstOfReportsAllSucceeds(t *testing.T) {
 }
 
 func TestReportWaitingForSlotHonorsContext(t *testing.T) {
-	release := make(chan struct{})
-	c, _ := start(t, handlerFunc(func(context.Context, Observation) error {
-		<-release
-		return nil
-	}))
-	t.Cleanup(func() { close(release) })
-	var wg sync.WaitGroup
-	for range maxInFlight {
-		wg.Go(func() { _, _ = c.Report(t.Context(), Observation{QName: "a.test."}) }) //nolint:errcheck // these calls only fill the pool; the test checks the cap, not their results
-	}
-	for len(c.inflight) < maxInFlight {
-		time.Sleep(time.Millisecond) // waits for the pool to fill; no other signal exists
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
-	defer cancel()
-	_, err := c.Report(ctx, Observation{QName: "a.test."})
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("err = %v, want DeadlineExceeded", err)
-	}
-	cancel()
-	// The blocked reports end when the cleanup releases the handler.
-	t.Cleanup(wg.Wait)
+	synctest.Test(t, func(t *testing.T) {
+		release := make(chan struct{})
+		c, _ := pipeReport(t, ServerConfig{Handler: handlerFunc(func(context.Context, Observation) error {
+			<-release
+			return nil
+		})})
+		var wg sync.WaitGroup
+		for range maxInFlight {
+			wg.Go(func() { _, _ = c.Report(t.Context(), Observation{QName: "a.test."}) }) //nolint:errcheck // these calls only fill the pool; the test checks the cap, not their results
+		}
+		synctest.Wait()
+		if n := len(c.inflight); n != maxInFlight {
+			t.Fatalf("%d report slots held, want %d (fixture broken)", n, maxInFlight)
+		}
+		begin := time.Now()
+
+		ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+		defer cancel()
+		_, err := c.Report(ctx, Observation{QName: "a.test."})
+
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want DeadlineExceeded", err)
+		}
+		if got := time.Since(begin); got != 50*time.Millisecond {
+			t.Errorf("Report returned after %v, want 50ms", got)
+		}
+		close(release)
+		wg.Wait()
+	})
+}
+
+// While 32 reports of a Client wait in the handler, a 33rd one does not
+// reach it. It gets in when a slot frees.
+func TestNo33rdReportReachesTheHandler(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// The test states the value of maxInFlight, because the value is
+		// part of the contract: it keeps a burst below the listen backlog.
+		const slots = 32
+		var entered atomic.Int32
+		release := make(chan struct{})
+		c, _ := pipeReport(t, ServerConfig{Handler: handlerFunc(func(context.Context, Observation) error {
+			entered.Add(1)
+			<-release
+			return nil
+		})})
+		errs := make(chan error, slots+1)
+		for range slots + 1 {
+			go func() { errs <- errOf(c.Report(t.Context(), Observation{QName: "a.test."})) }()
+		}
+
+		synctest.Wait()
+		if n := entered.Load(); n != slots {
+			t.Errorf("%d reports reached the handler at once, want %d", n, slots)
+		}
+
+		close(release)
+		for range slots + 1 {
+			if err := <-errs; err != nil {
+				t.Errorf("Report = %v, want nil after the handler returns", err)
+			}
+		}
+		if n := entered.Load(); n != slots+1 {
+			t.Errorf("%d reports reached the handler in total, want %d", n, slots+1)
+		}
+	})
 }
 
 func TestServerConnectionCap(t *testing.T) {
-	c, path := start(t, handlerFunc(ack))
-	var idle []net.Conn
-	var d net.Dialer
-	for range maxConns {
-		conn, err := d.DialContext(t.Context(), "unix", path)
-		if err != nil {
+	synctest.Test(t, func(t *testing.T) {
+		c, ln := pipeReport(t, ServerConfig{Handler: handlerFunc(ack)})
+		ln.hold(t, maxConns-1)
+		if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+			t.Fatalf("with %d idle connections: %v", maxConns-1, err)
+		}
+		last := ln.hold(t, 1)[0]
+
+		// Every slot is taken: the next client waits.
+		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+		defer cancel()
+		if _, err := c.Report(ctx, Observation{QName: "a.test."}); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v, want DeadlineExceeded while the cap is full", err)
+		}
+		if err := last.Close(); err != nil {
 			t.Fatal(err)
 		}
-		idle = append(idle, conn)
-	}
-	// Every slot is taken: the next client waits in the kernel backlog.
-	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-	defer cancel()
-	if _, err := c.Report(ctx, Observation{QName: "a.test."}); !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("err = %v, want DeadlineExceeded while the cap is full", err)
-	}
-	for _, conn := range idle {
-		if err := conn.Close(); err != nil {
-			t.Error(err)
+		if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+			t.Errorf("after an idle connection closes: %v", err)
 		}
-	}
-	if _, err := c.Report(t.Context(), Observation{QName: "a.test."}); err != nil {
-		t.Errorf("after the idle connections close: %v", err)
-	}
+	})
 }
 
 func TestOneRequestPerConnection(t *testing.T) {
@@ -831,23 +912,19 @@ func TestListenSaturatedLiveServer(t *testing.T) {
 }
 
 func TestServeTwiceFails(t *testing.T) {
-	path := shortPath(t)
-	srv := listen(t, path, handlerFunc(ack), self())
-	for srv.serveStarted() == false {
-		time.Sleep(time.Millisecond) // waits for the first Serve goroutine to start
-	}
-	if err := srv.Serve(t.Context()); err == nil {
-		t.Error("second Serve returned nil")
-	}
-	if _, err := NewClient(path, self()).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
-		t.Errorf("first Serve was disturbed: %v", err)
-	}
-}
+	synctest.Test(t, func(t *testing.T) {
+		ln := newPipeListener()
+		srv := newServer(ln, ServerConfig{Handler: handlerFunc(ack), AllowedUIDs: []uint32{pipeClientUID}})
+		serve(t, srv)
+		synctest.Wait() // the first Serve waits in Accept
 
-func (s *Server) serveStarted() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.serving
+		if err := srv.Serve(t.Context()); !errors.Is(err, errAlreadyServing) {
+			t.Errorf("second Serve = %v, want errAlreadyServing", err)
+		}
+		if _, err := newClient(ln.dial, pipeServerUID).Report(t.Context(), Observation{QName: "a.test."}); err != nil {
+			t.Errorf("first Serve was disturbed: %v", err)
+		}
+	})
 }
 
 // fakeListener fails Accept a fixed number of times, then blocks until Close.
@@ -1059,56 +1136,44 @@ func TestTimeoutBounds(t *testing.T) {
 	}
 }
 
-// TestTrickleCannotExtendDeadline sends one byte every 50 ms. The server must
-// close the connection at its one connection deadline anyway.
+// TestTrickleCannotExtendDeadline sends one byte every second. The server
+// must close the connection at its one connection deadline anyway.
 func TestTrickleCannotExtendDeadline(t *testing.T) {
-	path := shortPath(t)
-	srv, err := Listen(ServerConfig{Path: path, Handler: handlerFunc(ack), AllowedUIDs: []uint32{self()}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	srv.connTimeout = 200 * time.Millisecond // set before Serve starts
-	served := make(chan struct{})
-	go func() { _ = srv.Serve(t.Context()); close(served) }() //nolint:errcheck // Serve ends when the cleanup closes it; this test does not assert on that result
-	t.Cleanup(func() {
-		if err := srv.Close(); err != nil {
-			t.Error(err)
+	synctest.Test(t, func(t *testing.T) {
+		_, ln := pipeReport(t, ServerConfig{Handler: handlerFunc(ack)})
+		conn, err := ln.dial(t.Context())
+		if err != nil {
+			t.Fatal(err)
 		}
-		<-served
-	})
-
-	var d net.Dialer
-	conn, err := d.DialContext(t.Context(), "unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = conn.Close() }() //nolint:errcheck // the server closes first; this call only frees the descriptor
-	begin := time.Now()
-	// A 256-byte body follows, slowly.
-	if _, err := conn.Write([]byte{0, 0, 1, 0}); err != nil {
-		t.Fatal(err)
-	}
-	closed := make(chan time.Duration, 1)
-	go func() {
-		var b [1]byte
-		_, _ = conn.Read(b[:]) //nolint:errcheck // the read only waits for the server to close; the elapsed time is the result
-		closed <- time.Since(begin)
-	}()
-	tick := time.NewTicker(50 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		select {
-		case got := <-closed:
-			if got < 150*time.Millisecond || got > time.Second {
-				t.Errorf("closed after %v, want about 200ms", got)
+		defer func() { _ = conn.Close() }() //nolint:errcheck // a pipe close never fails
+		begin := time.Now()
+		// A body of 64 KiB follows, too slowly to end before the deadline.
+		if _, err := conn.Write([]byte{0, 1, 0, 0}); err != nil {
+			t.Fatal(err)
+		}
+		closed := make(chan time.Duration, 1)
+		go func() {
+			var b [1]byte
+			_, _ = conn.Read(b[:]) //nolint:errcheck // the read only waits for the server to close; the elapsed time is the result
+			closed <- time.Since(begin)
+		}()
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		giveUp := time.After(2 * connTimeout)
+		for {
+			select {
+			case got := <-closed:
+				if got != connTimeout {
+					t.Errorf("closed after %v, want %v", got, connTimeout)
+				}
+				return
+			case <-tick.C:
+				_, _ = conn.Write([]byte{' '}) //nolint:errcheck // the server may have closed the connection already; the closed case ends the test
+			case <-giveUp:
+				t.Fatalf("connection still open after %v of trickling", 2*connTimeout)
 			}
-			return
-		case <-tick.C:
-			_, _ = conn.Write([]byte{' '}) //nolint:errcheck // the server may have closed the connection already; the closed case ends the test
-		case <-time.After(3 * time.Second):
-			t.Fatal("connection still open after 3s of trickling")
 		}
-	}
+	})
 }
 
 // TestCrossUIDImpostor: a server that runs as another uid owns the

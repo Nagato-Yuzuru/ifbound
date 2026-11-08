@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 	"unicode/utf8"
 )
@@ -314,112 +315,144 @@ func TestApplyIsNotStartedAfterItsDeadline(t *testing.T) {
 	}
 }
 
-// TestTimedOutApplyIsNotAppliedLater: the client writes its request while
-// the connection waits in the backlog, and gives up. When the server
-// accepts the connection later, it must not apply the config.
+// pipeReply is the reply to a raw request on a pipe connection.
+type pipeReply struct {
+	reply envelope
+	err   error
+}
+
+// exchangeLater sends frame on a new pipe connection when the server
+// accepts it, and delivers the reply.
+func exchangeLater(ctx context.Context, ln *pipeListener, frame []byte) <-chan pipeReply {
+	out := make(chan pipeReply, 1)
+	go func() {
+		conn, err := ln.dial(ctx)
+		if err != nil {
+			out <- pipeReply{err: err}
+			return
+		}
+		defer func() { _ = conn.Close() }() //nolint:errcheck // a pipe close never fails
+		if _, err := conn.Write(frame); err != nil {
+			out <- pipeReply{err: err}
+			return
+		}
+		env, err := readFrame(conn)
+		out <- pipeReply{env, err}
+	}()
+	return out
+}
+
+// TestTimedOutApplyIsNotAppliedLater: the request of an Apply waits for a
+// slot while its client gives up. When the server accepts the connection
+// later, it must not apply the config.
 func TestTimedOutApplyIsNotAppliedLater(t *testing.T) {
-	path := shortPath(t)
-	h := &fakeControl{status: fullStatus()}
-	srv := newAdminServer(t, path, h, nil, self())
-	// One slot serves the connections in order, so the late Apply is done
-	// when the Status below returns.
-	srv.slots = make(chan struct{}, 1) // set before Serve starts
-	serve(t, srv)
-	var d net.Dialer
-	hold, err := d.DialContext(t.Context(), "unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	c := NewControlClient(path, self())
+	synctest.Test(t, func(t *testing.T) {
+		h := &fakeControl{status: fullStatus()}
+		c, ln := pipeAdmin(t, h)
+		idle := ln.hold(t, adminConns)
+		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+		defer cancel()
+		deadline, _ := ctx.Deadline()
+		// On a socket, the kernel keeps the request after its client gives
+		// up. A pipe has no buffer, so the test sends that request itself.
+		late := exchangeLater(t.Context(), ln, applyFrame(deadline))
 
-	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
-	defer cancel()
-	_, applyErr := c.Apply(ctx, []byte("late config"))
-	if err := hold.Close(); err != nil {
-		t.Fatal(err)
-	}
-	_, statusErr := c.Status(t.Context())
+		_, applyErr := c.Apply(ctx, []byte("late config"))
+		if !errors.Is(applyErr, context.DeadlineExceeded) {
+			t.Fatalf("Apply = %v, want DeadlineExceeded while the slots are held (fixture broken)", applyErr)
+		}
+		if err := idle[0].Close(); err != nil {
+			t.Fatal(err)
+		}
+		got := <-late
 
-	if !errors.Is(applyErr, context.DeadlineExceeded) {
-		t.Fatalf("Apply = %v, want DeadlineExceeded while the slot is held (fixture broken)", applyErr)
-	}
-	if statusErr != nil {
-		t.Fatalf("Status after the slot is free: %v", statusErr)
-	}
-	if applied := h.appliedConfigs(); len(applied) != 0 {
-		t.Errorf("the handler applied %q after the client gave up", applied)
-	}
+		if got.err != nil {
+			t.Fatalf("late request: %v", got.err)
+		}
+		var b rejectBody
+		if err := json.Unmarshal(got.reply.Body, &b); got.reply.Type != typeReject || err != nil || b.Reason != errApplyLate.Error() {
+			t.Errorf("reply to the late request %s %s, want a reject: %v", got.reply.Type, got.reply.Body, errApplyLate)
+		}
+		if applied := h.appliedConfigs(); len(applied) != 0 {
+			t.Errorf("the handler applied %q after the client gave up", applied)
+		}
+		// The fixture is sound: an Apply in time reaches the handler.
+		if _, err := c.Apply(t.Context(), []byte("in time")); err != nil {
+			t.Fatalf("Apply after a slot is free: %v", err)
+		}
+		if applied := h.appliedConfigs(); len(applied) != 1 || string(applied[0]) != "in time" {
+			t.Errorf("handler got %q, want one call with %q", applied, "in time")
+		}
+	})
 }
 
 func TestHandlerContextLeavesTimeForTheReply(t *testing.T) {
+	// The connection deadline of a control socket.
+	const connDeadline = 5 * time.Second
 	t.Run("blocking handler", func(t *testing.T) {
-		path := shortPath(t)
-		srv := newStatusServer(t, path, &fakeControl{block: true}, nil)
-		srv.connTimeout = time.Second // set before Serve starts
-		serve(t, srv)
+		synctest.Test(t, func(t *testing.T) {
+			c, _ := pipeStatus(t, &fakeControl{block: true})
+			begin := time.Now()
 
-		_, err := NewControlClient(path, self()).Status(t.Context())
+			_, err := c.Status(t.Context())
 
-		// A reply, not a lost connection: the client knows the outcome.
-		if reason := rejectReason(t, err); !strings.Contains(reason, context.DeadlineExceeded.Error()) {
-			t.Errorf("reason = %q, want the handler's context error", reason)
-		}
+			// A reply, not a lost connection: the client knows the outcome.
+			if reason := rejectReason(t, err); !strings.Contains(reason, context.DeadlineExceeded.Error()) {
+				t.Errorf("reason = %q, want the handler's context error", reason)
+			}
+			if got, want := time.Since(begin), connDeadline-controlReplyMargin; got != want {
+				t.Errorf("Status returned after %v, want %v", got, want)
+			}
+		})
 	})
 	t.Run("connection deadline", func(t *testing.T) {
-		path := shortPath(t)
-		h := &fakeControl{status: fullStatus()}
-		listenStatus(t, path, h)
-		begin := time.Now()
+		synctest.Test(t, func(t *testing.T) {
+			h := &fakeControl{status: fullStatus()}
+			c, _ := pipeStatus(t, h)
+			begin := time.Now()
 
-		if _, err := NewControlClient(path, self()).Status(t.Context()); err != nil {
-			t.Fatal(err)
-		}
+			if _, err := c.Status(t.Context()); err != nil {
+				t.Fatal(err)
+			}
 
-		left := h.lastDeadline().Sub(begin)
-		if want := 5*time.Second - controlReplyMargin; left > want+100*time.Millisecond || left < want-time.Second {
-			t.Errorf("handler deadline %v after the call, want about %v", left, want)
-		}
+			if got, want := h.lastDeadline().Sub(begin), connDeadline-controlReplyMargin; got != want {
+				t.Errorf("handler deadline %v after the call, want %v", got, want)
+			}
+		})
 	})
 	t.Run("client deadline", func(t *testing.T) {
-		path := shortPath(t)
-		h := &fakeControl{status: fullStatus()}
-		listenAdmin(t, path, h, self())
-		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
-		defer cancel()
-		client, _ := ctx.Deadline()
+		synctest.Test(t, func(t *testing.T) {
+			h := &fakeControl{status: fullStatus()}
+			c, _ := pipeAdmin(t, h)
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			client, _ := ctx.Deadline()
 
-		if _, err := NewControlClient(path, self()).Apply(ctx, []byte("x")); err != nil {
-			t.Fatal(err)
-		}
+			if _, err := c.Apply(ctx, []byte("x")); err != nil {
+				t.Fatal(err)
+			}
 
-		if got, want := h.lastDeadline(), client.Add(-controlReplyMargin); got.After(want) || got.Before(want.Add(-10*time.Millisecond)) {
-			t.Errorf("handler deadline %v before the client deadline, want %v", client.Sub(got), controlReplyMargin)
-		}
+			if got, want := h.lastDeadline(), client.Add(-controlReplyMargin); !got.Equal(want) {
+				t.Errorf("handler deadline %v before the client deadline, want %v", client.Sub(got), controlReplyMargin)
+			}
+		})
 	})
 }
 
-// requestServer accepts one connection, sends the request to the test,
-// and answers with a status.
-func requestServer(t *testing.T) (string, <-chan envelope) {
+// requestServer accepts one pipe connection, sends the request to the
+// test, and answers with a status. It returns a client of it.
+func requestServer(t *testing.T) (*ControlClient, <-chan envelope) {
 	t.Helper()
-	path := shortPath(t)
-	var lc net.ListenConfig
-	ln, err := lc.Listen(t.Context(), "unix", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := ln.Close(); err != nil {
-			t.Error(err)
-		}
-	})
+	ln := newPipeListener()
 	got := make(chan envelope, 1)
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
-		defer func() { _ = conn.Close() }() //nolint:errcheck // the peer may have closed first
+		defer func() { _ = conn.Close() }() //nolint:errcheck // a pipe close never fails
 		req, err := readFrame(conn)
 		if err != nil {
 			return
@@ -427,24 +460,30 @@ func requestServer(t *testing.T) (string, <-chan envelope) {
 		got <- req
 		_, _ = conn.Write(statusFrame(`{"state":"ready"}`)) //nolint:errcheck // the client side asserts on a failed reply
 	}()
-	return path, got
+	t.Cleanup(func() {
+		_ = ln.Close() //nolint:errcheck // a pipe listener close never fails
+		<-done
+	})
+	return newControlClient(ln.dial, pipeServerUID), got
 }
 
 func TestApplyWithoutContextDeadlineWaitsSixSeconds(t *testing.T) {
-	path, got := requestServer(t)
-	begin := time.Now()
+	synctest.Test(t, func(t *testing.T) {
+		c, got := requestServer(t)
+		begin := time.Now()
 
-	if _, err := NewControlClient(path, self()).Apply(context.Background(), []byte("x")); err != nil {
-		t.Fatal(err)
-	}
+		if _, err := c.Apply(context.Background(), []byte("x")); err != nil {
+			t.Fatal(err)
+		}
 
-	var b applyBody
-	if err := json.Unmarshal((<-got).Body, &b); err != nil {
-		t.Fatal(err)
-	}
-	if wait, want := time.UnixMilli(b.DeadlineMS).Sub(begin), 6*time.Second; wait > want || wait < want-time.Second {
-		t.Errorf("request deadline %v after the call, want about %v", wait, want)
-	}
+		var b applyBody
+		if err := json.Unmarshal((<-got).Body, &b); err != nil {
+			t.Fatal(err)
+		}
+		if wait := time.UnixMilli(b.DeadlineMS).Sub(begin); wait != 6*time.Second {
+			t.Errorf("request deadline %v after the call, want 6s", wait)
+		}
+	})
 }
 
 func TestApplyRefusesAnEmptyConfig(t *testing.T) {
@@ -773,80 +812,78 @@ func TestApplyIsDeniedWhenTheSocketFileRefusesTheCaller(t *testing.T) {
 // status socket. A report and an Apply on the other sockets must still
 // get through.
 func TestStatusFloodDelaysNeitherReportsNorAdmin(t *testing.T) {
-	status, admin := shortPath(t), shortPath(t)
-	listenStatus(t, status, &fakeControl{status: fullStatus()})
-	listenAdmin(t, admin, &fakeControl{status: fullStatus()}, self())
-	reports, _ := start(t, handlerFunc(ack))
+	synctest.Test(t, func(t *testing.T) {
+		status, statusLn := pipeStatus(t, &fakeControl{status: fullStatus()})
+		admin, _ := pipeAdmin(t, &fakeControl{status: fullStatus()})
+		reports, _ := pipeReport(t, ServerConfig{Handler: handlerFunc(ack)})
 
-	var d net.Dialer
-	for range 16 { // more than the 4 status slots
-		conn, err := d.DialContext(t.Context(), "unix", status)
-		if err != nil {
-			t.Fatal(err)
+		// More than the 4 status slots: 4 connections take the slots, and
+		// the rest wait for one.
+		flood, stopFlood := context.WithCancel(t.Context())
+		var wg sync.WaitGroup
+		defer func() {
+			stopFlood()
+			wg.Wait()
+		}()
+		for range 16 {
+			wg.Go(func() {
+				conn, err := statusLn.dial(flood)
+				if err != nil {
+					return
+				}
+				<-flood.Done()
+				_ = conn.Close() //nolint:errcheck // a pipe close never fails
+			})
 		}
-		t.Cleanup(func() { _ = conn.Close() }) //nolint:errcheck // frees the slot; the server may have closed first
-	}
+		synctest.Wait()
 
-	// The fixture is sound: the status socket is full.
-	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-	defer cancel()
-	if _, err := NewControlClient(status, self()).Status(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Status = %v, want DeadlineExceeded while the status slots are full (fixture broken)", err)
-	}
-	// Many requests in sequence: each one frees its slot, and a status
-	// connection in the backlog would take a slot that two sockets share.
-	for i := range 16 {
-		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-		_, reportErr := reports.Report(ctx, Observation{QName: "a.test."})
-		_, applyErr := NewControlClient(admin, self()).Apply(ctx, []byte("x"))
-		cancel()
-		if reportErr != nil || applyErr != nil {
-			t.Fatalf("request %d: Report = %v, Apply = %v while the status slots are full", i, reportErr, applyErr)
+		// The fixture is sound: the status socket is full.
+		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+		defer cancel()
+		if _, err := status.Status(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Status = %v, want DeadlineExceeded while the status slots are full (fixture broken)", err)
 		}
-	}
+		// Many requests in sequence: each one frees its slot, and a waiting
+		// status connection would take a slot that two sockets share.
+		for i := range 16 {
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			_, reportErr := reports.Report(ctx, Observation{QName: "a.test."})
+			_, applyErr := admin.Apply(ctx, []byte("x"))
+			cancel()
+			if reportErr != nil || applyErr != nil {
+				t.Fatalf("request %d: Report = %v, Apply = %v while the status slots are full", i, reportErr, applyErr)
+			}
+		}
+	})
 }
 
 // TestControlSocketSlots: the status socket serves 4 connections at once,
 // and the admin socket 2.
 func TestControlSocketSlots(t *testing.T) {
-	status, admin := shortPath(t), shortPath(t)
-	listenStatus(t, status, &fakeControl{status: fullStatus()})
-	listenAdmin(t, admin, &fakeControl{status: fullStatus()}, self())
-	for _, tc := range []struct {
-		path  string
-		slots int
-	}{{status, 4}, {admin, 2}} {
-		var d net.Dialer
-		var idle []net.Conn
-		hold := func() {
-			conn, err := d.DialContext(t.Context(), "unix", tc.path)
-			if err != nil {
-				t.Fatal(err)
+	synctest.Test(t, func(t *testing.T) {
+		status, statusLn := pipeStatus(t, &fakeControl{status: fullStatus()})
+		admin, adminLn := pipeAdmin(t, &fakeControl{status: fullStatus()})
+		for _, tc := range []struct {
+			c     *ControlClient
+			ln    *pipeListener
+			slots int
+		}{{status, statusLn, 4}, {admin, adminLn, 2}} {
+			ask := func() error {
+				ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+				defer cancel()
+				_, err := tc.c.Status(ctx)
+				return err
 			}
-			idle = append(idle, conn)
-		}
-		ask := func() error {
-			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-			defer cancel()
-			_, err := NewControlClient(tc.path, self()).Status(ctx)
-			return err
-		}
-		for range tc.slots - 1 {
-			hold()
-		}
-		if err := ask(); err != nil {
-			t.Errorf("%d slots: Status with %d idle connections = %v", tc.slots, tc.slots-1, err)
-		}
-		hold()
-		if err := ask(); !errors.Is(err, context.DeadlineExceeded) {
-			t.Errorf("%d slots: Status with %d idle connections = %v, want DeadlineExceeded", tc.slots, tc.slots, err)
-		}
-		for _, conn := range idle {
-			if err := conn.Close(); err != nil {
-				t.Error(err)
+			tc.ln.hold(t, tc.slots-1)
+			if err := ask(); err != nil {
+				t.Errorf("%d slots: Status with %d idle connections = %v", tc.slots, tc.slots-1, err)
+			}
+			tc.ln.hold(t, 1)
+			if err := ask(); !errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("%d slots: Status with %d idle connections = %v, want DeadlineExceeded", tc.slots, tc.slots, err)
 			}
 		}
-	}
+	})
 }
 
 // levelCounter counts log records by level.
