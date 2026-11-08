@@ -190,7 +190,9 @@ func requireLeftThrough(t *testing.T, u *testnet.UTUN, dst netip.Addr) {
 }
 
 // exchange sends one datagram on conn and waits 2 s for an answer or an
-// error, as udpExchange does on a new socket.
+// error, as udpExchange does on a new socket. A packet that passes gets
+// no reply and no event, so only the end of the wait shows that no ICMP
+// reject came.
 func exchange(conn *net.UDPConn) error {
 	if err := conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		return err
