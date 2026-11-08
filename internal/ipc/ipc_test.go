@@ -861,7 +861,7 @@ type fakeListener struct {
 
 var errEMFILE = errors.New("accept: too many open files")
 
-func (f *fakeListener) Accept() (net.Conn, error) {
+func (f *fakeListener) Accept() (peerConn, error) {
 	select {
 	case f.calls <- struct{}{}:
 	case <-f.done:
@@ -880,8 +880,6 @@ func (f *fakeListener) Close() error {
 	f.once.Do(func() { close(f.done) })
 	return nil
 }
-
-func (f *fakeListener) Addr() net.Addr { return &net.UnixAddr{Net: "unix"} }
 
 func TestAcceptErrorsDoNotStopServe(t *testing.T) {
 	fl := &fakeListener{failures: 3, calls: make(chan struct{}), done: make(chan struct{})}

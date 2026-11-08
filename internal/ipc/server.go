@@ -88,7 +88,7 @@ type ServerConfig struct {
 // or by cancelling the Serve context. Each connection carries one request
 // and one reply.
 type Server struct {
-	ln      net.Listener
+	ln      peerListener
 	admit   uidCheck
 	routes  map[string]route
 	version int
@@ -112,7 +112,7 @@ type Server struct {
 	closed  bool
 	serving bool
 	cancel  context.CancelFunc
-	conns   map[net.Conn]struct{}
+	conns   map[peerConn]struct{}
 }
 
 // Listen binds the socket and sets its mode to 0660. The mode change follows
@@ -242,12 +242,13 @@ func bind(path string, sp spec) (*Server, error) {
 		}
 	}
 	var lc net.ListenConfig
-	ln, err := lc.Listen(context.Background(), "unix", path) // binding does not block; no caller context to honor
+	l, err := lc.Listen(context.Background(), "unix", path) // binding does not block; no caller context to honor
 	if err != nil {
 		return nil, fmt.Errorf("listening on %s: %w", path, err)
 	}
+	ln := l.(*net.UnixListener) //nolint:forcetypeassert // "unix" always gives *net.UnixListener
 	// Close must not unlink by name: a newer socket may own the path by then.
-	ln.(*net.UnixListener).SetUnlinkOnClose(false) //nolint:forcetypeassert // "unix" always gives *net.UnixListener
+	ln.SetUnlinkOnClose(false)
 	if err := os.Chmod(path, sp.mode); err != nil {
 		_ = ln.Close()      //nolint:errcheck // the chmod error is the one to report
 		_ = os.Remove(path) //nolint:errcheck // the file is ours: bound just above
@@ -258,18 +259,18 @@ func bind(path string, sp spec) (*Server, error) {
 		_ = ln.Close() //nolint:errcheck // the stat error is the one to report
 		return nil, fmt.Errorf("inspecting %s: %w", path, err)
 	}
-	s := serverOf(ln, sp)
+	s := serverOf(unixListener{ln}, sp)
 	s.path = path
 	s.sock = sock
 	return s, nil
 }
 
 // newServer returns a report server on ln that owns no socket file.
-func newServer(ln net.Listener, cfg ServerConfig) *Server {
+func newServer(ln peerListener, cfg ServerConfig) *Server {
 	return serverOf(ln, reportSpec(cfg))
 }
 
-func serverOf(ln net.Listener, sp spec) *Server {
+func serverOf(ln peerListener, sp spec) *Server {
 	logger := sp.log
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
@@ -285,7 +286,7 @@ func serverOf(ln net.Listener, sp spec) *Server {
 		slots:   make(chan struct{}, sp.conns),
 
 		connTimeout: sp.timeout,
-		conns:       make(map[net.Conn]struct{}),
+		conns:       make(map[peerConn]struct{}),
 	}
 }
 
@@ -393,7 +394,7 @@ func (s *Server) removeOwnSocket() {
 	}
 }
 
-func (s *Server) track(c net.Conn) bool {
+func (s *Server) track(c peerConn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -403,7 +404,7 @@ func (s *Server) track(c net.Conn) bool {
 	return true
 }
 
-func (s *Server) untrack(c net.Conn) {
+func (s *Server) untrack(c peerConn) {
 	s.mu.Lock()
 	delete(s.conns, c)
 	s.mu.Unlock()
@@ -414,8 +415,8 @@ func (s *Server) untrack(c net.Conn) {
 // covers the whole connection. A request that fails before its reply is
 // written writes one event; a rejection is a reply, and the peer gets
 // its reason.
-func (s *Server) serveConn(ctx context.Context, c net.Conn) {
-	uid, err := peerUID(c)
+func (s *Server) serveConn(ctx context.Context, c peerConn) {
+	uid, err := c.PeerUID()
 	if err != nil {
 		s.logFailed(ctx, s.peerLvl, logattr.ErrorTypeSocket, err)
 		return
