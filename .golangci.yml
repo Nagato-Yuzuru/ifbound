@@ -43,6 +43,14 @@ linters:
               desc: pf must not depend on ifbound
             - pkg: github.com/Nagato-Yuzuru/ifbound/cmd
               desc: pf must not depend on ifbound
+        json-v2:
+          # v2 matches member names exactly and refuses duplicate members
+          # and invalid UTF-8. Tests keep v1: they decode the output of the
+          # code with a second library.
+          files: ["$all", "!$test"]
+          deny:
+            - pkg: encoding/json$
+              desc: use encoding/json/v2
     errcheck:
       check-blank: true # a blank drop needs //nolint:errcheck with a reason; nolintlint enforces the reason
     godox:
