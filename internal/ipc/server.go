@@ -95,13 +95,10 @@ type Server struct {
 	cut     func(reason string) string
 	peerLvl slog.Level
 	log     *slog.Logger
-	// slots bounds the connections served at once. A test in this
-	// package may replace it before Serve.
+	// slots bounds the connections served at once.
 	slots chan struct{}
 
-	// connTimeout is the one deadline for a connection. The spec of the
-	// socket sets the production value; a test in this package may shorten
-	// it before Serve.
+	// connTimeout is the one deadline for a connection.
 	connTimeout time.Duration
 
 	path string      // empty when the server does not own a file

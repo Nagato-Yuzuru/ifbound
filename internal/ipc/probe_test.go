@@ -73,36 +73,39 @@ func startProbes(t *testing.T, h Handler, p ProbeHandler) *Client {
 // Every report slot is held by a report that waits for its probe. The
 // probes must still reach the server, or no report ever acks.
 func TestProbesPassWhileEveryReportSlotWaits(t *testing.T) {
-	b := newProbeBoard()
-	c := startProbes(t, b, b)
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		b := newProbeBoard()
+		c, _ := pipeReport(t, ServerConfig{Handler: b, Probes: b})
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
 
-	reports := make(chan error, maxInFlight)
-	for i := range maxInFlight {
-		go func() { reports <- errOf(c.Report(ctx, Observation{QName: fmt.Sprintf("r%d.test", i)})) }()
-	}
-	for len(c.inflight) < maxInFlight {
-		time.Sleep(time.Millisecond) // waits for the slots to fill; no other signal exists
-	}
+		reports := make(chan error, maxInFlight)
+		for i := range maxInFlight {
+			go func() { reports <- errOf(c.Report(ctx, Observation{QName: fmt.Sprintf("r%d.test", i)})) }()
+		}
+		synctest.Wait()
+		if n := len(c.inflight); n != maxInFlight {
+			t.Fatalf("%d report slots held, want %d (fixture broken)", n, maxInFlight)
+		}
 
-	var probes sync.WaitGroup
-	errs := make(chan error, maxInFlight)
-	for i := range maxInFlight { // more probes than probe slots
-		probes.Go(func() { errs <- c.ReportProbe(ctx, fmt.Sprintf("%sx.r%d.test", ProbePrefix, i)) })
-	}
-	probes.Wait()
-	close(errs)
-	for err := range errs {
-		if err != nil {
-			t.Errorf("ReportProbe = %v while the report slots are full", err)
+		var probes sync.WaitGroup
+		errs := make(chan error, maxInFlight)
+		for i := range maxInFlight { // more probes than probe slots
+			probes.Go(func() { errs <- c.ReportProbe(ctx, fmt.Sprintf("%sx.r%d.test", ProbePrefix, i)) })
 		}
-	}
-	for range maxInFlight {
-		if err := <-reports; err != nil {
-			t.Errorf("Report = %v, want an ack after its probe", err)
+		probes.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Errorf("ReportProbe = %v while the report slots are full", err)
+			}
 		}
-	}
+		for range maxInFlight {
+			if err := <-reports; err != nil {
+				t.Errorf("Report = %v, want an ack after its probe", err)
+			}
+		}
+	})
 }
 
 func TestProbeRoundTrip(t *testing.T) {

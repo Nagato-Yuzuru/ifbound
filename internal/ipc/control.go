@@ -100,7 +100,12 @@ func ListenStatus(cfg StatusConfig) (*Server, error) {
 	if cfg.Handler == nil {
 		return nil, errNilHandler
 	}
-	return listenSpec(cfg.Path, spec{
+	return listenSpec(cfg.Path, statusSpec(cfg))
+}
+
+// statusSpec is the spec of the status socket.
+func statusSpec(cfg StatusConfig) spec {
+	return spec{
 		mode:    statusSocketMode,
 		conns:   statusConns,
 		timeout: controlConnTimeout,
@@ -110,7 +115,7 @@ func ListenStatus(cfg StatusConfig) (*Server, error) {
 		cut:     func(reason string) string { return cutText(reason, maxReasonLen) },
 		peerLvl: slog.LevelDebug,
 		log:     cfg.Logger,
-	})
+	}
 }
 
 // ListenAdmin binds the admin socket and sets its mode to 0600. The caller
@@ -124,7 +129,12 @@ func ListenAdmin(cfg AdminConfig) (*Server, error) {
 	if cfg.Handler == nil {
 		return nil, errNilHandler
 	}
-	return listenSpec(cfg.Path, spec{
+	return listenSpec(cfg.Path, adminSpec(cfg))
+}
+
+// adminSpec is the spec of the admin socket.
+func adminSpec(cfg AdminConfig) spec {
+	return spec{
 		mode:    adminSocketMode,
 		conns:   adminConns,
 		timeout: controlConnTimeout,
@@ -137,7 +147,7 @@ func ListenAdmin(cfg AdminConfig) (*Server, error) {
 		cut:     func(reason string) string { return cutText(reason, maxAdminReasonLen) },
 		peerLvl: slog.LevelWarn,
 		log:     cfg.Logger,
-	})
+	}
 }
 
 // handlerContext returns the context of a control handler. It ends
@@ -218,7 +228,12 @@ type ControlClient struct {
 // NewControlClient returns a client for the socket at path. It trusts a
 // reply only from a server that runs as serverUID. Production passes 0.
 func NewControlClient(path string, serverUID uint32) *ControlClient {
-	return &ControlClient{dial: dialUnix(path), serverUID: serverUID}
+	return newControlClient(dialUnix(path), serverUID)
+}
+
+// newControlClient returns a client that opens each connection with dial.
+func newControlClient(dial dialFunc, serverUID uint32) *ControlClient {
+	return &ControlClient{dial: dial, serverUID: serverUID}
 }
 
 // Status returns the status of ifboundd. The error set is:
