@@ -26,6 +26,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
 	"github.com/Nagato-Yuzuru/ifbound/internal/teardown"
+	"github.com/Nagato-Yuzuru/ifbound/pf"
 )
 
 // These tests install the enforcement of one policy into pf and
@@ -45,6 +46,27 @@ func (r stopRunner) Run(ctx context.Context, stdin []byte, args ...string) (pfba
 		return pfbackend.Output{Stderr: []byte("injected stop\n")}, errStop
 	}
 	return r.Runner.Run(ctx, stdin, args...)
+}
+
+// stopDevice fails Refs when refs is true and StopRef when stopRef is
+// true, and passes the other calls to Device.
+type stopDevice struct {
+	pfbackend.Device
+	refs, stopRef bool
+}
+
+func (d stopDevice) Refs() ([]pf.Ref, error) {
+	if d.refs {
+		return nil, errStop
+	}
+	return d.Device.Refs()
+}
+
+func (d stopDevice) StopRef(token uint64) error {
+	if d.stopRef {
+		return errStop
+	}
+	return d.Device.StopRef(token)
 }
 
 // stopResolver fails each Remove.
@@ -196,14 +218,12 @@ func TestTeardownFinishesAfterAStop(t *testing.T) {
 	stops := []struct {
 		name     string
 		pf       func([]string) bool
+		dev      stopDevice
 		resolver bool
-		// keepsLabel marks a stop after the token release and before the
-		// rules flush: the label of the released token stays in the anchor.
-		keepsLabel bool
 	}{
-		{name: "at the read of the references", pf: has("-s", "References")},
-		{name: "at the token release", pf: has("-X")},
-		{name: "after the token release", pf: has(pfbackend.Anchor, "-F", "rules"), keepsLabel: true},
+		{name: "at the read of the references", pf: never, dev: stopDevice{refs: true}},
+		{name: "at the token release", pf: never, dev: stopDevice{stopRef: true}},
+		{name: "after the token release", pf: has(pfbackend.Anchor, "-F", "rules")},
 		{name: "after the rules flush", pf: has(pfbackend.Anchor, "-F", "Tables")},
 		{name: "at the resolver removal", pf: never, resolver: true},
 	}
@@ -216,7 +236,9 @@ func TestTeardownFinishesAfterAStop(t *testing.T) {
 			if s.resolver {
 				res = stopResolver{res}
 			}
-			first := newTeardown(stopRunner{Runner: pfbackend.Exec{Path: pfbackend.Path}, stop: s.pf}, openPf(t), res)
+			dev := s.dev
+			dev.Device = openPf(t)
+			first := newTeardown(stopRunner{Runner: pfbackend.Exec{Path: pfbackend.Path}, stop: s.pf}, dev, res)
 			// The Backend keeps the cause of a pfctl failure in the text only.
 			if err := first.Run(t.Context()); err == nil || !strings.Contains(err.Error(), errStop.Error()) {
 				t.Fatalf("teardown with a stop = %v, want the injected stop", err)
@@ -224,16 +246,6 @@ func TestTeardownFinishesAfterAStop(t *testing.T) {
 			other := otherReference(t)
 			if slices.Contains(mine, other) {
 				t.Logf("pf gave the other tool the value %s, which ifbound held", other)
-				if s.keepsLabel {
-					// "pfctl -s References" shows the age of a reference in
-					// whole seconds only. So in the tokenSkew window, the
-					// reference of the other tool has the value and the
-					// creation time of the released token, and the second
-					// teardown releases it. The kernel of macOS 26 on arm64
-					// gives the released value again at once. The cleanups
-					// give back the other reference, then tear down.
-					t.Skip("the Backend cannot tell the other reference from the released token")
-				}
 			}
 			refs = append(refs, other)
 			slices.Sort(refs)

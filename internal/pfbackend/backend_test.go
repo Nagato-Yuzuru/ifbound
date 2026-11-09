@@ -102,7 +102,9 @@ type rig struct {
 }
 
 // newRig returns a Backend on a fresh kernel. Each test checks at the end
-// that the Backend never ran "pfctl -d".
+// that the Backend never ran "pfctl -d", and that it took and gave back
+// its references only through the Device: a reference that pfctl takes
+// carries the pid of the short-lived pfctl process.
 func newRig(t *testing.T) *rig {
 	t.Helper()
 	k := newKernel()
@@ -112,6 +114,11 @@ func newRig(t *testing.T) *rig {
 	t.Cleanup(func() {
 		if k.disables != 0 {
 			t.Errorf("the Backend ran pfctl -d %d times; it must never disable pf", k.disables)
+		}
+		for _, c := range k.calls {
+			if slices.Contains(c, "-E") || slices.Contains(c, "-X") || slices.Contains(c, "References") {
+				t.Errorf("the Backend ran pfctl %v; it must use the Device for references", c)
+			}
 		}
 	})
 	return &rig{b: pfbackend.New(k, k, clk.now, slog.New(w)), k: k, clk: clk, log: w}
@@ -640,7 +647,7 @@ func TestVoidingProblems(t *testing.T) {
 	}
 }
 
-// Enable: -E with a token, rate limit, warning, never -d
+// Enable: a reference with a token, rate limit, warning, never -d
 
 func TestLoadEnablesPfAndKeepsTheToken(t *testing.T) {
 	r := newRig(t)
@@ -658,8 +665,8 @@ func TestLoadEnablesPfAndKeepsTheToken(t *testing.T) {
 	if err := r.b.Unload(t.Context()); err != nil {
 		t.Fatalf("Unload: %v", err)
 	}
-	if got := r.k.callsWith("-X", tok); len(got) != 1 {
-		t.Errorf("Unload ran %v, want one pfctl -X %s", got, tok)
+	if got := r.k.callsWith("DIOCSTOPREF", tok); len(got) != 1 {
+		t.Errorf("Unload ran %v, want one StopRef of %s", got, tok)
 	}
 	if r.k.enabled {
 		t.Errorf("pf is still enabled after Unload gave back the only reference")
@@ -678,16 +685,16 @@ func TestEnableIsRateLimited(t *testing.T) {
 	if err := r.b.Load(t.Context(), rs); err == nil {
 		t.Errorf("Load 5 s after the last enable = nil, want an error from the rate limit")
 	}
-	if n := len(r.k.callsWith("-E")); n != 1 {
-		t.Errorf("pfctl -E ran %d times within the rate limit, want 1", n)
+	if n := len(r.k.callsWith("DIOCSTARTREF")); n != 1 {
+		t.Errorf("StartRef ran %d times within the rate limit, want 1", n)
 	}
 	if got := mustRead(t, r); len(voiding(got.Problems)) == 0 {
 		t.Errorf("Read while pf stays disabled has no voiding Problem")
 	}
 	r.clk.t = r.clk.t.Add(pfbackend.EnableInterval)
 	mustLoad(t, r, rs)
-	if !r.k.enabled || len(r.k.callsWith("-E")) != 2 {
-		t.Errorf("after the rate limit: enabled %v, -E calls %d, want true and 2", r.k.enabled, len(r.k.callsWith("-E")))
+	if !r.k.enabled || len(r.k.callsWith("DIOCSTARTREF")) != 2 {
+		t.Errorf("after the rate limit: enabled %v, StartRef calls %d, want true and 2", r.k.enabled, len(r.k.callsWith("DIOCSTARTREF")))
 	}
 	if r.log.count(slog.LevelWarn) < 2 {
 		t.Errorf("warnings = %d, want one per enable", r.log.count(slog.LevelWarn))
@@ -702,7 +709,7 @@ func TestUnloadWithoutTokenGivesNothingBack(t *testing.T) {
 	if err := r.b.Unload(t.Context()); err != nil {
 		t.Errorf("Unload without a token = %v, want nil", err)
 	}
-	if got := r.k.callsWith("-X"); len(got) != 0 {
+	if got := r.k.callsWith("DIOCSTOPREF"); len(got) != 0 {
 		t.Errorf("Unload without a token ran %v", got)
 	}
 	if !r.k.enabled || len(r.k.refs) != 1 {

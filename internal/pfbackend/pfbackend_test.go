@@ -6,6 +6,7 @@ import (
 	"maps"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -169,8 +170,8 @@ func TestLoadEnablesPfWithRateLimit(t *testing.T) {
 	if err := b.Load(t.Context(), rs); !errors.Is(err, errDisabled) {
 		t.Fatalf("Load within the interval: error = %v, want errDisabled", err)
 	}
-	if n := len(f.callsOf("-E")); n != 1 {
-		t.Errorf("pfctl -E ran %d times, want 1", n)
+	if n := len(f.callsOf("DIOCSTARTREF")); n != 1 {
+		t.Errorf("StartRef ran %d times, want 1", n)
 	}
 
 	c.t = c.t.Add(time.Second)
@@ -197,6 +198,22 @@ func TestLoadTakesItsOwnReference(t *testing.T) {
 	}
 	if calls := f.callsOf("-d"); len(calls) != 0 {
 		t.Errorf("Load ran %v", calls)
+	}
+}
+
+// Without the creation time and the pid of a new reference no label can
+// name it, so Load gives the reference back at once and fails.
+func TestLoadGivesBackAReferenceThatItCannotRead(t *testing.T) {
+	b, f, _ := newTest(t)
+	f.fail = func(args []string) bool { return slices.Contains(args, "DIOCGETSTARTERS") }
+	if err := b.Load(t.Context(), compile(t, testConfig)); err == nil {
+		t.Fatal("Load with a failing Refs = nil, want an error")
+	}
+	if f.enabled || len(f.tokens) != 0 || len(b.tokens) != 0 {
+		t.Errorf("after Load: enabled %v, references %v, tokens of ifbound %v; want none", f.enabled, f.tokens, values(b))
+	}
+	if calls := f.callsOf("-f"); len(calls) != 0 {
+		t.Errorf("Load ran %v without a token rule", calls)
 	}
 }
 
@@ -481,21 +498,21 @@ func TestLoadedIDWhenAReadFails(t *testing.T) {
 func values(b *Backend) []string {
 	var out []string
 	for _, t := range b.tokens {
-		out = append(out, t.value)
+		out = append(out, strconv.FormatUint(t.value, 10))
 	}
 	return out
 }
 
 func TestReleaseToken(t *testing.T) {
 	b, f, c := newTest(t)
-	if err := b.release(t.Context()); err != nil || len(f.calls) != 0 {
+	if err := b.release(); err != nil || len(f.calls) != 0 {
 		t.Fatalf("release without a token: error %v, calls %v; want nothing", err, f.calls)
 	}
 	if err := b.Load(t.Context(), compile(t, testConfig)); err != nil {
 		t.Fatal(err)
 	}
 	f.tokens = append(f.tokens, "77")
-	if err := b.release(t.Context()); err != nil {
+	if err := b.release(); err != nil {
 		t.Fatalf("release: %v", err)
 	}
 	if !slices.Equal(f.tokens, []string{"77"}) || !f.enabled {
@@ -508,14 +525,14 @@ func TestReleaseToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.enabled, f.tokens = false, nil // pfctl -d drops every token
-	before := len(f.callsOf("-X"))
-	if err := b.release(t.Context()); err != nil {
+	before := len(f.callsOf("DIOCSTOPREF"))
+	if err := b.release(); err != nil {
 		t.Errorf("release after pf was disabled: %v", err)
 	}
 	if len(b.tokens) != 0 {
 		t.Errorf("tokens after release = %v, want none", b.tokens)
 	}
-	if calls := f.callsOf("-X"); len(calls) != before {
+	if calls := f.callsOf("DIOCSTOPREF"); len(calls) != before {
 		t.Errorf("release after pf was disabled ran %v", calls)
 	}
 
@@ -523,10 +540,10 @@ func TestReleaseToken(t *testing.T) {
 	if err := b.Load(t.Context(), compile(t, testConfig)); err != nil {
 		t.Fatal(err)
 	}
-	f.fail = func(args []string) bool { return slices.Contains(args, "-X") }
+	f.fail = func(args []string) bool { return slices.Contains(args, "DIOCSTOPREF") }
 	held := slices.Clone(b.tokens)
-	if err := b.release(t.Context()); !errors.Is(err, errPfctl) || !slices.Equal(b.tokens, held) {
-		t.Errorf("release with a failing pfctl: error %v, tokens %v; want errPfctl and %v kept", err, b.tokens, held)
+	if err := b.release(); err == nil || !slices.Equal(b.tokens, held) {
+		t.Errorf("release with a failing StopRef: error %v, tokens %v; want an error and %v kept", err, b.tokens, held)
 	}
 }
 
@@ -537,23 +554,22 @@ func TestReleaseLeavesAReusedValue(t *testing.T) {
 	if err := b.Load(t.Context(), compile(t, testConfig)); err != nil {
 		t.Fatal(err)
 	}
-	mine := b.tokens[0]
-	f.tokens, f.free = nil, []string{mine.value} // pfctl -d drops it
+	mine := values(b)[0]
+	f.enabled, f.tokens, f.free = false, nil, []string{mine} // pfctl -d drops it
 	c.t = c.t.Add(time.Minute)
-	f.enabled = true
 	if _, err := f.Run(t.Context(), nil, "-E"); err != nil { // another tool gets the same value
 		t.Fatal(err)
 	}
-	if !slices.Equal(f.tokens, []string{mine.value}) {
-		t.Fatalf("the other tool got %v, want the reused value %s", f.tokens, mine.value)
+	if !slices.Equal(f.tokens, []string{mine}) {
+		t.Fatalf("the other tool got %v, want the reused value %s", f.tokens, mine)
 	}
-	if err := b.release(t.Context()); err != nil {
+	if err := b.release(); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if calls := f.callsOf("-X"); len(calls) != 0 {
+	if calls := f.callsOf("DIOCSTOPREF"); len(calls) != 0 {
 		t.Errorf("release ran %v: the value belongs to another process now", calls)
 	}
-	if !f.enabled || !slices.Equal(f.tokens, []string{mine.value}) {
+	if !f.enabled || !slices.Equal(f.tokens, []string{mine}) {
 		t.Errorf("after release: enabled %v tokens %v; want the reference of the other tool", f.enabled, f.tokens)
 	}
 }

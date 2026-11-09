@@ -2,10 +2,10 @@ package pfbackend_test
 
 // This file holds a model of the pf kernel, of the pfctl command line,
 // and of the ioctl calls on /dev/pf, for the tests of the public methods. It is independent of
-// fakepf_test.go: it parses pfctl flags in any order, keeps reference
-// tokens as the macOS kernel does, keeps NAT rules apart from filter
-// rules, and refuses each flag that it does not know, so an unexpected
-// pfctl call fails the test.
+// fakepf_test.go: it parses pfctl flags in any order, keeps references
+// as the macOS kernel does, keeps NAT rules apart from filter rules, and
+// refuses each flag that it does not know, so an unexpected pfctl call
+// fails the test.
 
 import (
 	"context"
@@ -28,15 +28,21 @@ var errKernelExit = errors.New("exit status 1")
 // kernel state outlives ifboundd.
 type kernel struct {
 	enabled bool
-	// refs holds the reference tokens of "pfctl -E", and born the time
-	// when each one was taken. pf gives a released value again, also to
-	// another process: free holds the released values, and the next
-	// enable takes the last one.
+	// refs holds the reference tokens, oldest first. born holds the time
+	// when each one was taken, in whole seconds as the kernel keeps it,
+	// and owner the pid of the process that took it. pf gives a released
+	// value again, also to another process: free holds the released
+	// values, and the next reference takes the last one.
 	refs    []string
 	born    map[string]time.Time
+	owner   map[string]int
 	free    []string
 	now     func() time.Time
 	nextTok int
+	// pid is the pid of ifboundd, the process that calls the Device.
+	// Each "pfctl -E" runs in a new pfctl process with a new pid.
+	pid     int
+	nextPID int
 	// mainRules and mainNat are the filter and the NAT rules of the main
 	// ruleset.
 	mainRules []string
@@ -56,7 +62,8 @@ type kernel struct {
 	// fail makes a call fail when it returns true.
 	fail func(args []string) bool
 	// calls records the arguments of every pfctl call, and the name of
-	// every ioctl call (for example "DIOCGETSTATUS").
+	// every ioctl call (for example "DIOCGETSTATUS"), with the token after
+	// "DIOCSTOPREF".
 	calls [][]string
 	// disables counts the calls of "pfctl -d".
 	disables int
@@ -77,7 +84,9 @@ func newKernel() *kernel {
 		nat:    map[string][]string{},
 		tables: map[string]map[string]map[netip.Prefix]bool{},
 		born:   map[string]time.Time{},
+		owner:  map[string]int{},
 		now:    time.Now,
+		pid:    4242,
 		ifaces: []string{"ALL", "en0", "lo0", "utun4"},
 	}
 }
@@ -298,11 +307,49 @@ func (k *kernel) Status() (pf.Status, error) {
 	return pf.Status{Running: k.enabled}, nil
 }
 
-func (k *kernel) enableRef() (pfbackend.Output, error) {
-	msg := "pf enabled\n"
-	if k.enabled {
-		msg = "pf already enabled\n"
+// StartRef implements pfbackend.Device.
+func (k *kernel) StartRef() (uint64, error) {
+	if err := k.ioctl("DIOCSTARTREF"); err != nil {
+		return 0, err
 	}
+	return strconv.ParseUint(k.take(k.pid), 10, 64)
+}
+
+// StopRef implements pfbackend.Device. As pf.Handle does, it answers
+// pf.ErrNotFound for an unknown token and on a disabled pf.
+func (k *kernel) StopRef(token uint64) error {
+	if err := k.ioctl("DIOCSTOPREF", strconv.FormatUint(token, 10)); err != nil {
+		return err
+	}
+	if !k.drop(strconv.FormatUint(token, 10)) {
+		return fmt.Errorf("giving back reference %d: %w", token, pf.ErrNotFound)
+	}
+	return nil
+}
+
+// Refs implements pfbackend.Device. The kernel lists the newest
+// reference first.
+func (k *kernel) Refs() ([]pf.Ref, error) {
+	if err := k.ioctl("DIOCGETSTARTERS"); err != nil {
+		return nil, err
+	}
+	var refs []pf.Ref
+	for _, tok := range slices.Backward(k.refs) {
+		v, err := strconv.ParseUint(tok, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		proc := "pfctl"
+		if k.owner[tok] == k.pid {
+			proc = "ifboundd"
+		}
+		refs = append(refs, pf.Ref{Token: v, Created: k.born[tok], PID: k.owner[tok], Process: proc})
+	}
+	return refs, nil
+}
+
+// take takes a reference for the process pid and enables pf.
+func (k *kernel) take(pid int) string {
 	k.enabled = true
 	var tok string
 	if n := len(k.free); n > 0 {
@@ -312,24 +359,45 @@ func (k *kernel) enableRef() (pfbackend.Output, error) {
 		tok = strconv.Itoa(7000000 + k.nextTok)
 	}
 	k.refs = append(k.refs, tok)
-	k.born[tok] = k.now()
+	k.born[tok] = time.Unix(k.now().Unix(), 0)
+	k.owner[tok] = pid
+	return tok
+}
+
+// drop gives back a reference and reports whether pf held it. pf stops
+// with its last reference.
+func (k *kernel) drop(tok string) bool {
+	i := slices.Index(k.refs, tok)
+	if !k.enabled || i < 0 {
+		return false
+	}
+	k.refs = slices.Delete(k.refs, i, i+1)
+	k.free = append(k.free, tok)
+	k.enabled = len(k.refs) > 0
+	return true
+}
+
+// enableRef is "pfctl -E" of another tool, in a new pfctl process.
+func (k *kernel) enableRef() (pfbackend.Output, error) {
+	msg := "pf enabled\n"
+	if k.enabled {
+		msg = "pf already enabled\n"
+	}
+	k.nextPID++
+	tok := k.take(800 + k.nextPID)
 	return pfbackend.Output{Stderr: []byte("No ALTQ support in kernel\nALTQ related functions disabled\n" + msg + "Token : " + tok + "\n")}, nil
 }
 
-// releaseRef answers as pfctl on macOS 27 does: "token invalid" for an
-// unknown token while pf is enabled.
+// releaseRef is "pfctl -X" of another tool. It answers as pfctl on macOS
+// 27 does: "token invalid" for an unknown token while pf is enabled.
 func (k *kernel) releaseRef(tok string) (pfbackend.Output, error) {
 	if !k.enabled {
 		return failure("pf not enabled")
 	}
-	i := slices.Index(k.refs, tok)
-	if i < 0 {
+	if !k.drop(tok) {
 		return failure("pf: token invalid")
 	}
-	k.refs = slices.Delete(k.refs, i, i+1)
-	k.free = append(k.free, tok)
 	if len(k.refs) == 0 {
-		k.enabled = false
 		return pfbackend.Output{Stderr: []byte("pf disabled\n")}, nil
 	}
 	return pfbackend.Output{Stderr: []byte(strconv.Itoa(len(k.refs)) + " more pf enable reference(s) remaining, pf still enabled\n")}, nil
@@ -421,28 +489,10 @@ func (k *kernel) showCmd(p pfctlArgs) (pfbackend.Output, error) {
 		return stdout(k.listAnchors(p.anchor, p.verbose)), nil
 	case "T", "Tables":
 		return stdout(joinLines(slices.Sorted(maps.Keys(k.tables[p.anchor])))), nil
-	case "References":
-		return k.showReferences(), nil
 	case "I", "Interfaces":
 		return stdout(joinLines(k.ifaces)), nil
 	}
 	return failure("kernel model: unmodeled show " + p.show)
-}
-
-// showReferences prints the references as "pfctl -s References" does on
-// macOS 27: TIMESTAMP is the age of the reference.
-func (k *kernel) showReferences() pfbackend.Output {
-	if len(k.refs) == 0 {
-		return pfbackend.Output{Stderr: []byte("No pf starter references held\n")}
-	}
-	var b strings.Builder
-	b.WriteString("TOKENS:\nPID      Process Name                 TOKEN                    TIMESTAMP\n")
-	for i, tok := range k.refs {
-		age := int64(k.now().Sub(k.born[tok]).Seconds())
-		fmt.Fprintf(&b, "%-8d %-28s %-24s %d days %02d:%02d:%02d\n", 800+i, "pfctl", tok,
-			age/86400, age/3600%24, age/60%60, age%60)
-	}
-	return stdout(b.String())
 }
 
 func joinLines(ls []string) string {

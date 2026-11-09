@@ -65,8 +65,11 @@ func (e Exec) Run(ctx context.Context, stdin []byte, args ...string) (Output, er
 // blocks, and writes numeric IDs), so the ID cannot be computed again
 // from the rules that the kernel prints. A label keeps its text. A label
 // holds at most 63 bytes, so the 32-byte digest goes in as 43 characters
-// of unpadded base64url. A token rule carries one pf token of ifbound in
-// the same way: the value and the creation time, "<value>.<unix seconds>".
+// of unpadded base64url. A token rule carries one pf reference of ifbound
+// in the same way: "<value>.<unix seconds>.<pid>" in decimal. The prefix
+// and the two dots take 16 bytes, a uint64 value at most 20, and a pid
+// that fits in int32 at most 10, so the label fits for each creation
+// time below 10^17 seconds.
 //
 // The rules match only packets with the tag sentinelTag, and no rule
 // sets that tag: every tag of a policy starts with "ifbound.". So the
@@ -87,28 +90,25 @@ func sentinel(id string) (string, error) {
 	return labelRule(labelPrefix + base64.RawURLEncoding.EncodeToString(sum)), nil
 }
 
-// token is a pf reference token. pf gives a released value again, also
-// to another process, so only the value with its creation time names
-// one reference.
+// token is a pf reference of ifbound. pf gives a released value again,
+// also to another process at once, so only the value with the creation
+// time and the pid of the process that took the reference names one
+// reference.
 type token struct {
-	value   string // a decimal number of at most 20 digits
-	created int64  // Unix time in seconds
+	value   uint64
+	created int64 // Unix time in seconds, as the kernel keeps it
+	pid     int
 }
 
-// tokenSkew is the largest difference in seconds between two creation
-// times of the same reference. pfctl prints the age of a reference in
-// whole seconds, and the Backend reads the clock after pfctl returns.
-const tokenSkew = 2
-
-// same reports whether r is the reference of t.
-func (t token) same(r token) bool {
-	d := t.created - r.created
-	return t.value == r.value && d >= -tokenSkew && d <= tokenSkew
+// is reports whether r is the reference of t.
+func (t token) is(r pf.Ref) bool {
+	return t.value == r.Token && t.created == r.Created.Unix() && t.pid == r.PID
 }
 
 // tokenRule returns the token rule for a pf token.
 func tokenRule(t token) string {
-	return labelRule(tokenPrefix + t.value + "." + strconv.FormatInt(t.created, 10))
+	return labelRule(tokenPrefix + strconv.FormatUint(t.value, 10) + "." +
+		strconv.FormatInt(t.created, 10) + "." + strconv.Itoa(t.pid))
 }
 
 func labelRule(label string) string {
@@ -161,59 +161,21 @@ func labelToken(label string) (token, bool) {
 	if !ok {
 		return token{}, false
 	}
-	value, created, ok := strings.Cut(text, ".")
-	if !ok || !isDigits(value) || !isDigits(created) {
+	f := strings.Split(text, ".")
+	if len(f) != 3 || !isDigits(f[0]) || !isDigits(f[1]) || !isDigits(f[2]) {
 		return token{}, false
 	}
-	sec, err := strconv.ParseInt(created, 10, 64)
-	if err != nil {
+	value, err1 := strconv.ParseUint(f[0], 10, 64)
+	created, err2 := strconv.ParseInt(f[1], 10, 64)
+	pid, err3 := strconv.ParseInt(f[2], 10, 32)
+	if err1 != nil || err2 != nil || err3 != nil {
 		return token{}, false
 	}
-	return token{value: value, created: sec}, true
+	return token{value: value, created: created, pid: int(pid)}, true
 }
 
 func isDigits(s string) bool {
 	return s != "" && !strings.ContainsFunc(s, func(r rune) bool { return r < '0' || r > '9' })
-}
-
-// parseReferences reads the output of "pfctl -s References" on macOS 27:
-//
-//	TOKENS:
-//	PID      Process Name                 TOKEN                    TIMESTAMP
-//	796      pfctl                        3634474195142116324      0 days 00:00:05
-//
-// TIMESTAMP is the age of the reference. The creation time of each token
-// is now minus its age. A process name can hold spaces, so the fields
-// count from the end of the line. A line in another format is skipped:
-// the Backend then gives back no token for it.
-func parseReferences(out []byte, now time.Time) []token {
-	var refs []token
-	for line := range strings.Lines(string(out)) {
-		f := strings.Fields(line)
-		n := len(f)
-		if n < 5 || f[n-2] != "days" || !isDigits(f[n-4]) {
-			continue
-		}
-		days, err := strconv.ParseInt(f[n-3], 10, 64)
-		if err != nil {
-			continue
-		}
-		var h, m, sec int64
-		if _, err := fmt.Sscanf(f[n-1], "%d:%d:%d", &h, &m, &sec); err != nil {
-			continue
-		}
-		age := ((days*24+h)*60+m)*60 + sec
-		refs = append(refs, token{value: f[n-4], created: now.Unix() - age})
-	}
-	return refs
-}
-
-// tokenGone reports whether the stderr of "pfctl -X" says that pf does
-// not hold the token: "pf not enabled" when pf is disabled (which drops
-// every token), and "pf: token invalid" for a token that pf does not
-// know.
-func tokenGone(stderr []byte) bool {
-	return bytes.Contains(stderr, []byte("pf not enabled")) || bytes.Contains(stderr, []byte("token invalid"))
 }
 
 // parseNames reads one name per line, as "pfctl -sT" prints tables and
@@ -267,16 +229,6 @@ func parseEntry(text string) (netip.Prefix, error) {
 		return netip.Prefix{}, fmt.Errorf("%w: table entry %q", errOutput, text)
 	}
 	return netip.PrefixFrom(a, a.BitLen()), nil
-}
-
-// parseToken reads the reference token from the stderr of "pfctl -E".
-func parseToken(stderr []byte) (string, error) {
-	for line := range strings.Lines(string(stderr)) {
-		if tok, ok := strings.CutPrefix(strings.TrimSpace(line), "Token : "); ok && tok != "" {
-			return tok, nil
-		}
-	}
-	return "", fmt.Errorf("%w: no token in the output of pfctl -E", errOutput)
 }
 
 // parseSkipped reads the output of "pfctl -sI -v" and returns the
