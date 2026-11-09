@@ -24,12 +24,18 @@ var errExit = errors.New("exit status 1")
 type fakePF struct {
 	enabled bool
 	tokens  []string
-	// born holds the creation time of each token; free holds the
-	// released values, which pf gives again, last released first.
-	born map[string]time.Time
-	free []string
-	now  func() time.Time
-	next int
+	// born holds the creation time of each token in whole seconds, and
+	// owner the pid of the process that took it. free holds the released
+	// values, which pf gives again, last released first.
+	born  map[string]time.Time
+	owner map[string]int
+	free  []string
+	now   func() time.Time
+	next  int
+	// pid is the pid of ifboundd, the process that calls the Device.
+	// Each "-E" runs in a new pfctl process with a new pid.
+	pid     int
+	nextPID int
 	// anchors maps an anchor path to its rule lines. It holds the ifbound
 	// anchor, its sub-anchors, and the other anchors.
 	anchors map[string][]string
@@ -43,7 +49,8 @@ type fakePF struct {
 	// stickyNegation makes "-T delete" keep negated entries.
 	stickyNegation bool
 	// fail makes each call whose arguments it accepts fail. An ioctl call
-	// has its name as its only argument, for example "DIOCGETSTATUS".
+	// has its name as its first argument, for example "DIOCGETSTATUS",
+	// and the token after "DIOCSTOPREF".
 	fail func(args []string) bool
 	// complain adds an error to the stderr of each call whose arguments
 	// it accepts, with exit status 0, as pfctl does for a ruleset that it
@@ -62,7 +69,9 @@ func newFakePF() *fakePF {
 		nat:    map[string][]string{"": {`nat-anchor "com.apple/*" all`, `rdr-anchor "com.apple/*" all`}},
 		tables: make(map[string]map[netip.Prefix]bool),
 		born:   make(map[string]time.Time),
+		owner:  make(map[string]int),
 		now:    time.Now,
+		pid:    4100,
 		ifaces: []string{"ALL", "en0", "lo0", "utun0"},
 		states: make(map[netip.Addr]bool),
 	}
@@ -88,6 +97,74 @@ func (f *fakePF) Status() (pf.Status, error) {
 		return pf.Status{}, err
 	}
 	return pf.Status{Running: f.enabled}, nil
+}
+
+// StartRef implements Device.
+func (f *fakePF) StartRef() (uint64, error) {
+	if err := f.ioctl("DIOCSTARTREF"); err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(f.take(f.pid), 10, 64)
+}
+
+// StopRef implements Device. As pf.Handle does, it answers
+// pf.ErrNotFound for an unknown token and on a disabled pf.
+func (f *fakePF) StopRef(token uint64) error {
+	if err := f.ioctl("DIOCSTOPREF", strconv.FormatUint(token, 10)); err != nil {
+		return err
+	}
+	if !f.drop(strconv.FormatUint(token, 10)) {
+		return fmt.Errorf("giving back reference %d: %w", token, pf.ErrNotFound)
+	}
+	return nil
+}
+
+// Refs implements Device, newest reference first.
+func (f *fakePF) Refs() ([]pf.Ref, error) {
+	if err := f.ioctl("DIOCGETSTARTERS"); err != nil {
+		return nil, err
+	}
+	var refs []pf.Ref
+	for _, tok := range slices.Backward(f.tokens) {
+		v, err := strconv.ParseUint(tok, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		proc := "pfctl"
+		if f.owner[tok] == f.pid {
+			proc = "ifboundd"
+		}
+		refs = append(refs, pf.Ref{Token: v, Created: f.born[tok], PID: f.owner[tok], Process: proc})
+	}
+	return refs, nil
+}
+
+// take takes a reference for the process pid and enables pf.
+func (f *fakePF) take(pid int) string {
+	f.enabled = true
+	var tok string
+	if n := len(f.free); n > 0 {
+		tok, f.free = f.free[n-1], f.free[:n-1]
+	} else {
+		f.next++
+		tok = strconv.Itoa(1000 + f.next)
+	}
+	f.tokens = append(f.tokens, tok)
+	f.born[tok] = time.Unix(f.now().Unix(), 0)
+	f.owner[tok] = pid
+	return tok
+}
+
+// drop gives back a reference and reports whether pf held it.
+func (f *fakePF) drop(tok string) bool {
+	i := slices.Index(f.tokens, tok)
+	if !f.enabled || i < 0 {
+		return false
+	}
+	f.tokens = slices.Delete(f.tokens, i, i+1)
+	f.free = append(f.free, tok)
+	f.enabled = len(f.tokens) > 0
+	return true
 }
 
 // ioctl records an ioctl call with its arguments, and reports whether
@@ -217,31 +294,17 @@ func (f *fakePF) run(stdin []byte, args []string) (Output, error) {
 	a := strings.Join(args, " ")
 	switch {
 	case a == "-E":
-		f.enabled = true
-		var tok string
-		if n := len(f.free); n > 0 {
-			tok, f.free = f.free[n-1], f.free[:n-1]
-		} else {
-			f.next++
-			tok = strconv.Itoa(1000 + f.next)
-		}
-		f.tokens = append(f.tokens, tok)
-		f.born[tok] = f.now()
+		f.nextPID++
+		tok := f.take(700 + f.nextPID)
 		return Output{Stderr: []byte("No ALTQ support in kernel\nALTQ related functions disabled\npf enabled\nToken : " + tok + "\n")}, nil
 	case len(args) == 2 && args[0] == "-X":
-		i := slices.Index(f.tokens, args[1])
 		switch {
 		case !f.enabled:
 			return Output{Stderr: []byte("pfctl: pf not enabled\n")}, errExit
-		case i < 0:
+		case !f.drop(args[1]):
 			return Output{Stderr: []byte("pfctl: pf: token invalid\n")}, errExit
 		}
-		f.tokens = slices.Delete(f.tokens, i, i+1)
-		f.free = append(f.free, args[1])
-		f.enabled = len(f.tokens) > 0
 		return Output{}, nil
-	case a == "-s References":
-		return out(showReferences(f.tokens, f.born, f.now())), nil
 	case a == "-sr":
 		return out(strings.Join(f.main, "\n") + "\n"), nil
 	case a == "-sn":
@@ -399,20 +462,4 @@ func (f *fakePF) callsOf(want ...string) [][]string {
 		}
 	}
 	return got
-}
-
-// showReferences prints the references as "pfctl -s References" does on
-// macOS 27. TIMESTAMP is the age of the reference.
-func showReferences(tokens []string, born map[string]time.Time, now time.Time) string {
-	if len(tokens) == 0 {
-		return "No pf starter references held\n"
-	}
-	var b strings.Builder
-	b.WriteString("TOKENS:\nPID      Process Name                 TOKEN                    TIMESTAMP\n")
-	for i, tok := range tokens {
-		age := int64(now.Sub(born[tok]).Seconds())
-		fmt.Fprintf(&b, "%-8d %-28s %-24s %d days %02d:%02d:%02d\n", 700+i, "pfctl", tok,
-			age/86400, age/3600%24, age/60%60, age%60)
-	}
-	return b.String()
 }

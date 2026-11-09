@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os/exec"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -510,14 +511,21 @@ func TestPfBackendUnloadAfterRestart(t *testing.T) {
 	}
 }
 
-// references returns the tokens that "pfctl -s References" lists.
+// references returns the tokens that "pfctl -s References" lists, of
+// every process: pfctl, and the test process for the references of the
+// Backend. A line of a reference starts with the pid and ends with the
+// token and the age, which takes three fields ("0 days 00:00:05"). A
+// process name can hold spaces.
 func references(t *testing.T) []string {
 	t.Helper()
 	var toks []string
 	for line := range strings.Lines(pfctl(t, "-s", "References")) {
 		f := strings.Fields(line)
-		if len(f) >= 3 && f[1] == "pfctl" {
-			toks = append(toks, f[2])
+		if len(f) < 6 {
+			continue
+		}
+		if _, err := strconv.Atoi(f[0]); err == nil {
+			toks = append(toks, f[len(f)-4])
 		}
 	}
 	slices.Sort(toks)

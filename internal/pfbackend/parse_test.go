@@ -2,6 +2,7 @@ package pfbackend
 
 import (
 	"errors"
+	"math"
 	"net/netip"
 	"slices"
 	"strings"
@@ -25,7 +26,7 @@ var loadedRules = []pf.Rule{
 	{Action: pf.ActionDrop},
 	{Action: pf.ActionDrop},
 	{Action: pf.ActionDrop, Label: "ifbound-ruleset:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
-	{Action: pf.ActionDrop, Label: "ifbound-token:13772037947654164677.1793350000"},
+	{Action: pf.ActionDrop, Label: "ifbound-token:13772037947654164677.1793350000.412"},
 }
 
 const zeroID = "0000000000000000000000000000000000000000000000000000000000000000"
@@ -93,75 +94,60 @@ func TestSentinelRoundTrip(t *testing.T) {
 }
 
 func TestTokenRoundTrip(t *testing.T) {
-	tok := token{value: "18446744073709551615", created: 9999999999}
+	// The longest label: the largest token value and pid, and the
+	// largest creation time that the comment on the label budget names.
+	tok := token{value: math.MaxUint64, created: 1e17 - 1, pid: math.MaxInt32}
 	r := tokenRule(tok)
 	if got, ok := labelToken(ruleLabel(t, r)); !ok || got != tok {
 		t.Errorf("token read back from %q = %v, want %v", r, got, tok)
 	}
-	want := []token{{value: "13772037947654164677", created: 1793350000}}
+	want := []token{{value: 13772037947654164677, created: 1793350000, pid: 412}}
 	if _, got, _ := parseRules(loadedRules); !slices.Equal(got, want) {
 		t.Errorf("tokens read back from the loaded rules = %v, want %v", got, want)
 	}
-	two := append(slices.Clone(loadedRules), pf.Rule{Action: pf.ActionDrop, Label: "ifbound-token:1.2"})
+	two := append(slices.Clone(loadedRules), pf.Rule{Action: pf.ActionDrop, Label: "ifbound-token:1.2.3"})
 	if _, got, _ := parseRules(two); len(got) != 2 {
 		t.Errorf("tokens read back from two token rules = %v, want two", got)
 	}
 	for _, label := range []string{
+		"13772037947654164677",
+		"13772037947654164677.1793350000",
+		"13772037947654164677.1793350000.412.5",
+		"12x.5.1",
+		"12.x.1",
+		"12.5.x",
+		"12.5.-1",
+		"12.5.",
+		".5.1",
+		"18446744073709551616.5.1",
+		"12.5.2147483648",
 		"",
-		"ifbound-token:13772037947654164677",
-		"ifbound-token:12x.5",
-		"ifbound-token:12.x",
-		"ifbound-token:.5",
-		"ifbound-token:",
 	} {
-		if got, ok := labelToken(label); ok {
-			t.Errorf("token read back from label %q = %v, want none", label, got)
+		if got, ok := labelToken(tokenPrefix + label); ok {
+			t.Errorf("token read back from label %q = %v, want none", tokenPrefix+label, got)
 		}
+	}
+	if _, got, _ := parseRules(nil); len(got) != 0 {
+		t.Errorf("tokens read back from no rules = %v, want none", got)
 	}
 }
 
-// capturedReferences is "pfctl -s References" with two references, 8 s
-// after the first "pfctl -E".
-const capturedReferences = `TOKENS:
-PID      Process Name                 TOKEN                    TIMESTAMP
-796      pfctl                        3634474195142116324      0 days 00:00:05
-792      pfctl                        9418272877687921726      0 days 00:00:08
-`
-
-func TestParseReferences(t *testing.T) {
-	now := time.Unix(1793350000, 0)
-	want := []token{
-		{value: "3634474195142116324", created: 1793350000 - 5},
-		{value: "9418272877687921726", created: 1793350000 - 8},
-	}
-	if got := parseReferences([]byte(capturedReferences), now); !slices.Equal(got, want) {
-		t.Errorf("parseReferences = %v, want %v", got, want)
-	}
-	long := "801      Some VPN Helper              42                       2 days 03:04:05\n"
-	if got := parseReferences([]byte(long), now); !slices.Equal(got, []token{{value: "42", created: 1793350000 - (2*86400 + 3*3600 + 4*60 + 5)}}) {
-		t.Errorf("parseReferences with a name with spaces = %v", got)
-	}
-	for _, out := range []string{"No pf starter references held\n", "TOKENS:\nPID Process Name TOKEN TIMESTAMP\n"} {
-		if got := parseReferences([]byte(out), now); len(got) != 0 {
-			t.Errorf("parseReferences(%q) = %v, want none", out, got)
-		}
-	}
-}
-
-func TestTokenSame(t *testing.T) {
-	tok := token{value: "7", created: 100}
+// A token is its reference only when the value, the creation time, and
+// the pid all match.
+func TestTokenIs(t *testing.T) {
+	tok := token{value: 7, created: 100, pid: 412}
 	for _, tt := range []struct {
-		r    token
+		r    pf.Ref
 		want bool
 	}{
-		{token{value: "7", created: 100}, true},
-		{token{value: "7", created: 100 + tokenSkew}, true},
-		{token{value: "7", created: 100 - tokenSkew}, true},
-		{token{value: "7", created: 100 + tokenSkew + 1}, false},
-		{token{value: "8", created: 100}, false},
+		{pf.Ref{Token: 7, Created: time.Unix(100, 0), PID: 412}, true},
+		{pf.Ref{Token: 8, Created: time.Unix(100, 0), PID: 412}, false},
+		{pf.Ref{Token: 7, Created: time.Unix(101, 0), PID: 412}, false},
+		{pf.Ref{Token: 7, Created: time.Unix(99, 0), PID: 412}, false},
+		{pf.Ref{Token: 7, Created: time.Unix(100, 0), PID: 413}, false},
 	} {
-		if got := tok.same(tt.r); got != tt.want {
-			t.Errorf("%v.same(%v) = %v, want %v", tok, tt.r, got, tt.want)
+		if got := tok.is(tt.r); got != tt.want {
+			t.Errorf("%v.is(%+v) = %v, want %v", tok, tt.r, got, tt.want)
 		}
 	}
 }
@@ -222,16 +208,6 @@ func TestParseEntries(t *testing.T) {
 		if _, _, err := parseEntries([]byte(bad)); !errors.Is(err, errOutput) {
 			t.Errorf("parseEntries(%q) error = %v, want errOutput", bad, err)
 		}
-	}
-}
-
-func TestParseToken(t *testing.T) {
-	tok, err := parseToken([]byte("No ALTQ support in kernel\nALTQ related functions disabled\npf enabled\nToken : 5568675831746034285\n"))
-	if err != nil || tok != "5568675831746034285" {
-		t.Errorf("parseToken = (%q, %v), want 5568675831746034285", tok, err)
-	}
-	if _, err := parseToken([]byte("pf enabled\n")); !errors.Is(err, errOutput) {
-		t.Errorf("parseToken without a token: error = %v, want errOutput", err)
 	}
 }
 
