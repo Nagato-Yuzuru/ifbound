@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -143,19 +144,21 @@ func TestProbeRejections(t *testing.T) {
 }
 
 func TestReportProbeWaitingForSlotHonorsContext(t *testing.T) {
-	c := NewClient("/nonexistent/s.sock", self())
-	for range maxProbesInFlight {
-		c.probes <- struct{}{}
-	}
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
-	defer cancel()
+	synctest.Test(t, func(t *testing.T) {
+		c := NewClient("/nonexistent/s.sock", self())
+		for range maxProbesInFlight {
+			c.probes <- struct{}{}
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+		defer cancel()
 
-	if err := c.ReportProbe(ctx, ProbePrefix+"x.a.test"); !errors.Is(err, context.DeadlineExceeded) {
-		t.Errorf("ReportProbe = %v, want DeadlineExceeded", err)
-	}
-	if len(c.inflight) != 0 {
-		t.Error("a probe took a report slot")
-	}
+		if err := c.ReportProbe(ctx, ProbePrefix+"x.a.test"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("ReportProbe = %v, want DeadlineExceeded", err)
+		}
+		if len(c.inflight) != 0 {
+			t.Error("a probe took a report slot")
+		}
+	})
 }
 
 func TestIsProbe(t *testing.T) {

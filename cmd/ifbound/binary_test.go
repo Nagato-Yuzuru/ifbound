@@ -160,12 +160,30 @@ func checkInterruptOnFIFO(t *testing.T, bin string) {
 	}
 	done := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(done) }() //nolint:errcheck // the exit status is read from ProcessState
-	// No writer exists, so the open blocks. The wait gives main time to
-	// install its signal handler.
+	// The open of the write end returns only after the child opens the
+	// read end. main installs the signal handler before apply opens the
+	// file, so the handler is in place when this open returns. The write
+	// end stays open and sends nothing, so the read of the child blocks.
+	opened := make(chan error, 1)
+	go func() {
+		w, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+		opened <- err
+		if err == nil {
+			<-done
+			_ = w.Close() //nolint:errcheck // the child is gone; nothing reads the FIFO
+		}
+	}()
 	select {
+	case err := <-opened:
+		if err != nil {
+			t.Fatal(err)
+		}
 	case <-done:
-		t.Fatalf("ended before the interrupt: %q", errOut.String())
-	case <-time.After(500 * time.Millisecond):
+		// A reader that does not block lets the pending open return.
+		if r, err := os.OpenFile(fifo, os.O_RDONLY|syscall.O_NONBLOCK, 0); err == nil {
+			_ = r.Close() //nolint:errcheck // the reader only ends the open
+		}
+		t.Fatalf("ended before it opened the file: %q", errOut.String())
 	}
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
 		t.Fatal(err)

@@ -96,10 +96,11 @@ func TestProbeReportWaitsAtMostTheTimeout(t *testing.T) {
 
 // probeGate is ifboundd for the deadlock test: each report waits until
 // the probe of its qname arrives, so each report holds its slot while its
-// probe needs a slot.
+// probe needs a slot. Each report that reaches Observe sends on entered.
 type probeGate struct {
-	mu   sync.Mutex
-	seen map[string]chan struct{}
+	mu      sync.Mutex
+	seen    map[string]chan struct{}
+	entered chan struct{}
 }
 
 func (g *probeGate) ch(qname string) chan struct{} {
@@ -128,6 +129,7 @@ func (g *probeGate) ProbeSeen(qname string) {
 }
 
 func (g *probeGate) Observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
+	g.entered <- struct{}{}
 	select {
 	case <-g.ch(ipc.ProbePrefix + "x." + o.QName):
 		return ipc.Ack{}, nil
@@ -140,7 +142,13 @@ func (g *probeGate) Observe(ctx context.Context, o ipc.Observation) (ipc.Ack, er
 // probes. The probe queries must still reach ifboundd through the same
 // client, or every report times out.
 func TestProbesPassWhileEveryReportWaits(t *testing.T) {
-	g := &probeGate{}
+	const (
+		n = 40 // more than the report slots of the client
+		// reportSlots is the number of Reports that an ipc.Client runs at
+		// once. wire_compat_test.go pins the same value.
+		reportSlots = 32
+	)
+	g := &probeGate{entered: make(chan struct{}, n)}
 	path := socketPath(t)
 	srv, err := ipc.Listen(ipc.ServerConfig{Path: path, Handler: g, Probes: g, AllowedUIDs: []uint32{selfUID()}})
 	if err != nil {
@@ -157,7 +165,6 @@ func TestProbesPassWhileEveryReportWaits(t *testing.T) {
 	client := ipc.NewClient(path, selfUID())
 	h := &handler{key: testKey, next: writeA(done), reporter: client, probes: client, timeout: 10 * time.Second}
 
-	const n = 40 // more than the report slots of the client
 	replies := make(chan int, n)
 	var wg sync.WaitGroup
 	for i := range n {
@@ -166,7 +173,13 @@ func TestProbesPassWhileEveryReportWaits(t *testing.T) {
 			replies <- rcode
 		})
 	}
-	time.Sleep(100 * time.Millisecond) // lets the reports fill the slots; no other signal exists
+	for i := range reportSlots {
+		select {
+		case <-g.entered:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("only %d reports reached ifboundd, want %d", i, reportSlots)
+		}
+	}
 	for i := range n {
 		wg.Go(func() {
 			if _, rcode, err := serve(t.Context(), h, fmt.Sprintf("%sx.r%d.test.", ipc.ProbePrefix, i)); err != nil {
