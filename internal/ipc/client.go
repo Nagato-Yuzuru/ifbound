@@ -6,7 +6,6 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"time"
 )
@@ -50,7 +49,7 @@ type Ack struct {
 // Each call uses its own connection, so a broken connection never affects
 // the next call.
 type Client struct {
-	path      string
+	dial      dialFunc
 	serverUID uint32
 	inflight  chan struct{}
 	probes    chan struct{}
@@ -72,7 +71,7 @@ const (
 // from a server that runs as serverUID. Production passes 0.
 func NewClient(path string, serverUID uint32) *Client {
 	return &Client{
-		path:      path,
+		dial:      dialUnix(path),
 		serverUID: serverUID,
 		inflight:  make(chan struct{}, maxInFlight),
 		probes:    make(chan struct{}, maxProbesInFlight),
@@ -133,8 +132,7 @@ func (c *Client) exchange(ctx context.Context, slots chan struct{}, qname string
 }
 
 func (c *Client) roundTrip(ctx context.Context, req envelope) (jsontext.Value, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", c.path)
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
@@ -145,8 +143,8 @@ func (c *Client) roundTrip(ctx context.Context, req envelope) (jsontext.Value, e
 // exchangeOn sends req on conn and returns the body of the ack. The
 // server must run as serverUID, and its reply must have the given
 // protocol version.
-func exchangeOn(ctx context.Context, conn net.Conn, serverUID uint32, version int, req envelope) (jsontext.Value, error) {
-	uid, err := peerUID(conn)
+func exchangeOn(ctx context.Context, conn peerConn, serverUID uint32, version int, req envelope) (jsontext.Value, error) {
+	uid, err := conn.PeerUID()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}

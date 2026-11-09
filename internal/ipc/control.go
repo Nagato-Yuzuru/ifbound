@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"net"
 	"time"
 )
 
@@ -212,14 +211,14 @@ func decodeApply(raw jsontext.Value) ([]byte, time.Time, error) {
 // the admin socket. It is safe for concurrent use. Each call uses its own
 // connection.
 type ControlClient struct {
-	path      string
+	dial      dialFunc
 	serverUID uint32
 }
 
 // NewControlClient returns a client for the socket at path. It trusts a
 // reply only from a server that runs as serverUID. Production passes 0.
 func NewControlClient(path string, serverUID uint32) *ControlClient {
-	return &ControlClient{path: path, serverUID: serverUID}
+	return &ControlClient{dial: dialUnix(path), serverUID: serverUID}
 }
 
 // Status returns the status of ifboundd. The error set is:
@@ -282,8 +281,7 @@ func (c *ControlClient) call(ctx context.Context, req func(context.Context) enve
 }
 
 func (c *ControlClient) roundTrip(ctx context.Context, req envelope) (jsontext.Value, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", c.path)
+	conn, err := c.dial(ctx)
 	switch {
 	case errors.Is(err, fs.ErrPermission):
 		return nil, fmt.Errorf("%w: %v", ErrDenied, err)
