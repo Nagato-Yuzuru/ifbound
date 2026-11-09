@@ -85,7 +85,6 @@ func newKernel() *kernel {
 // pfctlArgs is a parsed pfctl command line.
 type pfctlArgs struct {
 	anchor, table, tcmd, show, file, flush, release string
-	kills                                           []string
 	verbose, enable, disable                        bool
 	rest                                            []string
 }
@@ -114,10 +113,6 @@ func parseArgs(args []string) (pfctlArgs, error) {
 			p.flush, err = value(&i)
 		case a == "-X":
 			p.release, err = value(&i)
-		case a == "-k":
-			var k string
-			k, err = value(&i)
-			p.kills = append(p.kills, k)
 		case a == "-s":
 			p.show, err = value(&i)
 		case strings.HasPrefix(a, "-s") && len(a) > 2:
@@ -165,8 +160,6 @@ func (k *kernel) Run(_ context.Context, stdin []byte, args ...string) (pfbackend
 		return pfbackend.Output{Stderr: []byte("pf disabled\n")}, nil
 	case p.release != "":
 		return k.releaseRef(p.release)
-	case len(p.kills) > 0:
-		return k.kill(p.kills)
 	case p.tcmd != "":
 		return k.tableCmd(p, stdin)
 	case p.file != "":
@@ -183,12 +176,115 @@ func (k *kernel) Run(_ context.Context, stdin []byte, args ...string) (pfbackend
 	return failure(fmt.Sprintf("kernel model: unmodeled command %q", strings.Join(args, " ")))
 }
 
-// ioctl records an ioctl call and reports whether fail refuses it.
-func (k *kernel) ioctl(name string) error {
-	k.calls = append(k.calls, []string{name})
-	if k.fail != nil && k.fail([]string{name}) {
+// ioctl records an ioctl call with its arguments, and reports whether
+// fail refuses it.
+func (k *kernel) ioctl(name string, args ...string) error {
+	call := append([]string{name}, args...)
+	k.calls = append(k.calls, call)
+	if k.fail != nil && k.fail(call) {
 		return fmt.Errorf("%s: injected failure", name)
 	}
+	return nil
+}
+
+// exists reports whether pf holds the anchor.
+func (k *kernel) exists(anchor string) bool {
+	if _, ok := k.rules[anchor]; ok {
+		return true
+	}
+	return len(pfbackend.Children(slices.Collect(maps.Keys(k.rules)), anchor)) > 0
+}
+
+// Rules implements pfbackend.Device.
+func (k *kernel) Rules(rs pf.Ruleset) ([]pf.Rule, error) {
+	if err := k.ioctl("DIOCGETRULES", rs.Anchor, rs.Kind.String()); err != nil {
+		return nil, err
+	}
+	lines := slices.Concat(k.mainRules, k.mainNat)
+	if rs.Anchor != "" {
+		if !k.exists(rs.Anchor) {
+			return nil, fmt.Errorf("anchor %s: %w", rs.Anchor, pf.ErrNotFound)
+		}
+		lines = slices.Concat(k.rules[rs.Anchor], k.nat[rs.Anchor])
+	}
+	return pfbackend.RulesOf(lines, rs.Kind), nil
+}
+
+// Anchors implements pfbackend.Device.
+func (k *kernel) Anchors(anchor string) ([]string, error) {
+	if err := k.ioctl("DIOCGETRULESETS", anchor); err != nil {
+		return nil, err
+	}
+	if anchor != "" && !k.exists(anchor) {
+		return nil, fmt.Errorf("anchor %s: %w", anchor, pf.ErrNotFound)
+	}
+	return pfbackend.Children(slices.Collect(maps.Keys(k.rules)), anchor), nil
+}
+
+func (k *kernel) tableOf(t pf.Table) (map[netip.Prefix]bool, error) {
+	tbl := k.tables[t.Anchor][t.Name]
+	if tbl == nil {
+		return nil, fmt.Errorf("table %s: %w", t, pf.ErrNotFound)
+	}
+	return tbl, nil
+}
+
+// CreateTable implements pfbackend.Device.
+func (k *kernel) CreateTable(t pf.Table) error {
+	if err := k.ioctl("DIOCRADDTABLES", t.Anchor, t.Name); err != nil {
+		return err
+	}
+	if k.tables[t.Anchor] == nil {
+		k.tables[t.Anchor] = map[string]map[netip.Prefix]bool{}
+	}
+	if k.tables[t.Anchor][t.Name] == nil {
+		k.tables[t.Anchor][t.Name] = map[netip.Prefix]bool{}
+	}
+	return nil
+}
+
+// AddAddrs implements pfbackend.Device.
+func (k *kernel) AddAddrs(t pf.Table, addrs []pf.Addr) ([]pf.Feedback, error) {
+	if err := k.ioctl("DIOCRADDADDRS", pfbackend.AddrArgs(t, addrs)...); err != nil {
+		return nil, err
+	}
+	tbl, err := k.tableOf(t)
+	if err != nil {
+		return nil, err
+	}
+	return pfbackend.AddAddrs(tbl, addrs), nil
+}
+
+// DeleteAddrs implements pfbackend.Device.
+func (k *kernel) DeleteAddrs(t pf.Table, addrs []pf.Addr) ([]pf.Feedback, error) {
+	if err := k.ioctl("DIOCRDELADDRS", pfbackend.AddrArgs(t, addrs)...); err != nil {
+		return nil, err
+	}
+	tbl, err := k.tableOf(t)
+	if err != nil {
+		return nil, err
+	}
+	return pfbackend.DelAddrs(tbl, addrs, nil), nil
+}
+
+// Addrs implements pfbackend.Device.
+func (k *kernel) Addrs(t pf.Table) ([]pf.Addr, error) {
+	if err := k.ioctl("DIOCRGETADDRS", t.Anchor, t.Name); err != nil {
+		return nil, err
+	}
+	tbl, err := k.tableOf(t)
+	if err != nil {
+		return nil, err
+	}
+	return pfbackend.AddrsOf(tbl), nil
+}
+
+// KillStates implements pfbackend.Device.
+func (k *kernel) KillStates(dst netip.Prefix) error {
+	if err := k.ioctl("DIOCKILLSTATES", dst.String()); err != nil {
+		return err
+	}
+	k.states = slices.DeleteFunc(k.states, dst.Contains)
 	return nil
 }
 
@@ -237,22 +333,6 @@ func (k *kernel) releaseRef(tok string) (pfbackend.Output, error) {
 		return pfbackend.Output{Stderr: []byte("pf disabled\n")}, nil
 	}
 	return pfbackend.Output{Stderr: []byte(strconv.Itoa(len(k.refs)) + " more pf enable reference(s) remaining, pf still enabled\n")}, nil
-}
-
-func (k *kernel) kill(hosts []string) (pfbackend.Output, error) {
-	if len(hosts) != 2 {
-		return failure("kernel model: only -k <src> -k <dst> is modeled")
-	}
-	src, err1 := netip.ParsePrefix(hosts[0])
-	dst, err2 := netip.ParsePrefix(hosts[1])
-	if err1 != nil || err2 != nil {
-		return failure("illegal kill address")
-	}
-	_ = src // every modeled state has a source inside 0.0.0.0/0 or ::/0
-	k.states = slices.DeleteFunc(k.states, func(a netip.Addr) bool {
-		return dst.Contains(a) && src.Addr().Is4() == a.Is4()
-	})
-	return pfbackend.Output{}, nil
 }
 
 // load replaces the filter and the NAT rules of an anchor in one
@@ -331,11 +411,6 @@ func (k *kernel) showCmd(p pfctlArgs) (pfbackend.Output, error) {
 		if p.anchor == "" {
 			return stdout(joinLines(k.mainRules)), nil
 		}
-		if base, ok := strings.CutSuffix(p.anchor, "/*"); ok {
-			var b strings.Builder
-			k.printTree(&b, base, "")
-			return stdout(b.String()), nil
-		}
 		return stdout(joinLines(k.rules[p.anchor])), nil
 	case "n", "nat":
 		if p.anchor == "" {
@@ -350,8 +425,6 @@ func (k *kernel) showCmd(p pfctlArgs) (pfbackend.Output, error) {
 		return k.showReferences(), nil
 	case "I", "Interfaces":
 		return stdout(joinLines(k.ifaces)), nil
-	case "s", "state", "states":
-		return stdout(k.showStates()), nil
 	}
 	return failure("kernel model: unmodeled show " + p.show)
 }
@@ -372,38 +445,11 @@ func (k *kernel) showReferences() pfbackend.Output {
 	return stdout(b.String())
 }
 
-// showStates prints the states as "pfctl -s state" does on macOS 27. Each
-// state has a local source and its destination.
-func (k *kernel) showStates() string {
-	var b strings.Builder
-	for _, a := range k.states {
-		if a.Is4() {
-			b.WriteString("ALL udp 192.168.64.14:50000 -> " + a.String() + ":443       SINGLE:NO_TRAFFIC\n")
-		} else {
-			b.WriteString("ALL udp 2001:db8:ffff::14[50000] -> " + a.String() + "[443]       SINGLE:NO_TRAFFIC\n")
-		}
-	}
-	return b.String()
-}
-
 func joinLines(ls []string) string {
 	if len(ls) == 0 {
 		return ""
 	}
 	return strings.Join(ls, "\n") + "\n"
-}
-
-func (k *kernel) printTree(b *strings.Builder, path, indent string) {
-	for _, r := range k.rules[path] {
-		sub, ok := anchorName(r)
-		if !ok {
-			b.WriteString(indent + r + "\n")
-			continue
-		}
-		b.WriteString(indent + r + " {\n")
-		k.printTree(b, path+"/"+sub, indent+"  ")
-		b.WriteString(indent + "}\n")
-	}
 }
 
 // listAnchors prints the children of an anchor, or with verbose all
@@ -443,8 +489,6 @@ func (k *kernel) tableCmd(p pfctlArgs, stdin []byte) (pfbackend.Output, error) {
 		}
 		clear(t)
 		return pfbackend.Output{}, nil
-	case "add":
-		return k.tableAdd(p, stdin)
 	case "delete":
 		return tableDelete(t, p, stdin)
 	}
@@ -479,36 +523,6 @@ func tableDelete(t map[netip.Prefix]bool, p pfctlArgs, stdin []byte) (pfbackend.
 		}
 	}
 	return pfbackend.Output{}, nil
-}
-
-func (k *kernel) tableAdd(p pfctlArgs, stdin []byte) (pfbackend.Output, error) {
-	es, err := entriesOf(p, stdin)
-	if err != nil {
-		return failure(err.Error())
-	}
-	if k.tables[p.anchor] == nil {
-		k.tables[p.anchor] = map[string]map[netip.Prefix]bool{}
-	}
-	t := k.tables[p.anchor][p.table]
-	if t == nil {
-		t = map[netip.Prefix]bool{}
-		k.tables[p.anchor][p.table] = t
-	}
-	var fb strings.Builder
-	for _, e := range es {
-		neg, ok := t[e.p]
-		switch {
-		case ok && neg != e.neg:
-			fb.WriteString("Y  " + hostText(e.p) + "\n")
-		case !ok:
-			t[e.p] = e.neg
-			fb.WriteString("A  " + hostText(e.p) + "\n")
-		}
-	}
-	if !p.verbose {
-		return pfbackend.Output{}, nil
-	}
-	return stdout(fb.String()), nil
 }
 
 type entry struct {

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -156,7 +157,7 @@ func TestFailedStateKillIsRetried(t *testing.T) {
 			r.k.states = []netip.Addr{netip.MustParseAddr("1.1.1.1")}
 			failed := !fault
 			r.k.fail = func(args []string) bool {
-				if !failed && slices.Contains(args, "1.1.1.1/32") && slices.Contains(args, "-k") {
+				if !failed && args[0] == "DIOCKILLSTATES" && slices.Contains(args, "1.1.1.1/32") {
 					failed = true
 					return true
 				}
@@ -180,7 +181,7 @@ func TestFailedStateKillOfAddEntriesGivesNoRuleset(t *testing.T) {
 	rs := compileRS(t, testPolicies)
 	mustLoad(t, r, rs)
 	r.k.states = []netip.Addr{netip.MustParseAddr("198.51.100.3")}
-	r.k.fail = func(args []string) bool { return slices.Contains(args, "-k") }
+	r.k.fail = func(args []string) bool { return args[0] == "DIOCKILLSTATES" }
 	if err := r.b.AddEntries(t.Context(), "bing", pfx("198.51.100.3/32")); err == nil {
 		t.Fatal("AddEntries with a failing kill = nil, want an error")
 	}
@@ -329,8 +330,8 @@ func TestUnloadOfAStaleToken(t *testing.T) {
 	}
 }
 
-// Load reads the state table once and kills only the states that it
-// finds, so the number of pfctl calls does not grow with the entries.
+// Load ends the states of each entry through ioctl, so the number of
+// pfctl processes does not grow with the entries.
 func TestStateKillCallsDoNotGrowWithEntries(t *testing.T) {
 	count := func(n int) int {
 		r := newRig(t)
@@ -347,7 +348,13 @@ func TestStateKillCallsDoNotGrowWithEntries(t *testing.T) {
 		if !r.k.hasState("8.8.8.8") {
 			t.Errorf("with %d entries: the state to 8.8.8.8 is gone", n)
 		}
-		return len(r.k.calls)
+		procs := 0
+		for _, c := range r.k.calls {
+			if !strings.HasPrefix(c[0], "DIOC") {
+				procs++
+			}
+		}
+		return procs
 	}
 	if small, big := count(0), count(3000); big-small > 2 {
 		t.Errorf("pfctl calls per Load: %d with 0 entries, %d with 3000 entries", small, big)

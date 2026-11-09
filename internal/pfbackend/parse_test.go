@@ -7,62 +7,70 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Nagato-Yuzuru/ifbound/pf"
 )
 
 // The outputs below are captured from pfctl on macOS 27.0 (26A428) in a
 // tart guest.
 
-// capturedRuleset is "pfctl -a com.apple/000.ifbound/* -sr" after a load
-// of a pfrules ruleset with a sentinel. The kernel expands the interface
-// list, removes the quotes, and reorders the quick blocks.
-const capturedRuleset = `anchor "tag.bing" out on utun4 from any to <bing> tag ifbound.bing {
+// loadedRules are the filter rules of the anchor after a load of a
+// pfrules ruleset with a sentinel, as Handle.Rules returns them: two
+// anchor rules, three block rules, the sentinel rule, and a token rule.
+// pf keeps a "block return" rule with the action drop.
+var loadedRules = []pf.Rule{
+	{Action: pf.ActionPass, AnchorCall: "tag.bing"},
+	{Action: pf.ActionPass, AnchorCall: "tag.bing"},
+	{Action: pf.ActionDrop},
+	{Action: pf.ActionDrop},
+	{Action: pf.ActionDrop},
+	{Action: pf.ActionDrop, Label: "ifbound-ruleset:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+	{Action: pf.ActionDrop, Label: "ifbound-token:13772037947654164677.1793350000"},
 }
-anchor "tag.bing" out on utun5 from any to <bing> tag ifbound.bing {
-}
-block return-icmp(port-unr, port-unr) out quick from any to <doh>
-block return-icmp(port-unr, port-unr) out quick from any to <doh> user = 299
-block return-icmp(port-unr, port-unr) out quick from any to <bing> ! tagged ifbound.bing
-block drop out quick all label "ifbound-ruleset:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" tagged ifbound-id
-block drop out quick all label "ifbound-token:13772037947654164677.1793350000" tagged ifbound-id
-`
-
-// capturedForeign is the same anchor after another tool loaded rules into
-// a sub-anchor, also a nested one.
-const capturedForeign = `anchor "tag.bing" out on utun4 from any to <bing> tag ifbound.bing {
-  anchor "z" all {
-    pass out quick all no state
-  }
-}
-block drop out quick all label "ifbound-ruleset:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" tagged ifbound-id
-`
 
 const zeroID = "0000000000000000000000000000000000000000000000000000000000000000"
 
-func TestParseRuleset(t *testing.T) {
-	other := "ifbound-ruleset:" + strings.Repeat("_", 43)
+func TestParseRules(t *testing.T) {
+	other := pf.Rule{Action: pf.ActionDrop, Label: "ifbound-ruleset:" + strings.Repeat("_", 43)}
+	label := func(l string) pf.Rule { return pf.Rule{Action: pf.ActionDrop, Label: l} }
 	tests := []struct {
-		name string
-		out  string
-		want string
+		name        string
+		rules       []pf.Rule
+		want        string
+		wantForeign bool
 	}{
-		{"captured", capturedRuleset, zeroID},
-		{"rule in a sub-anchor", capturedForeign, ""},
-		{"pass rule at the top level", "pass out quick all no state\n" + capturedRuleset, ""},
-		{"block rule at the top level", "block drop out quick from any to 192.0.2.77\n" + capturedRuleset, zeroID},
-		{"no sentinel", "block drop out quick all\n", ""},
-		{"empty anchor", "", ""},
-		{"two sentinels", capturedRuleset + `block drop out quick all label "` + other + `"` + "\n", ""},
-		{"label too short", `block drop out quick all label "ifbound-ruleset:AAAA"` + "\n", ""},
-		{"label not base64url", `block drop out quick all label "ifbound-ruleset:` + strings.Repeat("+", 43) + `"` + "\n", ""},
-		{"label without end quote", `block drop out quick all label "ifbound-ruleset:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA` + "\n", ""},
+		{"loaded", loadedRules, zeroID, false},
+		{"pass rule at the top level", append([]pf.Rule{{Action: pf.ActionPass}}, loadedRules...), zeroID, true},
+		{"NAT action at the top level", append([]pf.Rule{{Action: pf.ActionNAT}}, loadedRules...), zeroID, true},
+		{"block rule at the top level", append([]pf.Rule{{Action: pf.ActionDrop}}, loadedRules...), zeroID, false},
+		{"no sentinel", []pf.Rule{{Action: pf.ActionDrop}}, "", false},
+		{"empty anchor", nil, "", false},
+		{"two sentinels", append(slices.Clone(loadedRules), other), "", false},
+		{"label too short", []pf.Rule{label("ifbound-ruleset:AAAA")}, "", false},
+		{"label not base64url", []pf.Rule{label("ifbound-ruleset:" + strings.Repeat("+", 43))}, "", false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got, _ := parseRuleset([]byte(tt.out)); got != tt.want {
-				t.Errorf("parseRuleset = %q, want %q", got, tt.want)
+			got, _, foreign := parseRules(tt.rules)
+			if got != tt.want || foreign != tt.wantForeign {
+				t.Errorf("parseRules = (%q, foreign %v), want (%q, foreign %v)", got, foreign, tt.want, tt.wantForeign)
 			}
 		})
 	}
+}
+
+// ruleLabel returns the label of a rule that the Backend writes.
+func ruleLabel(t *testing.T, rule string) string {
+	t.Helper()
+	_, rest, ok := strings.Cut(rule, `label "`)
+	if !ok {
+		t.Fatalf("rule %q has no label", rule)
+	}
+	label, _, _ := strings.Cut(rest, `"`)
+	if len(label) > 63 {
+		t.Errorf("label %q has %d bytes, pf takes at most 63", label, len(label))
+	}
+	return label
 }
 
 func TestSentinelRoundTrip(t *testing.T) {
@@ -74,11 +82,7 @@ func TestSentinelRoundTrip(t *testing.T) {
 	if !strings.Contains(s, `tagged "ifbound-id"`) {
 		t.Errorf("sentinel %q does not match on the sentinel tag only", s)
 	}
-	label, _, _ := strings.Cut(strings.SplitN(s, `label "`, 2)[1], `"`)
-	if len(label) > 63 {
-		t.Errorf("label %q has %d bytes, pf takes at most 63", label, len(label))
-	}
-	if got, _ := parseRuleset([]byte(s)); got != id {
+	if got, ok := labelID(ruleLabel(t, s)); !ok || got != id {
 		t.Errorf("ID read back from %q = %q, want %q", s, got, id)
 	}
 	for _, bad := range []string{"", "xyz", id[:62], id + "00"} {
@@ -91,30 +95,27 @@ func TestSentinelRoundTrip(t *testing.T) {
 func TestTokenRoundTrip(t *testing.T) {
 	tok := token{value: "18446744073709551615", created: 9999999999}
 	r := tokenRule(tok)
-	if label, _, _ := strings.Cut(strings.SplitN(r, `label "`, 2)[1], `"`); len(label) > 63 {
-		t.Errorf("label %q has %d bytes, pf takes at most 63", label, len(label))
-	}
-	if _, got := parseRuleset([]byte(r)); !slices.Equal(got, []token{tok}) {
-		t.Errorf("tokens read back from %q = %v, want %v", r, got, tok)
+	if got, ok := labelToken(ruleLabel(t, r)); !ok || got != tok {
+		t.Errorf("token read back from %q = %v, want %v", r, got, tok)
 	}
 	want := []token{{value: "13772037947654164677", created: 1793350000}}
-	if _, got := parseRuleset([]byte(capturedRuleset)); !slices.Equal(got, want) {
-		t.Errorf("tokens read back from the captured ruleset = %v, want %v", got, want)
+	if _, got, _ := parseRules(loadedRules); !slices.Equal(got, want) {
+		t.Errorf("tokens read back from the loaded rules = %v, want %v", got, want)
 	}
-	two := capturedRuleset + `block drop out quick all label "ifbound-token:1.2" tagged ifbound-id` + "\n"
-	if _, got := parseRuleset([]byte(two)); len(got) != 2 {
+	two := append(slices.Clone(loadedRules), pf.Rule{Action: pf.ActionDrop, Label: "ifbound-token:1.2"})
+	if _, got, _ := parseRules(two); len(got) != 2 {
 		t.Errorf("tokens read back from two token rules = %v, want two", got)
 	}
-	for _, out := range []string{
+	for _, label := range []string{
 		"",
-		`block drop out quick all label "ifbound-token:13772037947654164677" tagged ifbound-id` + "\n",
-		`block drop out quick all label "ifbound-token:12x.5" tagged ifbound-id` + "\n",
-		`block drop out quick all label "ifbound-token:12.x" tagged ifbound-id` + "\n",
-		`block drop out quick all label "ifbound-token:.5" tagged ifbound-id` + "\n",
-		`block drop out quick all label "ifbound-token:" tagged ifbound-id` + "\n",
+		"ifbound-token:13772037947654164677",
+		"ifbound-token:12x.5",
+		"ifbound-token:12.x",
+		"ifbound-token:.5",
+		"ifbound-token:",
 	} {
-		if _, got := parseRuleset([]byte(out)); len(got) != 0 {
-			t.Errorf("tokens read back from %q = %v, want none", out, got)
+		if got, ok := labelToken(label); ok {
+			t.Errorf("token read back from label %q = %v, want none", label, got)
 		}
 	}
 }
@@ -162,32 +163,6 @@ func TestTokenSame(t *testing.T) {
 		if got := tok.same(tt.r); got != tt.want {
 			t.Errorf("%v.same(%v) = %v, want %v", tok, tt.r, got, tt.want)
 		}
-	}
-}
-
-// capturedStates is "pfctl -s state" with a NAT state and an IPv6 state.
-const capturedStates = `ALL udp 192.168.64.14:57829 -> 192.0.2.10:9       SINGLE:NO_TRAFFIC
-ALL tcp 192.168.64.14:51121 -> 192.0.2.10:443       SYN_SENT:CLOSED
-ALL udp 192.168.64.14:59130 -> 192.168.64.200:38457 -> 192.0.2.11:9       SINGLE:NO_TRAFFIC
-ALL udp ::1[63006] -> ::1[9999]       SINGLE:NO_TRAFFIC
-`
-
-func TestParseStates(t *testing.T) {
-	got, ok := parseStates([]byte(capturedStates))
-	want := []string{"192.168.64.14", "192.0.2.10", "192.168.64.14", "192.0.2.10", "192.168.64.14", "192.168.64.200", "192.0.2.11", "::1", "::1"}
-	if !ok || len(got) != len(want) {
-		t.Fatalf("parseStates = (%v, %v), want %v", got, ok, want)
-	}
-	for i, a := range got {
-		if a.String() != want[i] {
-			t.Errorf("address %d = %v, want %s", i, a, want[i])
-		}
-	}
-	if got, ok := parseStates(nil); !ok || len(got) != 0 {
-		t.Errorf("parseStates(empty) = (%v, %v), want no address", got, ok)
-	}
-	if _, ok := parseStates([]byte(capturedStates + "ALL gre host.example -> other.example\n")); ok {
-		t.Errorf("parseStates accepts a line without an address")
 	}
 }
 
@@ -246,22 +221,6 @@ func TestParseEntries(t *testing.T) {
 	for _, bad := range []string{"   example.com\n", "   10.0.0.0/33\n"} {
 		if _, _, err := parseEntries([]byte(bad)); !errors.Is(err, errOutput) {
 			t.Errorf("parseEntries(%q) error = %v, want errOutput", bad, err)
-		}
-	}
-}
-
-func TestParseConflicts(t *testing.T) {
-	captured := "Y  198.18.1.20\nA  198.18.1.21\nA  10.0.0.0/8\n"
-	got, err := parseConflicts([]byte(captured))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := prefixes("198.18.1.20/32"); !slices.Equal(got, want) {
-		t.Errorf("parseConflicts = %v, want %v", got, want)
-	}
-	for _, bad := range []string{"Y198.18.1.20\n", "Y  \n", "Y x198.18.1.20\n", "Y  host.example\n"} {
-		if _, err := parseConflicts([]byte(bad)); !errors.Is(err, errOutput) {
-			t.Errorf("parseConflicts(%q) error = %v, want errOutput", bad, err)
 		}
 	}
 }

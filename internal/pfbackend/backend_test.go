@@ -8,6 +8,7 @@ package pfbackend_test
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"slices"
 	"strings"
@@ -393,6 +394,48 @@ func TestReadReportsNegatedEntriesOutsideTables(t *testing.T) {
 
 // Writes: -T add / -T delete / -T kill, idempotent
 
+// A protected ack calls LoadedID and AddEntries. Neither starts a pfctl
+// process: one start costs about a millisecond. The entries here take
+// every branch of AddEntries: a new entry with a state, an entry that the
+// table holds as a negated entry, and a prefix with a negated entry
+// inside.
+func TestAckPathStartsNoPfctl(t *testing.T) {
+	r := newRig(t)
+	rs := compileRS(t, testPolicies)
+	mustLoad(t, r, rs)
+	r.k.setEntries(ifb, "bing", "!198.51.100.9/32", "!203.0.113.7/32")
+	r.k.states = []netip.Addr{netip.MustParseAddr("198.51.100.1"), netip.MustParseAddr("203.0.113.7")}
+	from := len(r.k.calls)
+	if id, err := r.b.LoadedID(t.Context()); err != nil || id != rs.ID() {
+		t.Fatalf("LoadedID = (%q, %v), want %q", id, err, rs.ID())
+	}
+	add := pfx("198.51.100.1/32", "198.51.100.9/32", "203.0.113.0/24")
+	if err := r.b.AddEntries(t.Context(), "bing", add); err != nil {
+		t.Fatalf("AddEntries: %v", err)
+	}
+	for _, c := range r.k.calls[from:] {
+		if !strings.HasPrefix(c[0], "DIOC") {
+			t.Errorf("the ack path ran pfctl %v", c)
+		}
+	}
+	if got, want := r.k.tables[ifb]["bing"], sortedTable(add); !maps.Equal(got, want) {
+		t.Errorf("bing = %v, want %v without negated entries", got, want)
+	}
+	if len(r.k.states) != 0 {
+		t.Errorf("states after AddEntries = %v, want none", r.k.states)
+	}
+}
+
+// sortedTable returns the table of a model that holds entries, none
+// negated.
+func sortedTable(entries []netip.Prefix) map[netip.Prefix]bool {
+	t := map[netip.Prefix]bool{}
+	for _, e := range entries {
+		t[e.Masked()] = false
+	}
+	return t
+}
+
 func TestWritesUseTheTableCommandsAndAreIdempotent(t *testing.T) {
 	r := newRig(t)
 	mustLoad(t, r, compileRS(t, testPolicies))
@@ -437,9 +480,24 @@ func checkRemoveAndDrop(t *testing.T, r *rig) {
 	if _, ok := r.k.tables[ifb]["bing"]; ok {
 		t.Errorf("table bing exists after DropTable")
 	}
-	for _, verb := range []string{"add", "delete", "kill"} {
+	checkTableCalls(t, r)
+}
+
+// checkTableCalls checks that the table writes ran, each in the ifbound
+// anchor.
+func checkTableCalls(t *testing.T, r *rig) {
+	t.Helper()
+	if len(r.k.callsWith("DIOCRADDADDRS")) == 0 {
+		t.Error("no DIOCRADDADDRS call")
+	}
+	for _, verb := range []string{"delete", "kill"} {
 		if len(r.k.callsWith("-T", verb)) == 0 {
 			t.Errorf("no pfctl -T %s call", verb)
+		}
+	}
+	for _, c := range r.k.calls {
+		if strings.HasPrefix(c[0], "DIOCR") && c[1] != ifb {
+			t.Errorf("table ioctl outside the ifbound anchor: %v", c)
 		}
 	}
 	for _, c := range r.k.callsWith("-T") {
@@ -452,10 +510,12 @@ func checkRemoveAndDrop(t *testing.T, r *rig) {
 func TestWriteErrorsAreReported(t *testing.T) {
 	r := newRig(t)
 	mustLoad(t, r, compileRS(t, testPolicies))
-	r.k.fail = func(args []string) bool { return slices.Contains(args, "-T") && !slices.Contains(args, "show") }
+	r.k.fail = func(args []string) bool {
+		return args[0] == "DIOCRADDADDRS" || slices.Contains(args, "-T") && !slices.Contains(args, "show")
+	}
 	ctx := t.Context()
 	if err := r.b.AddEntries(ctx, "bing", pfx("192.0.2.1/32")); err == nil {
-		t.Errorf("AddEntries with a failing pfctl = nil, want an error")
+		t.Errorf("AddEntries with a failing DIOCRADDADDRS = nil, want an error")
 	}
 	if err := r.b.RemoveEntries(ctx, "bing", pfx("192.0.2.1/32")); err == nil {
 		t.Errorf("RemoveEntries with a failing pfctl = nil, want an error")
