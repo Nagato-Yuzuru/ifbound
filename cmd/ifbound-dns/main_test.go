@@ -211,7 +211,8 @@ func TestWatchExitsOnlyWhenDNSChanges(t *testing.T) {
 	requireRunning(t, done)
 
 	store(t, l, "127.0.0.1:10053", upstreamB, policyB)
-	ticks.tick(t)
+	// watch can see the change at the second tick already.
+	ticks.tickOrDone(done)
 	requireReturns(t, done)
 }
 
