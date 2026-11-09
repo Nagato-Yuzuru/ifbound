@@ -116,7 +116,7 @@ func unloadAfterAStop(t *testing.T, step []string, other bool) {
 		t.Fatal(err)
 	}
 	keep = append(keep, r.k.refs[len(r.k.refs)-1])
-	again := pfbackend.New(r.k, r.clk.now, slog.New(slog.DiscardHandler))
+	again := pfbackend.New(r.k, r.k, r.clk.now, slog.New(slog.DiscardHandler))
 	if err := again.Unload(t.Context()); err != nil {
 		t.Fatalf("second Unload: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestUnloadLeavesAReusedTokenValue(t *testing.T) {
 	if !slices.Equal(r.k.refs, []string{mine}) {
 		t.Fatalf("the other tool got %v, want the reused value %s", r.k.refs, mine)
 	}
-	again := pfbackend.New(r.k, r.clk.now, slog.New(slog.DiscardHandler))
+	again := pfbackend.New(r.k, r.k, r.clk.now, slog.New(slog.DiscardHandler))
 	if err := again.Unload(t.Context()); err != nil {
 		t.Fatalf("second Unload: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestLoadKeepsAnOldTokenThatDidNotGoBack(t *testing.T) {
 	r.k.fail = func(args []string) bool { return slices.Contains(args, "-X") }
 	mustLoad(t, r, compileRS(t, testPolicies))
 	r.k.fail = nil
-	again := pfbackend.New(r.k, r.clk.now, slog.New(slog.DiscardHandler))
+	again := pfbackend.New(r.k, r.k, r.clk.now, slog.New(slog.DiscardHandler))
 	if err := again.Unload(t.Context()); err != nil {
 		t.Fatalf("Unload: %v", err)
 	}
@@ -221,7 +221,7 @@ func (c ctxRunner) Run(ctx context.Context, stdin []byte, args ...string) (pfbac
 // that no label holds. Load gives it back with a new context.
 func TestLoadGivesBackTheNewTokenAfterACancel(t *testing.T) {
 	r := newRig(t)
-	b := pfbackend.New(ctxRunner{r.k}, r.clk.now, slog.New(slog.DiscardHandler))
+	b := pfbackend.New(ctxRunner{r.k}, r.k, r.clk.now, slog.New(slog.DiscardHandler))
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	r.k.fail = func(args []string) bool {
@@ -242,7 +242,7 @@ func TestLoadGivesBackTheNewTokenAfterACancel(t *testing.T) {
 // removes the enforcement.
 func TestUnloadWithACanceledContext(t *testing.T) {
 	r := newRig(t)
-	b := pfbackend.New(ctxRunner{r.k}, r.clk.now, slog.New(slog.DiscardHandler))
+	b := pfbackend.New(ctxRunner{r.k}, r.k, r.clk.now, slog.New(slog.DiscardHandler))
 	if err := b.Load(t.Context(), compileRS(t, testPolicies)); err != nil {
 		t.Fatal(err)
 	}

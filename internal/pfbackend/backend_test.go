@@ -113,7 +113,7 @@ func newRig(t *testing.T) *rig {
 			t.Errorf("the Backend ran pfctl -d %d times; it must never disable pf", k.disables)
 		}
 	})
-	return &rig{b: pfbackend.New(k, clk.now, slog.New(w)), k: k, clk: clk, log: w}
+	return &rig{b: pfbackend.New(k, k, clk.now, slog.New(w)), k: k, clk: clk, log: w}
 }
 
 func compileRS(t *testing.T, config string) reconcile.Ruleset {
@@ -271,6 +271,20 @@ func TestLoadedIDIsTheCompilerID(t *testing.T) {
 		if got := mustRead(t, r).Ruleset; got != rs.ID() {
 			t.Errorf("Read.Ruleset = %q, want the Compiler ID %q", got, rs.ID())
 		}
+	}
+}
+
+// A failed read of the pf status is an error, not a disabled pf: "" would
+// tell the Reconciler to load again.
+func TestLoadedIDFailsWhenTheStatusReadFails(t *testing.T) {
+	r := newRig(t)
+	mustLoad(t, r, compileRS(t, testPolicies))
+	r.k.fail = func(args []string) bool { return slices.Equal(args, []string{"DIOCGETSTATUS"}) }
+	if id, err := r.b.LoadedID(t.Context()); err == nil {
+		t.Errorf("LoadedID with a failing DIOCGETSTATUS = %q, nil; want an error", id)
+	}
+	if _, err := r.b.Read(t.Context()); err == nil {
+		t.Error("Read with a failing DIOCGETSTATUS = nil error, want an error")
 	}
 }
 

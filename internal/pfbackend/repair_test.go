@@ -291,7 +291,7 @@ func TestUnloadAfterRestart(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			r := newRig(t)
 			mustLoad(t, r, compileRS(t, testPolicies)) // the first ifboundd enables pf
-			again := pfbackend.New(r.k, r.clk.now, slog.New(slog.DiscardHandler))
+			again := pfbackend.New(r.k, r.k, r.clk.now, slog.New(slog.DiscardHandler))
 			r.clk.t = r.clk.t.Add(time.Minute)
 			if load {
 				if err := again.Load(t.Context(), compileRS(t, testPolicies)); err != nil {

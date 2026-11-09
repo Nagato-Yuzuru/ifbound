@@ -1,5 +1,5 @@
-// Package pfbackend implements reconcile.Backend with pfctl on macOS. It
-// is the only part of ifbound that writes pf.
+// Package pfbackend implements reconcile.Backend with pfctl and with ioctl
+// calls on /dev/pf on macOS. It is the only part of ifbound that writes pf.
 //
 // pf is a shared resource. The Backend changes only the ifbound anchor
 // Anchor, its tables, and its sub-anchors. It reads the main ruleset and
@@ -47,8 +47,8 @@
 // the Backend leaves it. A token that the Backend fails to give back
 // stays in the labels, and the next Load or Unload tries again.
 //
-// Every pfctl call goes through a Runner, so the logic runs without pf
-// and without root.
+// Every pfctl call goes through a Runner, and every ioctl call goes
+// through a Device, so the logic runs without pf and without root.
 package pfbackend
 
 import (
@@ -65,6 +65,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
+	"github.com/Nagato-Yuzuru/ifbound/pf"
 )
 
 const (
@@ -94,10 +95,19 @@ var (
 // noTable is the message of pfctl for a table that does not exist.
 const noTable = "Table does not exist."
 
-// Backend implements reconcile.Backend with pfctl. It is not safe for
-// concurrent use. Build one with New.
+// Device is the part of /dev/pf that the Backend uses through ioctl.
+// *pf.Handle implements it.
+type Device interface {
+	Status() (pf.Status, error)
+}
+
+var _ Device = (*pf.Handle)(nil)
+
+// Backend implements reconcile.Backend with pfctl and with ioctl calls
+// on /dev/pf. It is not safe for concurrent use. Build one with New.
 type Backend struct {
 	run Runner
+	dev Device
 	now func() time.Time
 	log *slog.Logger
 	// tokens are the pf references that ifbound holds, or none when it
@@ -113,10 +123,11 @@ type Backend struct {
 var _ reconcile.Backend = (*Backend)(nil)
 
 // New returns a Backend that runs pfctl through run (Exec{Path: Path} on
-// macOS). Now is the clock of the rate limit of "pfctl -E". Log gets a
-// warning each time the Backend enables pf.
-func New(run Runner, now func() time.Time, log *slog.Logger) *Backend {
-	return &Backend{run: run, now: now, log: log}
+// macOS) and calls ioctl through dev (a handle from pf.Open on macOS). Now
+// is the clock of the rate limit of "pfctl -E". Log gets a warning each
+// time the Backend enables pf.
+func New(run Runner, dev Device, now func() time.Time, log *slog.Logger) *Backend {
+	return &Backend{run: run, dev: dev, now: now, log: log}
 }
 
 // Read implements reconcile.Backend. Tables holds every table of the
@@ -146,7 +157,8 @@ func (b *Backend) Read(ctx context.Context) (reconcile.BackendState, error) {
 	return reconcile.BackendState{Ruleset: id, Tables: tables, Problems: problems}, nil
 }
 
-// LoadedID implements reconcile.Backend. It runs pfctl twice.
+// LoadedID implements reconcile.Backend. It reads the pf status and runs
+// pfctl once.
 func (b *Backend) LoadedID(ctx context.Context) (string, error) {
 	_, id, err := b.loaded(ctx)
 	return id, err
@@ -157,7 +169,7 @@ func (b *Backend) LoadedID(ctx context.Context) (string, error) {
 // Backend knows no token, it takes the tokens from the anchor, where an
 // earlier process of ifbound wrote them.
 func (b *Backend) loaded(ctx context.Context) (enabled bool, id string, err error) {
-	enabled, err = b.enabled(ctx)
+	enabled, err = b.enabled()
 	if err != nil {
 		return false, "", err
 	}
@@ -180,12 +192,12 @@ func (b *Backend) loaded(ctx context.Context) (enabled bool, id string, err erro
 	return true, id, nil
 }
 
-func (b *Backend) enabled(ctx context.Context) (bool, error) {
-	out, err := b.pfctl(ctx, nil, "-s", "info")
+func (b *Backend) enabled() (bool, error) {
+	s, err := b.dev.Status()
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("reading the pf status: %w", err)
 	}
-	return parseStatus(out.Stdout)
+	return s.Running, nil
 }
 
 // Load implements reconcile.Backend. It takes a new pf reference (this

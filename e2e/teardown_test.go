@@ -54,10 +54,10 @@ func (stopResolver) Remove(context.Context, policy.Domain) error { return errSto
 
 // newTeardown returns a teardown on a new Backend, as a new process of
 // uninstall has.
-func newTeardown(run pfbackend.Runner, res reconcile.SysResolver) teardown.Teardown {
+func newTeardown(run pfbackend.Runner, dev pfbackend.Device, res reconcile.SysResolver) teardown.Teardown {
 	return teardown.Teardown{
 		Lock:     layout.EnforcementLock,
-		Backend:  pfbackend.New(run, time.Now, slog.New(slog.DiscardHandler)),
+		Backend:  pfbackend.New(run, dev, time.Now, slog.New(slog.DiscardHandler)),
 		Resolver: res,
 	}
 }
@@ -72,11 +72,13 @@ func enforce(t *testing.T) {
 	t.Helper()
 	requireE2E(t)
 	requireResolverE2E(t)
+	// The cleanup below runs before the cleanup of openPf closes dev.
+	dev := openPf(t)
 	t.Cleanup(func() {
 		// t.Context is already canceled when cleanups run.
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		if err := newTeardown(pfbackend.Exec{Path: pfbackend.Path}, hostResolver()).Run(ctx); err != nil {
+		if err := newTeardown(pfbackend.Exec{Path: pfbackend.Path}, dev, hostResolver()).Run(ctx); err != nil {
 			t.Errorf("cleanup teardown: %v", err)
 		}
 	})
@@ -89,7 +91,7 @@ func enforce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := pfbackend.New(pfbackend.Exec{Path: pfbackend.Path}, time.Now, slog.New(slog.DiscardHandler))
+	b := pfbackend.New(pfbackend.Exec{Path: pfbackend.Path}, dev, time.Now, slog.New(slog.DiscardHandler))
 	rec := reconcile.Reconciler{
 		Compiler:  pfrules.Compiler{},
 		Backend:   b,
@@ -175,7 +177,7 @@ func requireTornDown(t *testing.T, refs []string) {
 func TestTeardownRemovesTheEnforcement(t *testing.T) {
 	refs := references(t)
 	enforce(t)
-	if err := newTeardown(pfbackend.Exec{Path: pfbackend.Path}, hostResolver()).Run(t.Context()); err != nil {
+	if err := newTeardown(pfbackend.Exec{Path: pfbackend.Path}, openPf(t), hostResolver()).Run(t.Context()); err != nil {
 		t.Fatalf("teardown: %v", err)
 	}
 	requireTornDown(t, refs)
@@ -214,7 +216,7 @@ func TestTeardownFinishesAfterAStop(t *testing.T) {
 			if s.resolver {
 				res = stopResolver{res}
 			}
-			first := newTeardown(stopRunner{Runner: pfbackend.Exec{Path: pfbackend.Path}, stop: s.pf}, res)
+			first := newTeardown(stopRunner{Runner: pfbackend.Exec{Path: pfbackend.Path}, stop: s.pf}, openPf(t), res)
 			// The Backend keeps the cause of a pfctl failure in the text only.
 			if err := first.Run(t.Context()); err == nil || !strings.Contains(err.Error(), errStop.Error()) {
 				t.Fatalf("teardown with a stop = %v, want the injected stop", err)
@@ -235,7 +237,7 @@ func TestTeardownFinishesAfterAStop(t *testing.T) {
 			}
 			refs = append(refs, other)
 			slices.Sort(refs)
-			if err := newTeardown(pfbackend.Exec{Path: pfbackend.Path}, hostResolver()).Run(t.Context()); err != nil {
+			if err := newTeardown(pfbackend.Exec{Path: pfbackend.Path}, openPf(t), hostResolver()).Run(t.Context()); err != nil {
 				t.Fatalf("second teardown: %v", err)
 			}
 			requireTornDown(t, refs)
@@ -268,7 +270,7 @@ func otherReference(t *testing.T) string {
 func TestTeardownKeepsADisabledPfDisabled(t *testing.T) {
 	enforce(t)
 	pfctl(t, "-d") // the user disables pf; this drops every token
-	if err := newTeardown(pfbackend.Exec{Path: pfbackend.Path}, hostResolver()).Run(t.Context()); err != nil {
+	if err := newTeardown(pfbackend.Exec{Path: pfbackend.Path}, openPf(t), hostResolver()).Run(t.Context()); err != nil {
 		t.Fatalf("teardown: %v", err)
 	}
 	if got := pfctlStdout(t, "-s", "info"); !strings.Contains(got, "Status: Disabled") {
@@ -327,7 +329,7 @@ func TestTeardownWhileTheLockIsHeld(t *testing.T) {
 		t.Fatalf("lock holder said %q, %v; want held", line, err)
 	}
 
-	err = newTeardown(pfbackend.Exec{Path: pfbackend.Path}, hostResolver()).Run(t.Context())
+	err = newTeardown(pfbackend.Exec{Path: pfbackend.Path}, openPf(t), hostResolver()).Run(t.Context())
 	if !errors.Is(err, enforcementlock.ErrHeld) {
 		t.Fatalf("teardown while another process holds the lock = %v, want ErrHeld", err)
 	}

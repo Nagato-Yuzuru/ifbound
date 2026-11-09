@@ -37,7 +37,7 @@ func newPfBackend(t *testing.T) (*pfbackend.Backend, *testClock) {
 	t.Helper()
 	requireE2E(t)
 	c := &testClock{t: time.Now()}
-	b := pfbackend.New(pfbackend.Exec{Path: pfbackend.Path}, c.now, slog.New(slog.DiscardHandler))
+	b := pfbackend.New(pfbackend.Exec{Path: pfbackend.Path}, openPf(t), c.now, slog.New(slog.DiscardHandler))
 	t.Cleanup(func() {
 		// t.Context is already canceled when cleanups run.
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -424,7 +424,7 @@ func TestPfBackendUnloadAfterRestart(t *testing.T) {
 	if got := references(t); len(got) != len(before)+1 {
 		t.Fatalf("references after Load = %v, want one more than %v", got, before)
 	}
-	again := pfbackend.New(pfbackend.Exec{Path: pfbackend.Path}, time.Now, slog.New(slog.DiscardHandler))
+	again := pfbackend.New(pfbackend.Exec{Path: pfbackend.Path}, openPf(t), time.Now, slog.New(slog.DiscardHandler))
 	readState(t, again)
 	if err := again.Unload(t.Context()); err != nil {
 		t.Fatalf("Unload by the restarted Backend: %v", err)
