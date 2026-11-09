@@ -14,7 +14,8 @@ import (
 
 // Errors that callers can test with errors.Is.
 var (
-	// ErrNotFound: the table or the anchor does not exist.
+	// ErrNotFound: the table, the anchor, or the reference token does not
+	// exist.
 	ErrNotFound = errors.New("not found")
 	// ErrChanged: the ruleset changed while Handle.Rules read it.
 	ErrChanged = errors.New("ruleset changed during the read")

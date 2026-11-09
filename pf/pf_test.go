@@ -32,6 +32,9 @@ func TestLayout(t *testing.T) {
 		{"DIOCGETRULE", diocGetRule, unsafe.Sizeof(pfiocRule{})},
 		{"DIOCGETRULESETS", diocGetRulesets, unsafe.Sizeof(pfiocRuleset{})},
 		{"DIOCGETRULESET", diocGetRuleset, unsafe.Sizeof(pfiocRuleset{})},
+		{"DIOCSTARTREF", diocStartRef, unsafe.Sizeof(uint64(0))},
+		{"DIOCSTOPREF", diocStopRef, unsafe.Sizeof(pfiocRemoveToken{})},
+		{"DIOCGETSTARTERS", diocGetStarters, unsafe.Sizeof(pfiocTokens{})},
 	}
 	for _, tt := range tests {
 		if got := ioctlSize(tt.req); got != tt.size {

@@ -25,6 +25,13 @@ enum {
 	offIocRuleAnchor = offsetof(struct pfioc_rule, anchor),
 	offIocRuleAnchorCall = offsetof(struct pfioc_rule, anchor_call),
 	offIocRuleRule = offsetof(struct pfioc_rule, rule),
+
+	// struct pfioc_token is packed: its size is 84, but a Go struct with a
+	// uint64 field has the size 88. The package reads it as bytes.
+	sizeofPfiocToken = sizeof(struct pfioc_token),
+	offTokenTimestamp = offsetof(struct pfioc_token, timestamp),
+	offTokenPid = offsetof(struct pfioc_token, pid),
+	offTokenProcName = offsetof(struct pfioc_token, proc_name),
 };
 */
 import "C"
@@ -37,6 +44,8 @@ type pfAddrWrap C.struct_pf_addr_wrap
 type pfiocStateAddrKill C.struct_pfioc_state_addr_kill
 type pfiocStateKill C.struct_pfioc_state_kill
 type pfStatus C.struct_pf_status
+type pfiocRemoveToken C.struct_pfioc_remove_token
+type pfiocTokens C.struct_pfioc_tokens
 
 const (
 	sizeofPfRule         = C.sizeofPfRule
@@ -50,6 +59,12 @@ const (
 	offIocRuleAnchorCall = C.offIocRuleAnchorCall
 	offIocRuleRule       = C.offIocRuleRule
 	ruleLabelSize        = C.PF_RULE_LABEL_SIZE
+
+	sizeofPfiocToken  = C.sizeofPfiocToken
+	offTokenTimestamp = C.offTokenTimestamp
+	offTokenPid       = C.offTokenPid
+	offTokenProcName  = C.offTokenProcName
+	tokenProcNameSize = C.PFTOK_PROCNAME_LEN
 )
 
 const (
@@ -64,6 +79,9 @@ const (
 	diocRAddAddrs   = C.DIOCRADDADDRS
 	diocRDelAddrs   = C.DIOCRDELADDRS
 	diocRGetAddrs   = C.DIOCRGETADDRS
+	diocStartRef    = C.DIOCSTARTREF
+	diocStopRef     = C.DIOCSTOPREF
+	diocGetStarters = C.DIOCGETSTARTERS
 )
 
 const (
