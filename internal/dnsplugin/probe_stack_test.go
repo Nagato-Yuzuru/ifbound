@@ -12,6 +12,7 @@ package dnsplugin
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -29,6 +30,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/hostsfile/hostsfs"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
@@ -123,16 +125,42 @@ func pvSocket(t *testing.T) string {
 }
 
 // pvCounter is the ipc.Handler of the daemon. It counts the reports that
-// reached the server.
+// reached the server, and closes full at report pvReportSlots.
 type pvCounter struct {
 	*daemon.Daemon
-	in atomic.Int32
+	in   atomic.Int32
+	full chan struct{}
 }
 
 func (c *pvCounter) Observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
-	c.in.Add(1)
+	if c.in.Add(1) == pvReportSlots {
+		close(c.full)
+	}
 	return c.Daemon.Observe(ctx, o)
 }
+
+// pvReady is the log handler of the daemon. It closes ready at the first
+// record that sets the enforcement state to ready.
+type pvReady struct {
+	ready chan struct{}
+	once  sync.Once
+}
+
+func (r *pvReady) Enabled(context.Context, slog.Level) bool { return true }
+
+func (r *pvReady) Handle(_ context.Context, rec slog.Record) error {
+	rec.Attrs(func(a slog.Attr) bool {
+		if a.Key == logattr.EnforcementState && a.Value.String() == logattr.StateReady {
+			r.once.Do(func() { close(r.ready) })
+			return false
+		}
+		return true
+	})
+	return nil
+}
+
+func (r *pvReady) WithAttrs([]slog.Attr) slog.Handler { return r }
+func (r *pvReady) WithGroup(string) slog.Handler      { return r }
 
 func pvUID() uint32 { return uint32(os.Getuid()) } //nolint:gosec // a uid is never negative on unix
 
@@ -152,6 +180,7 @@ func pvStack(t *testing.T, timeout time.Duration) (*handler, *pvCounter, *reconc
 	if err := os.WriteFile(store, []byte(pvStackConfig), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	ready := &pvReady{ready: make(chan struct{})}
 	d := daemon.New(daemon.Config{
 		ConfigPath: store,
 		ConfigGID:  -1,
@@ -163,8 +192,9 @@ func pvStack(t *testing.T, timeout time.Duration) (*handler, *pvCounter, *reconc
 			Inventory: reconciletest.NewInventory(reconcile.Interface{Name: "en0", Class: policy.ClassHardware}),
 		},
 		Lookup: mdns,
+		Logger: slog.New(ready),
 	})
-	counter := &pvCounter{Daemon: d}
+	counter := &pvCounter{Daemon: d, full: make(chan struct{})}
 	path := pvSocket(t)
 	srv, err := ipc.Listen(ipc.ServerConfig{Path: path, Handler: counter, Probes: d, AllowedUIDs: []uint32{pvUID()}})
 	if err != nil {
@@ -182,17 +212,15 @@ func pvStack(t *testing.T, timeout time.Duration) (*handler, *pvCounter, *reconc
 	// The warm-up of the daemon sends probes to the plugin, so Run starts
 	// after the plugin is set.
 	go func() { _ = d.Run(ctx) }() //nolint:errcheck // Run ends with ctx; the test reads the daemon status instead
-	for {
-		st, err := d.Status(ctx)
-		if err == nil && st.State == daemon.StateReady {
-			return h, counter, world
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("daemon not ready: %+v %v", st, err)
-		case <-time.After(10 * time.Millisecond): // polls the daemon start; no other signal exists
-		}
+	// The loop writes the record after it changes its mode and before it
+	// publishes the status, so Status can still show the old state. Each
+	// report runs on the loop after the change.
+	select {
+	case <-ready.ready:
+	case <-ctx.Done():
+		t.Fatal("the daemon did not log the state ready")
 	}
+	return h, counter, world
 }
 
 func TestPVProbesPassWhileTheLoopAndEveryReportSlotWait(t *testing.T) {
@@ -234,8 +262,10 @@ func TestPVProbesPassWhileTheLoopAndEveryReportSlotWait(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("no report reached the platform")
 	}
-	for counter.in.Load() < pvReportSlots {
-		time.Sleep(time.Millisecond) // waits for the slots to fill; no other signal exists
+	select {
+	case <-counter.full:
+	case <-ctx.Done():
+		t.Fatal("the reports did not fill the slots")
 	}
 
 	for i := range 4 {
