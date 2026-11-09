@@ -185,8 +185,9 @@ func resolve(t *testing.T, name string) []netip.Addr {
 
 // queryRecord asks the system resolver for name and qtype as
 // DNSServiceQueryRecord does, the API under URLSession and NWConnection
-// for HTTPS records. dns-sd runs until it is killed, so the context ends
-// it after the answer has had time to come.
+// for HTTPS records. dns-sd runs until it is killed and prints no line at
+// the end of the answers, so no event shows that all answers came. The
+// context ends it after the answers have had time to come.
 func queryRecord(t *testing.T, name string, qtype uint16) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)

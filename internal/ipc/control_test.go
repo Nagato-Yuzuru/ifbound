@@ -309,7 +309,9 @@ func TestApplyIsNotStartedAfterItsDeadline(t *testing.T) {
 	if n := len(h.appliedConfigs()); n != 0 {
 		t.Fatalf("%d late requests reached Apply", n)
 	}
-	// The fixture is sound: a deadline in time reaches Apply.
+	// The fixture is sound: a deadline in time reaches Apply. The server
+	// compares the deadline with the real clock, so the 3 s leave 2.5 s
+	// after controlReplyMargin for the exchange.
 	if env, _ := rawExchange(t, path, applyFrame(time.Now().Add(3*time.Second))); env.Type != typeAck {
 		t.Errorf("reply %+v, want an ack", env)
 	}

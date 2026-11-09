@@ -25,7 +25,11 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/testenv"
 )
 
-// delayedAck is a fake ifboundd that acks every report after delay.
+// delayedAck is a fake ifboundd that acks every report after delay. The
+// plugin sends no event when it holds an answer, so the delay makes the
+// hold visible: an answer that does not wait for the ack comes before
+// delay ends. A slow host can only hide that bug, not fail a correct
+// plugin.
 type delayedAck struct {
 	delay   time.Duration
 	reports atomic.Int64

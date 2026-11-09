@@ -193,6 +193,8 @@ func TestUnknownObserveFieldIsIgnored(t *testing.T) {
 			if got.obs.QName != want.QName || got.obs.TTL != want.TTL || !slices.Equal(got.obs.Addrs, want.Addrs) {
 				t.Errorf("observation = %+v, want %+v", got.obs, want)
 			}
+			// The server is on a real socket and uses the real clock, so the
+			// handler gets less than 5 s. The 1 s of slack covers the exchange.
 			if got.deadline <= 4*time.Second || got.deadline > 5*time.Second {
 				t.Errorf("handler deadline = %v, want the 5 s that the old plugin asked for", got.deadline)
 			}

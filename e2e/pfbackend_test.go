@@ -214,7 +214,9 @@ var errNoAnswer = errors.New("no answer before the deadline")
 
 // udpExchange sends one datagram on a connected UDP socket and waits 2 s
 // for an answer or an error. A block with ICMP port unreachable gives
-// ECONNREFUSED; a packet that leaves gets no answer here.
+// ECONNREFUSED; a packet that leaves gets no answer here. A packet that
+// passes causes no event, so only the end of the wait shows that no
+// reject came.
 func udpExchange(t *testing.T, to netip.AddrPort) error {
 	t.Helper()
 	var d net.Dialer
