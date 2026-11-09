@@ -482,6 +482,8 @@ func TestLoadRejectsBadSnapshots(t *testing.T) {
 		"expiry < seen":     doc(entryJSON(with("expiry_unix_nano", 0))),
 		"duplicate entry":   doc(entryJSON(), entryJSON()),
 		"one bad of two":    doc(entryJSON(), entryJSON(with("policy", ""), with("addr", "192.0.2.2"))),
+		"invalid UTF-8":     doc(strings.Replace(entryJSON(), `"policy":"p"`, "\"policy\":\"p\xff\"", 1)),
+		"entries object":    `{"version":1,"entries":{}}`,
 	}
 	for name, content := range tests {
 		t.Run(name, func(t *testing.T) {

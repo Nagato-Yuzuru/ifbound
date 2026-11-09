@@ -1,11 +1,10 @@
 package addrbook
 
 import (
-	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"maps"
 	"net/netip"
@@ -46,7 +45,7 @@ var (
 )
 
 var (
-	errNull             = errors.New("null value")
+	errMissing          = errors.New("missing or null")
 	errEmptyName        = errors.New("empty policy name")
 	errNotCanonical     = errors.New("key is not in canonical form")
 	errExpiryBeforeSeen = errors.New("expiry before last_seen")
@@ -69,22 +68,6 @@ type snapshotEntry struct {
 	LastSeenNano int64       `json:"last_seen_unix_nano"`
 	TTLNano      int64       `json:"ttl_nano"`
 	ExpiryNano   int64       `json:"expiry_unix_nano"`
-}
-
-// topFields returns the top-level keys of a snapshot version. The bool
-// is false for a version that Load does not know.
-func topFields(version int) ([]string, bool) {
-	switch version {
-	case snapshotVersion:
-		return []string{"version", "entries"}, true
-	case aliasesVersion:
-		return []string{"version", "entries", "aliases"}, true
-	}
-	return nil, false
-}
-
-func entryFields() []string {
-	return []string{"policy", "addr", "last_seen_unix_nano", "ttl_nano", "expiry_unix_nano"}
 }
 
 // Save writes the book to path. It removes the temporary files of earlier
@@ -259,38 +242,54 @@ func badf(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrSnapshot, fmt.Sprintf(format, args...))
 }
 
+// decode reads a snapshot. It accepts each key once, spelled exactly,
+// and nothing after the document. It decodes in two passes: the key set
+// depends on the version.
 func (b *AddrBook) decode(data []byte) (map[policy.Name]map[netip.Addr]*record, error) {
-	top, err := objectFields(data)
-	if err != nil {
-		return nil, err
+	var head struct {
+		Version *int `json:"version"`
 	}
-	if _, ok := top["version"]; !ok {
-		return nil, badf("missing key %q", "version")
+	if err := json.Unmarshal(data, &head); err != nil {
+		return nil, badf("%v", err)
 	}
-	var version int
-	if err := json.Unmarshal(top["version"], &version); err != nil {
-		return nil, badf("unknown version %s", top["version"])
+	switch {
+	case head.Version == nil:
+		return nil, badf("missing or null key %q", "version")
+	case *head.Version != snapshotVersion && *head.Version != aliasesVersion:
+		return nil, badf("unknown version %d", *head.Version)
 	}
-	want, ok := topFields(version)
-	if !ok {
-		return nil, badf("unknown version %s", top["version"])
+	var doc struct {
+		Version int            `json:"version"`
+		Entries *[]loadedEntry `json:"entries"`
+		Aliases jsontext.Value `json:"aliases"`
 	}
-	if err := exactFields(top, want); err != nil {
-		return nil, err
+	if err := json.Unmarshal(data, &doc, json.RejectUnknownMembers(true)); err != nil {
+		return nil, badf("%v", err)
 	}
-	entries, err := b.decodeEntries(top["entries"])
+	if doc.Entries == nil {
+		return nil, badf("missing or null key %q", "entries")
+	}
+	switch {
+	case doc.Version == snapshotVersion && doc.Aliases != nil:
+		return nil, badf("version %d has no key %q", doc.Version, "aliases")
+	case doc.Version == aliasesVersion && doc.Aliases.Kind() != '[':
+		return nil, badf("aliases: %v", errNotArray)
+	}
+	entries, err := b.decodeEntries(*doc.Entries)
 	if err != nil {
 		return nil, badf("entries: %v", err)
-	}
-	if raw, ok := top["aliases"]; ok && !isArray(raw) {
-		return nil, badf("aliases: %v", errNotArray)
 	}
 	return entries, nil
 }
 
-func isArray(raw json.RawMessage) bool {
-	raw = bytes.TrimSpace(raw)
-	return len(raw) > 0 && raw[0] == '['
+// loadedEntry is a snapshotEntry as Load reads it. A nil field is a key
+// that is missing or null.
+type loadedEntry struct {
+	Policy       *string `json:"policy"`
+	Addr         *string `json:"addr"`
+	LastSeenNano *int64  `json:"last_seen_unix_nano"`
+	TTLNano      *int64  `json:"ttl_nano"`
+	ExpiryNano   *int64  `json:"expiry_unix_nano"`
 }
 
 func parseAddr(s string) (netip.Addr, error) {
@@ -304,24 +303,12 @@ func parseAddr(s string) (netip.Addr, error) {
 	return a, nil
 }
 
-// decodeEntries decodes the JSON array of entries.
-func (b *AddrBook) decodeEntries(raw json.RawMessage) (map[policy.Name]map[netip.Addr]*record, error) {
-	if !isArray(raw) {
-		return nil, errNotArray
-	}
-	var items []json.RawMessage
-	if err := json.Unmarshal(raw, &items); err != nil {
-		return nil, err
-	}
+func (b *AddrBook) decodeEntries(items []loadedEntry) (map[policy.Name]map[netip.Addr]*record, error) {
 	out := make(map[policy.Name]map[netip.Addr]*record)
 	for i, item := range items {
-		name, addrText, r, err := b.decodeEntry(item)
+		name, k, r, err := b.decodeEntry(item)
 		if err != nil {
 			return nil, fmt.Errorf("item %d: %w", i, err)
-		}
-		k, err := parseAddr(addrText)
-		if err != nil {
-			return nil, fmt.Errorf("item %d: addr: %w", i, err)
 		}
 		if out[name] == nil {
 			out[name] = make(map[netip.Addr]*record)
@@ -334,40 +321,33 @@ func (b *AddrBook) decodeEntries(raw json.RawMessage) (map[policy.Name]map[netip
 	return out, nil
 }
 
-// decodeEntry decodes one entry. It returns the text of the address
-// unparsed.
-func (b *AddrBook) decodeEntry(item json.RawMessage) (policy.Name, string, *record, error) {
-	f, err := objectFields(item)
-	if err != nil {
-		return "", "", nil, err
-	}
-	if err := exactFields(f, entryFields()); err != nil {
-		return "", "", nil, err
-	}
-	var (
-		name                       string
-		addrText                   string
-		seenNano, ttlNano, expNano int64
-	)
-	targets := map[string]any{
-		"policy": &name, "addr": &addrText,
-		"last_seen_unix_nano": &seenNano, "ttl_nano": &ttlNano, "expiry_unix_nano": &expNano,
-	}
-	for field, dst := range targets {
-		if string(bytes.TrimSpace(f[field])) == "null" {
-			return "", "", nil, fmt.Errorf("%s: %w", field, errNull)
-		}
-		if err := json.Unmarshal(f[field], dst); err != nil {
-			return "", "", nil, fmt.Errorf("%s: %w", field, err)
+func (b *AddrBook) decodeEntry(e loadedEntry) (policy.Name, netip.Addr, *record, error) {
+	for _, f := range []struct {
+		key     string
+		missing bool
+	}{
+		{"policy", e.Policy == nil},
+		{"addr", e.Addr == nil},
+		{"last_seen_unix_nano", e.LastSeenNano == nil},
+		{"ttl_nano", e.TTLNano == nil},
+		{"expiry_unix_nano", e.ExpiryNano == nil},
+	} {
+		if f.missing {
+			return "", netip.Addr{}, nil, fmt.Errorf("%s: %w", f.key, errMissing)
 		}
 	}
+	seenNano, ttlNano, expNano := *e.LastSeenNano, *e.TTLNano, *e.ExpiryNano
 	switch {
-	case name == "":
-		return "", "", nil, errEmptyName
+	case *e.Policy == "":
+		return "", netip.Addr{}, nil, errEmptyName
 	case ttlNano < 0:
-		return "", "", nil, ErrNegativeTTL
+		return "", netip.Addr{}, nil, ErrNegativeTTL
 	case expNano < seenNano:
-		return "", "", nil, errExpiryBeforeSeen
+		return "", netip.Addr{}, nil, errExpiryBeforeSeen
+	}
+	k, err := parseAddr(*e.Addr)
+	if err != nil {
+		return "", netip.Addr{}, nil, fmt.Errorf("addr: %w", err)
 	}
 	r := &record{
 		lastSeen:    time.Unix(0, seenNano).UTC(),
@@ -378,54 +358,5 @@ func (b *AddrBook) decodeEntry(item json.RawMessage) (policy.Name, string, *reco
 	if floor := r.lastSeen.Add(max(r.ttl, b.retain)); floor.After(r.expiry) {
 		r.expiry = floor
 	}
-	return policy.Name(name), addrText, r, nil
-}
-
-// objectFields splits a JSON object into its raw values. It accepts each
-// key once, spelled exactly, and nothing after the object. The caller
-// checks the key set with exactFields. The standard decoder folds key
-// case and allows duplicate keys, so the walk is by hand.
-func objectFields(data []byte) (map[string]json.RawMessage, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return nil, badf("not an object")
-	}
-	fields := make(map[string]json.RawMessage)
-	for dec.More() {
-		tok, err := dec.Token()
-		key, isStr := tok.(string)
-		if err != nil || !isStr {
-			return nil, badf("malformed object")
-		}
-		if _, dup := fields[key]; dup {
-			return nil, badf("duplicate key %q", key)
-		}
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
-			return nil, badf("key %q: %v", key, err)
-		}
-		fields[key] = raw
-	}
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
-		return nil, badf("malformed object")
-	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return nil, badf("data after the document")
-	}
-	return fields, nil
-}
-
-// exactFields checks that fields has each key of want and no other key.
-func exactFields(fields map[string]json.RawMessage, want []string) error {
-	for _, k := range want {
-		if _, ok := fields[k]; !ok {
-			return badf("missing key %q", k)
-		}
-	}
-	for k := range fields {
-		if !slices.Contains(want, k) {
-			return badf("unknown key %q", k)
-		}
-	}
-	return nil
+	return policy.Name(*e.Policy), k, r, nil
 }
