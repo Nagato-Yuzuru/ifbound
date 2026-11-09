@@ -16,7 +16,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/testnet"
 )
 
-func requireE2E(t *testing.T) {
+func requireE2E(t testing.TB) {
 	t.Helper()
 	testenv.RequireOS(t, "darwin")
 	testenv.RequireRoot(t)

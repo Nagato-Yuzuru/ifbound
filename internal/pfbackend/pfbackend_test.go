@@ -102,8 +102,14 @@ func TestLoadedIDAfterExternalChange(t *testing.T) {
 			f.anchors[Anchor+"/tag.bing/z"] = []string{"pass out quick all no state"}
 		}},
 		{"pf disabled", func(f *fakePF) { f.enabled, f.tokens = false, nil }},
-		{"pfctl cannot read a sub-anchor", func(f *fakePF) {
-			f.complain = func(args []string) bool { return slices.Contains(args, Anchor+"/*") }
+		{"rule in a sub-anchor that no rule calls", func(f *fakePF) {
+			f.anchors[Anchor+"/other"] = []string{"pass out quick all no state"}
+		}},
+		{"NAT rule in the anchor", func(f *fakePF) {
+			f.nat[Anchor] = []string{"nat pass on en0 inet from any to 192.0.2.11 -> (en0)"}
+		}},
+		{"scrub rule in a sub-anchor", func(f *fakePF) {
+			f.anchors[Anchor+"/tag.bing"] = []string{"scrub out all max-mss 1200"}
 		}},
 	}
 	for _, tt := range tests {
@@ -435,9 +441,39 @@ func TestPfctlFailure(t *testing.T) {
 		t.Errorf("Read with a failing pfctl: error = %v, want errPfctl", err)
 	}
 	f.states[netip.MustParseAddr("198.51.100.1")] = true
-	f.fail = func(args []string) bool { return slices.Contains(args, "-k") }
-	if err := b.AddEntries(t.Context(), "bing", prefixes("198.51.100.1/32")); !errors.Is(err, errPfctl) {
-		t.Errorf("AddEntries with a failing state kill: error = %v, want errPfctl", err)
+	f.fail = func(args []string) bool { return args[0] == "DIOCKILLSTATES" }
+	if err := b.AddEntries(t.Context(), "bing", prefixes("198.51.100.1/32")); err == nil || !strings.Contains(err.Error(), "injected failure") {
+		t.Errorf("AddEntries with a failing state kill: error = %v, want the injected failure", err)
+	}
+}
+
+// pf never evaluates the NAT rules of a sub-anchor: the anchor holds no
+// nat-anchor rule. Load does not flush them, so they do not change the
+// ID. Else the Reconciler would load again and again.
+func TestLoadedIDIgnoresNATRulesOfASubAnchor(t *testing.T) {
+	b, f, _ := newTest(t)
+	rs := compile(t, testConfig)
+	if err := b.Load(t.Context(), rs); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	f.nat[Anchor+"/tag.bing"] = []string{"nat on en0 inet from any to 192.0.2.11 -> (en0)"}
+	if got := loadedID(t, b); got != rs.ID() {
+		t.Errorf("loaded ID with a NAT rule in a sub-anchor = %q, want %q", got, rs.ID())
+	}
+}
+
+// A read that fails in the middle never gives the ID of the loaded
+// ruleset: the anchor below can hold a rule that the read did not see.
+func TestLoadedIDWhenAReadFails(t *testing.T) {
+	b, f, _ := newTest(t)
+	if err := b.Load(t.Context(), compile(t, testConfig)); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	f.fail = func(args []string) bool {
+		return args[0] == "DIOCGETRULES" && strings.HasPrefix(args[1], Anchor+"/")
+	}
+	if id, err := b.LoadedID(t.Context()); err == nil || id != "" {
+		t.Errorf("LoadedID with a failing read of a sub-anchor = (%q, %v), want an error", id, err)
 	}
 }
 

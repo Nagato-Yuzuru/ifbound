@@ -33,7 +33,7 @@ func (c *testClock) now() time.Time { return c.t }
 
 // newPfBackend returns a Backend on the real pfctl, with a clock that the
 // test moves.
-func newPfBackend(t *testing.T) (*pfbackend.Backend, *testClock) {
+func newPfBackend(t testing.TB) (*pfbackend.Backend, *testClock) {
 	t.Helper()
 	requireE2E(t)
 	c := &testClock{t: time.Now()}
@@ -49,7 +49,7 @@ func newPfBackend(t *testing.T) (*pfbackend.Backend, *testClock) {
 	return b, c
 }
 
-func compilePolicies(t *testing.T, config string, ifaces ...reconcile.Interface) reconcile.Ruleset {
+func compilePolicies(t testing.TB, config string, ifaces ...reconcile.Interface) reconcile.Ruleset {
 	t.Helper()
 	cfg, err := policy.ParseBytes([]byte("[dns]\nupstream = [\"tls://1.1.1.1@a.example\"]\n" + config))
 	if err != nil {
@@ -71,7 +71,19 @@ func pfctl(t testing.TB, args ...string) string {
 	return string(out)
 }
 
-func load(t *testing.T, b *pfbackend.Backend, rs reconcile.Ruleset) {
+// loadOnly loads rules into the anchor as another tool does. Flag "-N"
+// loads only the NAT rules, "-R" only the filter rules: the other
+// rulesets of the anchor stay.
+func loadOnly(t *testing.T, anchor, flag, rules string) {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), pfbackend.Path, "-a", anchor, flag, "-f", "-")
+	cmd.Stdin = strings.NewReader(rules)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("load %q into %s: %v: %s", rules, anchor, err, out)
+	}
+}
+
+func load(t testing.TB, b *pfbackend.Backend, rs reconcile.Ruleset) {
 	t.Helper()
 	if err := b.Load(t.Context(), rs); err != nil {
 		t.Fatalf("Load: %v", err)
@@ -115,6 +127,52 @@ name     = "e2e-a"
 to       = ["192.0.2.0/24"]
 only_via = []
 `
+
+// benchPolicies are four policies, two of them with an anchor rule and a
+// sub-anchor, as the ack path of a small configuration sees them.
+const benchPolicies = policyA + `
+[[policy]]
+name     = "e2e-b1"
+to       = ["198.51.100.0/24"]
+only_via = ["lo0"]
+
+[[policy]]
+name     = "e2e-b2"
+to       = ["203.0.113.0/24"]
+only_via = ["lo0"]
+
+[[policy]]
+name     = "e2e-b3"
+to       = ["198.18.30.0/24"]
+only_via = []
+`
+
+// BenchmarkPfBackendLoadedID measures the check of the loaded ruleset
+// that the ack path does: the pf status and every rule below the anchor,
+// through ioctl.
+func BenchmarkPfBackendLoadedID(b *testing.B) {
+	be, _ := newPfBackend(b)
+	rs := compilePolicies(b, benchPolicies)
+	load(b, be, rs)
+	for b.Loop() {
+		if id, err := be.LoadedID(b.Context()); err != nil || id != rs.ID() {
+			b.Fatalf("LoadedID = (%q, %v), want %q", id, err, rs.ID())
+		}
+	}
+}
+
+// BenchmarkPfBackendAddEntries measures the write that the ack path does
+// for one DNS answer: one host entry, and the end of its states.
+func BenchmarkPfBackendAddEntries(b *testing.B) {
+	be, _ := newPfBackend(b)
+	load(b, be, compilePolicies(b, benchPolicies))
+	for i := 0; b.Loop(); i++ {
+		e := netip.PrefixFrom(netip.AddrFrom4([4]byte{192, 0, 2, byte(1 + i%250)}), 32)
+		if err := be.AddEntries(b.Context(), "e2e-a", []netip.Prefix{e}); err != nil {
+			b.Fatalf("AddEntries(%v): %v", e, err)
+		}
+	}
+}
 
 // TestPfBackendReloadKeepsEntries checks that the ID that the kernel
 // gives back is the Compiler ID, and that a reload keeps the entries that
@@ -165,6 +223,24 @@ func TestPfBackendSeesExternalChanges(t *testing.T) {
 	requireLoadedID(t, b, "")
 	load(t, b, rs)
 	requireLoadedID(t, b, rs.ID())
+
+	// Each change below is one that Load repairs: LoadedID gives "", and
+	// the next Load gives the ID back. A change that Load does not repair
+	// would make the Reconciler load again and again.
+	for _, c := range []struct{ anchor, flag, rule string }{
+		{pfbackend.Anchor, "-N", "nat on lo0 inet from any to 198.18.40.1 -> 127.0.0.1\n"},
+		{pfbackend.Anchor + "/e2e-other", "-R", "pass out quick all no state\n"},
+	} {
+		loadOnly(t, c.anchor, c.flag, c.rule)
+		requireLoadedID(t, b, "")
+		load(t, b, rs)
+		requireLoadedID(t, b, rs.ID())
+	}
+	// pf never evaluates the NAT rules of a sub-anchor: the anchor holds
+	// no nat-anchor rule. So such a rule does not change the ID.
+	loadOnly(t, sub, "-N", "nat on lo0 inet from any to 198.18.40.2 -> 127.0.0.1\n")
+	requireLoadedID(t, b, rs.ID())
+	pfctl(t, "-a", sub, "-F", "nat")
 
 	pfctl(t, "-a", pfbackend.Anchor, "-F", "rules")
 	requireLoadedID(t, b, "")

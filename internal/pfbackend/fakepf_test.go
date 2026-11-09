@@ -90,11 +90,125 @@ func (f *fakePF) Status() (pf.Status, error) {
 	return pf.Status{Running: f.enabled}, nil
 }
 
-// ioctl records an ioctl call and reports whether fail refuses it.
-func (f *fakePF) ioctl(name string) error {
-	f.calls = append(f.calls, []string{name})
-	if f.fail != nil && f.fail([]string{name}) {
+// ioctl records an ioctl call with its arguments, and reports whether
+// fail refuses it.
+func (f *fakePF) ioctl(name string, args ...string) error {
+	call := append([]string{name}, args...)
+	f.calls = append(f.calls, call)
+	if f.fail != nil && f.fail(call) {
 		return fmt.Errorf("%s: injected failure", name)
+	}
+	return nil
+}
+
+// Rules implements Device.
+func (f *fakePF) Rules(rs pf.Ruleset) ([]pf.Rule, error) {
+	if err := f.ioctl("DIOCGETRULES", rs.Anchor, rs.Kind.String()); err != nil {
+		return nil, err
+	}
+	lines := slices.Concat(f.main, f.nat[""])
+	if rs.Anchor != "" {
+		if !f.exists(rs.Anchor) {
+			return nil, fmt.Errorf("anchor %s: %w", rs.Anchor, pf.ErrNotFound)
+		}
+		lines = slices.Concat(f.anchors[rs.Anchor], f.nat[rs.Anchor])
+	}
+	return rulesOf(lines, rs.Kind), nil
+}
+
+// Anchors implements Device.
+func (f *fakePF) Anchors(anchor string) ([]string, error) {
+	if err := f.ioctl("DIOCGETRULESETS", anchor); err != nil {
+		return nil, err
+	}
+	if anchor != "" && !f.exists(anchor) {
+		return nil, fmt.Errorf("anchor %s: %w", anchor, pf.ErrNotFound)
+	}
+	return children(slices.Collect(maps.Keys(f.anchors)), anchor), nil
+}
+
+// exists reports whether pf holds the anchor: it has rules, or an anchor
+// below it does.
+func (f *fakePF) exists(anchor string) bool {
+	if _, ok := f.anchors[anchor]; ok {
+		return true
+	}
+	return len(children(slices.Collect(maps.Keys(f.anchors)), anchor)) > 0
+}
+
+// tableOf returns the table t. The fake keeps tables only in the anchor.
+func (f *fakePF) tableOf(t pf.Table) (map[netip.Prefix]bool, error) {
+	if t.Anchor != Anchor {
+		return nil, fmt.Errorf("fakePF: table in anchor %s", t.Anchor)
+	}
+	tbl, ok := f.tables[t.Name]
+	if !ok {
+		return nil, fmt.Errorf("table %s: %w", t, pf.ErrNotFound)
+	}
+	return tbl, nil
+}
+
+// CreateTable implements Device.
+func (f *fakePF) CreateTable(t pf.Table) error {
+	if err := f.ioctl("DIOCRADDTABLES", t.Anchor, t.Name); err != nil {
+		return err
+	}
+	if t.Anchor != Anchor {
+		return fmt.Errorf("fakePF: table in anchor %s", t.Anchor)
+	}
+	if f.tables[t.Name] == nil {
+		f.tables[t.Name] = make(map[netip.Prefix]bool)
+	}
+	return nil
+}
+
+// AddAddrs implements Device.
+func (f *fakePF) AddAddrs(t pf.Table, addrs []pf.Addr) ([]pf.Feedback, error) {
+	if err := f.ioctl("DIOCRADDADDRS", addrArgs(t, addrs)...); err != nil {
+		return nil, err
+	}
+	tbl, err := f.tableOf(t)
+	if err != nil {
+		return nil, err
+	}
+	return addAddrs(tbl, addrs), nil
+}
+
+// DeleteAddrs implements Device. With stickyNegation it keeps negated
+// entries.
+func (f *fakePF) DeleteAddrs(t pf.Table, addrs []pf.Addr) ([]pf.Feedback, error) {
+	if err := f.ioctl("DIOCRDELADDRS", addrArgs(t, addrs)...); err != nil {
+		return nil, err
+	}
+	tbl, err := f.tableOf(t)
+	if err != nil {
+		return nil, err
+	}
+	keep := func(a pf.Addr) bool { return a.Negated && f.stickyNegation }
+	return deleteAddrs(tbl, addrs, keep), nil
+}
+
+// Addrs implements Device.
+func (f *fakePF) Addrs(t pf.Table) ([]pf.Addr, error) {
+	if err := f.ioctl("DIOCRGETADDRS", t.Anchor, t.Name); err != nil {
+		return nil, err
+	}
+	tbl, err := f.tableOf(t)
+	if err != nil {
+		return nil, err
+	}
+	return addrsOf(tbl), nil
+}
+
+// KillStates implements Device.
+func (f *fakePF) KillStates(dst netip.Prefix) error {
+	if err := f.ioctl("DIOCKILLSTATES", dst.String()); err != nil {
+		return err
+	}
+	for d := range f.states {
+		if dst.Contains(d) {
+			delete(f.states, d)
+		}
 	}
 	return nil
 }
@@ -134,20 +248,8 @@ func (f *fakePF) run(stdin []byte, args []string) (Output, error) {
 		return out(strings.Join(f.nat[""], "\n") + "\n"), nil
 	case a == "-sA -v":
 		return out(f.listAnchors("", true)), nil
-	case a == "-s state":
-		return out(f.showStates()), nil
 	case a == "-sI -v":
 		return out(strings.Join(f.ifaces, "\n") + "\n"), nil
-	case len(args) == 4 && args[0] == "-k":
-		dst := netip.MustParsePrefix(args[3])
-		for d := range f.states {
-			if dst.Contains(d) {
-				delete(f.states, d)
-			}
-		}
-		return Output{}, nil
-	case len(args) >= 2 && args[0] == "-v" && args[1] == "-a":
-		return f.table(args[2], args[4], args[6], stdin, true)
 	case len(args) >= 2 && args[0] == "-a":
 		return f.anchor(args[1], args[2:], stdin)
 	}
@@ -158,11 +260,6 @@ func (f *fakePF) anchor(path string, rest []string, stdin []byte) (Output, error
 	r := strings.Join(rest, " ")
 	switch {
 	case r == "-sr":
-		if base, ok := strings.CutSuffix(path, "/*"); ok {
-			var b strings.Builder
-			f.print(&b, base, "")
-			return out(b.String()), nil
-		}
 		return out(strings.Join(f.anchors[path], "\n") + "\n"), nil
 	case r == "-sn":
 		return out(strings.Join(f.nat[path], "\n") + "\n"), nil
@@ -180,7 +277,7 @@ func (f *fakePF) anchor(path string, rest []string, stdin []byte) (Output, error
 	case r == "-sT":
 		return out(strings.Join(slices.Sorted(maps.Keys(f.tables)), "\n") + "\n"), nil
 	case len(rest) >= 4 && rest[0] == "-t" && rest[2] == "-T":
-		return f.table(path, rest[1], rest[3], stdin, false)
+		return f.table(path, rest[1], rest[3], stdin)
 	}
 	return Output{}, fmt.Errorf("fakePF: unknown anchor command %q", r)
 }
@@ -226,35 +323,7 @@ func (f *fakePF) listAnchors(path string, all bool) string {
 	return b.String()
 }
 
-// showStates prints the states as "pfctl -s state" does.
-func (f *fakePF) showStates() string {
-	var b strings.Builder
-	for _, a := range slices.SortedFunc(maps.Keys(f.states), netip.Addr.Compare) {
-		if a.Is4() {
-			b.WriteString("ALL tcp 192.168.64.14:51121 -> " + a.String() + ":443       ESTABLISHED:ESTABLISHED\n")
-		} else {
-			b.WriteString("ALL tcp fe80::14[51121] -> " + a.String() + "[443]       ESTABLISHED:ESTABLISHED\n")
-		}
-	}
-	return b.String()
-}
-
-// print writes the rules of an anchor as "pfctl -a <anchor>/* -sr" does:
-// each anchor rule gets the rules of its sub-anchor between braces.
-func (f *fakePF) print(b *strings.Builder, path, indent string) {
-	for _, rule := range f.anchors[path] {
-		name, ok := anchorRule(rule)
-		if !ok {
-			b.WriteString(indent + rule + "\n")
-			continue
-		}
-		b.WriteString(indent + rule + " {\n")
-		f.print(b, path+"/"+name, indent+"  ")
-		b.WriteString(indent + "}\n")
-	}
-}
-
-func (f *fakePF) table(anchor, name, cmd string, stdin []byte, verbose bool) (Output, error) {
+func (f *fakePF) table(anchor, name, cmd string, stdin []byte) (Output, error) {
 	if anchor != Anchor {
 		return Output{}, fmt.Errorf("fakePF: table in anchor %s", anchor)
 	}
@@ -269,16 +338,6 @@ func (f *fakePF) table(anchor, name, cmd string, stdin []byte, verbose bool) (Ou
 	case "kill":
 		delete(f.tables, name)
 		return Output{Stderr: []byte("0 table deleted.\n")}, nil
-	case "add":
-		if !exists {
-			t = make(map[netip.Prefix]bool)
-			f.tables[name] = t
-		}
-		fb := f.add(t, stdinEntries(stdin))
-		if !verbose {
-			return Output{}, nil
-		}
-		return out(fb), nil
 	case "delete":
 		if !exists {
 			return noTable, errExit
@@ -302,22 +361,6 @@ func show(t map[netip.Prefix]bool) string {
 			neg = "!"
 		}
 		b.WriteString("  " + neg + entryText(p) + "\n")
-	}
-	return b.String()
-}
-
-// add adds entries to a table and returns the feedback of "-v -T add".
-func (f *fakePF) add(t map[netip.Prefix]bool, entries []stdinEntry) string {
-	var b strings.Builder
-	for _, e := range entries {
-		neg, present := t[e.p]
-		switch {
-		case present && neg != e.neg:
-			b.WriteString("Y  " + entryText(e.p) + "\n")
-		case !present:
-			t[e.p] = e.neg
-			b.WriteString("A  " + entryText(e.p) + "\n")
-		}
 	}
 	return b.String()
 }

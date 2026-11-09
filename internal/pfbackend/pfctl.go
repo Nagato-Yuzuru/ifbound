@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Nagato-Yuzuru/ifbound/pf"
 )
 
 // Path is the absolute path of pfctl on macOS. /sbin is not always in
@@ -113,51 +115,36 @@ func labelRule(label string) string {
 	return `block drop out quick tagged "` + sentinelTag + `" label "` + label + `"` + "\n"
 }
 
-// parseRuleset reads the output of "pfctl -a <anchor>/* -sr": the rules
-// of the anchor, each referenced sub-anchor with its rules between braces,
-// recursively. It returns the ruleset ID from the sentinel rule, and the
-// tokens from the token rules.
+// parseRules reads the filter rules of the anchor. It returns the
+// ruleset ID from the sentinel rule, and the tokens from the token rules.
 //
-// The ID is "" when there is not exactly one valid sentinel rule, or when
-// the output holds a rule that the ruleset of ifbound does not write: a
-// rule in a sub-anchor, or a rule at the top level that is not a block or
-// an anchor rule. pf prints the rules of a sub-anchor indented below its
-// anchor rule. A block rule that another tool adds only blocks more, so
-// it does not change the ID.
-func parseRuleset(out []byte) (id string, tokens []token) {
+// The ID is "" when there is not exactly one valid sentinel rule. Foreign
+// is true when a rule is not one that the ruleset of ifbound writes at
+// the top level: a block rule or an anchor rule. A block rule that
+// another tool adds only blocks more, so it does not change the ID.
+func parseRules(rules []pf.Rule) (id string, tokens []token, foreign bool) {
 	var ids []string
-	foreign := false
-	for line := range strings.Lines(string(out)) {
-		line = strings.TrimRight(line, "\r\n")
-		switch {
-		case line == "", line == "}":
-		case line[0] == ' ' || line[0] == '\t':
+	for _, r := range rules {
+		if r.AnchorCall == "" && r.Action != pf.ActionDrop {
 			foreign = true
-		case !strings.HasPrefix(line, "block ") && !strings.HasPrefix(line, "anchor "):
-			foreign = true
-		default:
-			if id, ok := labelID(line); ok {
-				ids = append(ids, id)
-			}
-			if tok, ok := labelToken(line); ok {
-				tokens = append(tokens, tok)
-			}
+		}
+		if id, ok := labelID(r.Label); ok {
+			ids = append(ids, id)
+		}
+		if tok, ok := labelToken(r.Label); ok {
+			tokens = append(tokens, tok)
 		}
 	}
-	if len(ids) != 1 || foreign {
-		return "", tokens
+	if len(ids) != 1 {
+		return "", tokens, foreign
 	}
-	return ids[0], tokens
+	return ids[0], tokens, foreign
 }
 
 // labelID returns the ruleset ID in the label of a sentinel rule. A
 // label that does not decode to a digest gives no ID.
-func labelID(rule string) (string, bool) {
-	_, rest, ok := strings.Cut(rule, `label "`+labelPrefix)
-	if !ok {
-		return "", false
-	}
-	text, _, ok := strings.Cut(rest, `"`)
+func labelID(label string) (string, bool) {
+	text, ok := strings.CutPrefix(label, labelPrefix)
 	if !ok {
 		return "", false
 	}
@@ -169,12 +156,8 @@ func labelID(rule string) (string, bool) {
 }
 
 // labelToken returns the pf token in the label of a token rule.
-func labelToken(rule string) (token, bool) {
-	_, rest, ok := strings.Cut(rule, `label "`+tokenPrefix)
-	if !ok {
-		return token{}, false
-	}
-	text, _, ok := strings.Cut(rest, `"`)
+func labelToken(label string) (token, bool) {
+	text, ok := strings.CutPrefix(label, tokenPrefix)
 	if !ok {
 		return token{}, false
 	}
@@ -286,32 +269,6 @@ func parseEntry(text string) (netip.Prefix, error) {
 	return netip.PrefixFrom(a, a.BitLen()), nil
 }
 
-// parseConflicts reads the stdout of "pfctl -v -T add" and returns the
-// entries that conflict with a negated entry for the same address. Each
-// line is a feedback letter, a space, a space or "!", and the address.
-// "Y" marks a conflict. pfctl prints no line for an entry that is
-// already present.
-func parseConflicts(out []byte) ([]netip.Prefix, error) {
-	var conflicts []netip.Prefix
-	for line := range strings.Lines(string(out)) {
-		line = strings.TrimRight(line, "\r\n")
-		if line == "" {
-			continue
-		}
-		if len(line) < 4 || line[1] != ' ' || (line[2] != ' ' && line[2] != '!') {
-			return nil, fmt.Errorf("%w: table feedback %q", errOutput, line)
-		}
-		p, err := parseEntry(line[3:])
-		if err != nil {
-			return nil, err
-		}
-		if line[0] == 'Y' {
-			conflicts = append(conflicts, p)
-		}
-	}
-	return conflicts, nil
-}
-
 // parseToken reads the reference token from the stderr of "pfctl -E".
 func parseToken(stderr []byte) (string, error) {
 	for line := range strings.Lines(string(stderr)) {
@@ -372,33 +329,6 @@ func refersToApple(rule string) bool {
 	rest, ok := strings.CutPrefix(rule, `anchor "`+appleAnchor+`/*"`)
 	rest = strings.TrimSpace(rest)
 	return ok && (rest == "" || rest == "all")
-}
-
-// parseStates reads the output of "pfctl -s state" and returns every
-// address in it. A line prints the addresses of one state, an IPv4
-// address with ":port" and an IPv6 address with "[port]", for example
-//
-//	ALL udp 192.168.64.14:59130 -> 192.168.64.200:38457 -> 192.0.2.11:9       SINGLE:NO_TRAFFIC
-//	ALL udp ::1[63006] -> ::1[9999]       SINGLE:NO_TRAFFIC
-//
-// ok is false when a line holds no address.
-func parseStates(out []byte) (addrs []netip.Addr, ok bool) {
-	for line := range strings.Lines(string(out)) {
-		if strings.TrimSpace(line) == "" {
-			continue
-		}
-		found := false
-		for f := range strings.FieldsSeq(line) {
-			if a, ok := stateAddr(f); ok {
-				addrs = append(addrs, a)
-				found = true
-			}
-		}
-		if !found {
-			return nil, false
-		}
-	}
-	return addrs, true
 }
 
 // stateAddr reads one address field of a state line.

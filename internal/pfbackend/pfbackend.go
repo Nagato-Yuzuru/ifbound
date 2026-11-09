@@ -8,16 +8,17 @@
 // Load replaces the rules of the anchor in one transaction with
 // "pfctl -a <anchor> -f -". The ruleset of pfrules declares each table
 // "persist" and without addresses, so a reload keeps the entries of the
-// tables. The table entries change only with "-T add", "-T delete", and
-// "-T kill".
+// tables. The table entries change only through AddEntries,
+// RemoveEntries, and DropTable.
 //
 // The ID of the loaded ruleset is in the label of a sentinel rule that
 // Load adds at the end of the ruleset. Read and LoadedID read the label
 // from the kernel at each call. They report no ruleset ("") when the
 // label is missing, when the anchor holds a rule that the ruleset of
 // ifbound does not write (a rule in a sub-anchor, which pf evaluates for
-// the packets that the anchor rule matches, or a rule at the top level
-// that is not a block or an anchor rule), or when pf is disabled. pf
+// the packets that the anchor rule matches, a filter rule at the top
+// level that is not a block or an anchor rule, or a rule of another kind,
+// for example a NAT rule), or when pf is disabled. pf
 // replaces the rules of an anchor only as a whole, so another tool that
 // loads or flushes the anchor also removes the label. Load then repairs
 // the state: it loads the rules, flushes the rules of every sub-anchor,
@@ -99,6 +100,13 @@ const noTable = "Table does not exist."
 // *pf.Handle implements it.
 type Device interface {
 	Status() (pf.Status, error)
+	Rules(rs pf.Ruleset) ([]pf.Rule, error)
+	Anchors(anchor string) ([]string, error)
+	CreateTable(t pf.Table) error
+	AddAddrs(t pf.Table, addrs []pf.Addr) ([]pf.Feedback, error)
+	DeleteAddrs(t pf.Table, addrs []pf.Addr) ([]pf.Feedback, error)
+	Addrs(t pf.Table) ([]pf.Addr, error)
+	KillStates(dst netip.Prefix) error
 }
 
 var _ Device = (*pf.Handle)(nil)
@@ -137,7 +145,7 @@ func New(run Runner, dev Device, now func() time.Time, log *slog.Logger) *Backen
 // the enforcement, and it leaves the entry out of Tables: the Reconciler
 // adds the entry again, and AddEntries deletes the negated entry.
 func (b *Backend) Read(ctx context.Context) (reconcile.BackendState, error) {
-	enabled, id, err := b.loaded(ctx)
+	enabled, id, err := b.loaded()
 	if err != nil {
 		return reconcile.BackendState{}, err
 	}
@@ -157,10 +165,10 @@ func (b *Backend) Read(ctx context.Context) (reconcile.BackendState, error) {
 	return reconcile.BackendState{Ruleset: id, Tables: tables, Problems: problems}, nil
 }
 
-// LoadedID implements reconcile.Backend. It reads the pf status and runs
-// pfctl once.
-func (b *Backend) LoadedID(ctx context.Context) (string, error) {
-	_, id, err := b.loaded(ctx)
+// LoadedID implements reconcile.Backend. It starts no pfctl process: it
+// reads the pf status and the rules through ioctl.
+func (b *Backend) LoadedID(context.Context) (string, error) {
+	_, id, err := b.loaded()
 	return id, err
 }
 
@@ -168,28 +176,109 @@ func (b *Backend) LoadedID(ctx context.Context) (string, error) {
 // The ID is "" when pf is disabled: no rule is in effect then. When the
 // Backend knows no token, it takes the tokens from the anchor, where an
 // earlier process of ifbound wrote them.
-func (b *Backend) loaded(ctx context.Context) (enabled bool, id string, err error) {
+func (b *Backend) loaded() (enabled bool, id string, err error) {
 	enabled, err = b.enabled()
-	if err != nil {
+	if err != nil || !enabled {
 		return false, "", err
 	}
-	out, err := b.pfctl(ctx, nil, "-a", Anchor+"/*", "-sr")
+	id, tokens, err := b.readAnchor()
 	if err != nil {
-		return false, "", err
+		return true, "", err
 	}
-	if !enabled {
-		return false, "", nil
-	}
-	id, tokens := parseRuleset(out.Stdout)
 	if len(b.tokens) == 0 {
 		b.tokens = tokens
 	}
-	// pfctl reports a missing anchor, and a sub-anchor that it cannot
-	// read, on stderr and exits with 0. The output can then miss rules.
-	if complained(out.Stderr) || b.unfinished {
+	if b.unfinished {
 		return true, "", nil
 	}
 	return true, id, nil
+}
+
+// otherKinds returns the rulesets besides the filter rules that Load
+// replaces in the anchor ("pfctl -f" loads them all). The ruleset of
+// ifbound writes none of them. The main ruleset of macOS evaluates them
+// through its nat-anchor, rdr-anchor, and scrub-anchor rules.
+func otherKinds() []pf.RulesetKind {
+	return []pf.RulesetKind{pf.RulesetScrub, pf.RulesetNAT, pf.RulesetBINAT, pf.RulesetRDR}
+}
+
+// subKinds returns the rulesets that Load flushes in each sub-anchor
+// ("pfctl -F rules" flushes them). The anchor holds no nat-anchor or
+// rdr-anchor rule, so pf never evaluates the other rulesets of a
+// sub-anchor.
+func subKinds() []pf.RulesetKind {
+	return []pf.RulesetKind{pf.RulesetFilter, pf.RulesetScrub}
+}
+
+// readAnchor reads the rules of the anchor and of every anchor below it.
+// It returns the ruleset ID and the tokens, as parseRules does. The ID is
+// also "" when the anchor holds a rule of another kind than filter, or
+// when an anchor below holds a filter or scrub rule. An anchor below
+// counts also when no rule calls it: Load flushes each one, so a rule
+// there comes from another tool.
+//
+// The check sees only the changes that Load repairs. Else LoadedID gives
+// "" after each Load, and the Reconciler loads again and again.
+//
+// A missing anchor holds no ruleset. A ruleset that changes during the
+// read is an error: the caller tries again later.
+func (b *Backend) readAnchor() (string, []token, error) {
+	rules, err := b.dev.Rules(pf.Ruleset{Anchor: Anchor})
+	if errors.Is(err, pf.ErrNotFound) {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("reading the rules of the anchor: %w", err)
+	}
+	id, tokens, foreign := parseRules(rules)
+	if !foreign {
+		foreign, err = b.holdsRules(Anchor, otherKinds())
+	}
+	if err == nil && !foreign {
+		foreign, err = b.belowHoldsRules(Anchor)
+	}
+	if err != nil {
+		return "", tokens, err
+	}
+	if foreign {
+		return "", tokens, nil
+	}
+	return id, tokens, nil
+}
+
+// holdsRules reports whether a ruleset of one of the kinds in the anchor
+// holds a rule.
+func (b *Backend) holdsRules(anchor string, kinds []pf.RulesetKind) (bool, error) {
+	for _, k := range kinds {
+		rs := pf.Ruleset{Anchor: anchor, Kind: k}
+		rules, err := b.dev.Rules(rs)
+		if err != nil {
+			return false, fmt.Errorf("reading the %s: %w", rs, err)
+		}
+		if len(rules) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// belowHoldsRules reports whether an anchor below the anchor holds a rule
+// of the kinds in subKinds.
+func (b *Backend) belowHoldsRules(anchor string) (bool, error) {
+	children, err := b.dev.Anchors(anchor)
+	if err != nil {
+		return false, fmt.Errorf("listing the anchors below %s: %w", anchor, err)
+	}
+	for _, c := range children {
+		path := anchor + "/" + c
+		if held, err := b.holdsRules(path, subKinds()); err != nil || held {
+			return held, err
+		}
+		if held, err := b.belowHoldsRules(path); err != nil || held {
+			return held, err
+		}
+	}
+	return false, nil
 }
 
 func (b *Backend) enabled() (bool, error) {
@@ -217,7 +306,7 @@ func (b *Backend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 		return err
 	}
 	b.unfinished = true
-	enabled, _, err := b.loaded(ctx)
+	enabled, _, err := b.loaded()
 	if err != nil {
 		return err
 	}
@@ -254,7 +343,7 @@ func (b *Backend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 	if err != nil {
 		return err
 	}
-	if err := b.killStates(ctx, slices.Concat(slices.Collect(maps.Values(tables))...)); err != nil {
+	if err := b.killStates(slices.Concat(slices.Collect(maps.Values(tables))...)); err != nil {
 		return err
 	}
 	b.unfinished = false
@@ -342,7 +431,7 @@ func (b *Backend) abandon(ctx context.Context, t token) {
 func (b *Backend) Unload(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupWait)
 	defer cancel()
-	if _, _, err := b.loaded(ctx); err != nil {
+	if _, _, err := b.loaded(); err != nil {
 		return err
 	}
 	if err := b.release(ctx); err != nil {
@@ -395,19 +484,20 @@ func (b *Backend) giveBack(ctx context.Context, tokens []token) ([]token, error)
 	return kept, errors.Join(errs...)
 }
 
-// AddEntries implements reconcile.Backend. "pfctl -T add" creates the
-// table when it is missing. An entry whose address the table holds as a
-// negated entry is not added; AddEntries then deletes the negated entry
-// and adds the entry again. It also deletes each negated entry inside an
-// added prefix, also when the table holds the prefix already: pf uses the
-// longest match, so that entry exempts its addresses from the prefix. At
-// the end it ends the states to the entries.
-func (b *Backend) AddEntries(ctx context.Context, table policy.Name, entries []netip.Prefix) (err error) {
-	in, err := entryLines(entries)
+// AddEntries implements reconcile.Backend. It starts no pfctl process.
+// It creates the table when it is missing. An entry whose address the
+// table holds as a negated entry is not added; AddEntries then deletes the
+// negated entry and adds the entry again. It also deletes each negated
+// entry inside an added prefix, also when the table holds the prefix
+// already: pf uses the longest match, so that entry exempts its addresses
+// from the prefix. At the end it ends the states to the entries.
+func (b *Backend) AddEntries(_ context.Context, table policy.Name, entries []netip.Prefix) (err error) {
+	addrs, err := tableAddrs(entries, false)
 	if err != nil {
 		return err
 	}
-	conflicts, err := b.add(ctx, table, in)
+	t := pf.Table{Anchor: Anchor, Name: string(table)}
+	conflicts, err := b.add(t, addrs)
 	if err != nil {
 		return err
 	}
@@ -420,15 +510,12 @@ func (b *Backend) AddEntries(ctx context.Context, table policy.Name, entries []n
 		}
 	}()
 	if len(conflicts) > 0 {
-		var negated []byte
-		for _, c := range conflicts {
-			negated = append(negated, "!"+c.String()+"\n"...)
-		}
-		if _, err := b.pfctl(ctx, negated, "-a", Anchor, "-t", string(table), "-T", "delete", "-f", "-"); err != nil {
+		negated, _ := tableAddrs(conflicts, true) //nolint:errcheck // the entries are valid: they passed tableAddrs before
+		if _, err := b.dev.DeleteAddrs(t, negated); err != nil {
 			return fmt.Errorf("deleting negated entries of table %s: %w", table, err)
 		}
-		again, _ := entryLines(conflicts) //nolint:errcheck // the entries are valid: the kernel printed them
-		left, err := b.add(ctx, table, again)
+		again, _ := tableAddrs(conflicts, false) //nolint:errcheck // as above
+		left, err := b.add(t, again)
 		if err != nil {
 			return err
 		}
@@ -436,38 +523,46 @@ func (b *Backend) AddEntries(ctx context.Context, table policy.Name, entries []n
 			return fmt.Errorf("adding to table %s: %w: %v", table, errConflict, left)
 		}
 	}
-	if err := b.deleteHoles(ctx, table, entries); err != nil {
+	if err := b.deleteHoles(t, entries); err != nil {
 		return err
 	}
-	return b.killStates(ctx, entries)
+	return b.killStates(entries)
 }
 
-// deleteHoles deletes the negated entries of table that are inside a
-// prefix of entries. A host entry holds no other entry, so a call with
+// tableAddrs turns entries into table addresses, all negated or none.
+func tableAddrs(entries []netip.Prefix, negated bool) ([]pf.Addr, error) {
+	addrs := make([]pf.Addr, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsValid() {
+			return nil, fmt.Errorf("%w: %v", errEntry, e)
+		}
+		addrs = append(addrs, pf.Addr{Prefix: e.Masked(), Negated: negated})
+	}
+	return addrs, nil
+}
+
+// deleteHoles deletes the negated entries of the table t that are inside
+// a prefix of entries. A host entry holds no other entry, so a call with
 // host entries only reads nothing.
-func (b *Backend) deleteHoles(ctx context.Context, table policy.Name, entries []netip.Prefix) error {
+func (b *Backend) deleteHoles(t pf.Table, entries []netip.Prefix) error {
 	if !slices.ContainsFunc(entries, func(e netip.Prefix) bool { return !e.IsSingleIP() }) {
 		return nil
 	}
-	show, err := b.pfctl(ctx, nil, "-a", Anchor, "-t", string(table), "-T", "show")
+	addrs, err := b.dev.Addrs(t)
 	if err != nil {
-		return fmt.Errorf("reading table %s: %w", table, err)
+		return fmt.Errorf("reading table %s: %w", t.Name, err)
 	}
-	_, negated, err := parseEntries(show.Stdout)
-	if err != nil {
-		return fmt.Errorf("reading table %s: %w", table, err)
-	}
-	var holes []byte
-	for _, n := range negated {
-		if slices.ContainsFunc(entries, func(e netip.Prefix) bool { return inside(n, e) }) {
-			holes = append(holes, "!"+n.String()+"\n"...)
+	var holes []pf.Addr
+	for _, a := range addrs {
+		if a.Negated && slices.ContainsFunc(entries, func(e netip.Prefix) bool { return inside(a.Prefix, e) }) {
+			holes = append(holes, a)
 		}
 	}
 	if len(holes) == 0 {
 		return nil
 	}
-	if _, err := b.pfctl(ctx, holes, "-a", Anchor, "-t", string(table), "-T", "delete", "-f", "-"); err != nil {
-		return fmt.Errorf("deleting negated entries of table %s: %w", table, err)
+	if _, err := b.dev.DeleteAddrs(t, holes); err != nil {
+		return fmt.Errorf("deleting negated entries of table %s: %w", t.Name, err)
 	}
 	return nil
 }
@@ -479,13 +574,27 @@ func inside(n, p netip.Prefix) bool {
 	return p.Bits() < n.Bits() && p.Contains(n.Addr())
 }
 
-// add runs "pfctl -v -T add" and returns the conflicting entries.
-func (b *Backend) add(ctx context.Context, table policy.Name, in []byte) ([]netip.Prefix, error) {
-	out, err := b.pfctl(ctx, in, "-v", "-a", Anchor, "-t", string(table), "-T", "add", "-f", "-")
-	if err != nil {
-		return nil, fmt.Errorf("adding to table %s: %w", table, err)
+// add adds addrs to the table t, and creates t when it is missing, as
+// "pfctl -T add" does. It returns the prefixes that the table holds with
+// the other negation.
+func (b *Backend) add(t pf.Table, addrs []pf.Addr) ([]netip.Prefix, error) {
+	fb, err := b.dev.AddAddrs(t, addrs)
+	if errors.Is(err, pf.ErrNotFound) {
+		if err := b.dev.CreateTable(t); err != nil {
+			return nil, fmt.Errorf("creating table %s: %w", t.Name, err)
+		}
+		fb, err = b.dev.AddAddrs(t, addrs)
 	}
-	return parseConflicts(out.Stdout)
+	if err != nil {
+		return nil, fmt.Errorf("adding to table %s: %w", t.Name, err)
+	}
+	var conflicts []netip.Prefix
+	for i, f := range fb {
+		if f == pf.FeedbackConflict {
+			conflicts = append(conflicts, addrs[i].Prefix)
+		}
+	}
+	return conflicts, nil
 }
 
 // RemoveEntries implements reconcile.Backend. A missing table holds no
@@ -518,30 +627,14 @@ func (b *Backend) DropTable(ctx context.Context, table policy.Name) error {
 // ifbound keeps no state, but a state that another rule keeps lets the
 // packets of a connection skip the rules.
 //
-// It reads the state table once and runs one kill for each entry that an
-// address of a state is in, so the number of pfctl calls does not grow
-// with the number of entries. When a state line does not parse, it runs a
-// kill for every entry. The caller changed the rules or the tables first,
-// so a new state to an entry can come only from a rule that pf evaluates
-// before the ifbound rules, which Read reports as a voiding Problem.
-func (b *Backend) killStates(ctx context.Context, entries []netip.Prefix) error {
-	if len(entries) == 0 {
-		return nil
-	}
-	out, err := b.pfctl(ctx, nil, "-s", "state")
-	if err != nil {
-		return fmt.Errorf("reading the states: %w", err)
-	}
-	addrs, ok := parseStates(out.Stdout)
+// It ends the states to each entry with one ioctl. It does not read the
+// state table first: one ioctl costs microseconds. The caller changed the
+// rules or the tables first, so a new state to an entry can come only
+// from a rule that pf evaluates before the ifbound rules, which Read
+// reports as a voiding Problem.
+func (b *Backend) killStates(entries []netip.Prefix) error {
 	for _, e := range entries {
-		if ok && !slices.ContainsFunc(addrs, e.Masked().Contains) {
-			continue
-		}
-		from := "0.0.0.0/0"
-		if e.Addr().Is6() {
-			from = "::/0"
-		}
-		if _, err := b.pfctl(ctx, nil, "-k", from, "-k", e.Masked().String()); err != nil {
+		if err := b.dev.KillStates(e.Masked()); err != nil {
 			return fmt.Errorf("ending the states to %s: %w", e, err)
 		}
 	}
