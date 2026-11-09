@@ -7,6 +7,8 @@
 //   - tables: create a table, add, delete, clear, and list addresses;
 //   - states: end the states to a destination prefix;
 //   - status: whether pf is enabled;
+//   - references: take a reference to pf (which enables it), give it back
+//     (pf stops with the last reference), and list the references;
 //   - rules: the rules of a ruleset (the action, the label, and the anchor
 //     call of each rule), and the child anchors of an anchor.
 //

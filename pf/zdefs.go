@@ -76,6 +76,15 @@ type pfStatus struct {
 	Ifname    [16]int8
 	Pf_chksum [16]uint8
 }
+type pfiocRemoveToken struct {
+	Value    uint64
+	Refcount uint64
+}
+type pfiocTokens struct {
+	Size      int32
+	Pad_cgo_0 [4]byte
+	U         [8]byte
+}
 
 const (
 	sizeofPfRule         = 0x410
@@ -89,6 +98,12 @@ const (
 	offIocRuleAnchorCall = 0x410
 	offIocRuleRule       = 0x810
 	ruleLabelSize        = 0x40
+
+	sizeofPfiocToken  = 0x54
+	offTokenTimestamp = 0x8
+	offTokenPid       = 0x10
+	offTokenProcName  = 0x14
+	tokenProcNameSize = 0x40
 )
 
 const (
@@ -103,6 +118,9 @@ const (
 	diocRAddAddrs   = 0xc4504443
 	diocRDelAddrs   = 0xc4504444
 	diocRGetAddrs   = 0xc4504446
+	diocStartRef    = 0x40084408
+	diocStopRef     = 0xc0104409
+	diocGetStarters = 0xc0104405
 )
 
 const (
