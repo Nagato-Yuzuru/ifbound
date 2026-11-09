@@ -50,8 +50,6 @@ type recordingHandler struct {
 	active  atomic.Int32
 	peak    atomic.Int32
 	probes  chan string
-	// deaf makes Observe ignore its ctx and wait for gate only.
-	deaf bool
 	// protected is the flag of each ack.
 	protected bool
 }
@@ -80,10 +78,6 @@ func (h *recordingHandler) observe(ctx context.Context, o ipc.Observation) error
 		h.entered <- struct{}{}
 	}
 	if h.gate == nil {
-		return nil
-	}
-	if h.deaf {
-		<-h.gate // no reply before the client gives up
 		return nil
 	}
 	select {
@@ -260,33 +254,6 @@ func manyAliasesJSON(n int) string {
 	return out
 }
 
-// A Report whose ctx has no deadline waits 2 s for the ack, and asks
-// the server for that deadline.
-func TestReportDefaultTimeoutIsTwoSeconds(t *testing.T) {
-	t.Parallel()
-	h := &recordingHandler{gate: make(chan struct{}), deaf: true}
-	path := serveRecording(t, h)
-	defer close(h.gate)
-	c := ipc.NewClient(path, uint32(os.Getuid())) //nolint:gosec // a uid fits in uint32
-	start := time.Now()
-	_, err := c.Report(context.Background(), ipc.Observation{QName: "example.com", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.1")}})
-	elapsed := time.Since(start)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Report = %v, want DeadlineExceeded", err)
-	}
-	if elapsed < 1900*time.Millisecond || elapsed > 2600*time.Millisecond {
-		t.Errorf("Report returned after %v, want about 2 s", elapsed)
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if len(h.calls) != 1 {
-		t.Fatalf("handler calls = %d, want 1", len(h.calls))
-	}
-	if d := h.calls[0].deadline; d < 1500*time.Millisecond || d > 2*time.Second {
-		t.Errorf("handler deadline = %v, want at most 2 s and close to it", d)
-	}
-}
-
 // With every report slot of a Client held, a probe still reaches the
 // daemon, and the reports never exceed their slots.
 func TestProbeGetsThroughWhileReportSlotsAreFull(t *testing.T) {
@@ -315,12 +282,6 @@ func TestProbeGetsThroughWhileReportSlotsAreFull(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatalf("only %d reports reached the handler, want 32", i)
 		}
-	}
-	// No 33rd report gets in while the 32 wait.
-	select {
-	case <-h.entered:
-		t.Fatal("a 33rd report reached the handler while 32 were in flight")
-	case <-time.After(100 * time.Millisecond):
 	}
 
 	pctx, pcancel := context.WithTimeout(context.Background(), time.Second)

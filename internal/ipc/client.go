@@ -70,8 +70,13 @@ const (
 // NewClient returns a client for the socket at path. It trusts a reply only
 // from a server that runs as serverUID. Production passes 0.
 func NewClient(path string, serverUID uint32) *Client {
+	return newClient(dialUnix(path), serverUID)
+}
+
+// newClient returns a client that opens each connection with dial.
+func newClient(dial dialFunc, serverUID uint32) *Client {
 	return &Client{
-		dial:      dialUnix(path),
+		dial:      dial,
 		serverUID: serverUID,
 		inflight:  make(chan struct{}, maxInFlight),
 		probes:    make(chan struct{}, maxProbesInFlight),
