@@ -1,7 +1,7 @@
 package pfbackend_test
 
-// This file holds a model of the pf kernel and of the pfctl command line,
-// for the tests of the public methods. It is independent of
+// This file holds a model of the pf kernel, of the pfctl command line,
+// and of the ioctl calls on /dev/pf, for the tests of the public methods. It is independent of
 // fakepf_test.go: it parses pfctl flags in any order, keeps reference
 // tokens as the macOS kernel does, keeps NAT rules apart from filter
 // rules, and refuses each flag that it does not know, so an unexpected
@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfbackend"
+	"github.com/Nagato-Yuzuru/ifbound/pf"
 )
 
 var errKernelExit = errors.New("exit status 1")
@@ -54,7 +55,8 @@ type kernel struct {
 
 	// fail makes a call fail when it returns true.
 	fail func(args []string) bool
-	// calls records the arguments of every call.
+	// calls records the arguments of every pfctl call, and the name of
+	// every ioctl call (for example "DIOCGETSTATUS").
 	calls [][]string
 	// disables counts the calls of "pfctl -d".
 	disables int
@@ -179,6 +181,25 @@ func (k *kernel) Run(_ context.Context, stdin []byte, args ...string) (pfbackend
 		return k.showCmd(p)
 	}
 	return failure(fmt.Sprintf("kernel model: unmodeled command %q", strings.Join(args, " ")))
+}
+
+// ioctl records an ioctl call and reports whether fail refuses it.
+func (k *kernel) ioctl(name string) error {
+	k.calls = append(k.calls, []string{name})
+	if k.fail != nil && k.fail([]string{name}) {
+		return fmt.Errorf("%s: injected failure", name)
+	}
+	return nil
+}
+
+var _ pfbackend.Device = (*kernel)(nil)
+
+// Status implements pfbackend.Device.
+func (k *kernel) Status() (pf.Status, error) {
+	if err := k.ioctl("DIOCGETSTATUS"); err != nil {
+		return pf.Status{}, err
+	}
+	return pf.Status{Running: k.enabled}, nil
 }
 
 func (k *kernel) enableRef() (pfbackend.Output, error) {
@@ -306,12 +327,6 @@ func (k *kernel) flushCmd(p pfctlArgs) (pfbackend.Output, error) {
 
 func (k *kernel) showCmd(p pfctlArgs) (pfbackend.Output, error) {
 	switch p.show {
-	case "info":
-		status := "Disabled"
-		if k.enabled {
-			status = "Enabled"
-		}
-		return stdout("Status: " + status + " for 0 days 00:10:00           Debug: Urgent\n\nState Table                          Total             Rate\n  current entries                        " + strconv.Itoa(len(k.states)) + "\n"), nil
 	case "r", "rules":
 		if p.anchor == "" {
 			return stdout(joinLines(k.mainRules)), nil

@@ -233,24 +233,6 @@ func tokenGone(stderr []byte) bool {
 	return bytes.Contains(stderr, []byte("pf not enabled")) || bytes.Contains(stderr, []byte("token invalid"))
 }
 
-// parseStatus reads whether pf is enabled from "pfctl -s info".
-func parseStatus(out []byte) (bool, error) {
-	for line := range strings.Lines(string(out)) {
-		rest, ok := strings.CutPrefix(line, "Status: ")
-		if !ok {
-			continue
-		}
-		switch {
-		case strings.HasPrefix(rest, "Enabled"):
-			return true, nil
-		case strings.HasPrefix(rest, "Disabled"):
-			return false, nil
-		}
-		return false, fmt.Errorf("%w: status line %q", errOutput, strings.TrimSpace(line))
-	}
-	return false, fmt.Errorf("%w: no status line in pfctl -s info", errOutput)
-}
-
 // parseNames reads one name per line, as "pfctl -sT" prints tables and
 // "pfctl -sA" prints anchors.
 func parseNames(out []byte) []string {

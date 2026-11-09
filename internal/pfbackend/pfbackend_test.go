@@ -41,7 +41,7 @@ func newTest(t *testing.T) (*Backend, *fakePF, *clock) {
 	f := newFakePF()
 	c := &clock{t: time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)}
 	f.now = c.now
-	return New(f, c.now, slog.New(slog.DiscardHandler)), f, c
+	return New(f, f, c.now, slog.New(slog.DiscardHandler)), f, c
 }
 
 func compile(t *testing.T, config string) reconcile.Ruleset {

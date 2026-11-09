@@ -10,15 +10,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/Nagato-Yuzuru/ifbound/pf"
 )
 
 var errExit = errors.New("exit status 1")
 
-// fakePF is a Runner that models the part of pf that the Backend uses. It
-// prints in the formats that pfctl prints on macOS 27 (see parse_test.go
-// for the captured outputs). It keeps the rules of a load as they are:
-// the real kernel rewrites them, but the Backend reads only the sentinel
-// label and the indentation.
+// fakePF is a Runner and a Device that models the part of pf that the
+// Backend uses. It prints in the formats that pfctl prints on macOS 27
+// (see parse_test.go for the captured outputs). It keeps the rules of a
+// load as they are: the real kernel rewrites them, but the Backend reads
+// only the sentinel label and the indentation.
 type fakePF struct {
 	enabled bool
 	tokens  []string
@@ -40,7 +42,8 @@ type fakePF struct {
 	states map[netip.Addr]bool              // destinations with a state
 	// stickyNegation makes "-T delete" keep negated entries.
 	stickyNegation bool
-	// fail makes each call whose arguments it accepts fail.
+	// fail makes each call whose arguments it accepts fail. An ioctl call
+	// has its name as its only argument, for example "DIOCGETSTATUS".
 	fail func(args []string) bool
 	// complain adds an error to the stderr of each call whose arguments
 	// it accepts, with exit status 0, as pfctl does for a ruleset that it
@@ -77,15 +80,28 @@ func (f *fakePF) Run(_ context.Context, stdin []byte, args ...string) (Output, e
 	return o, err
 }
 
+var _ Device = (*fakePF)(nil)
+
+// Status implements Device.
+func (f *fakePF) Status() (pf.Status, error) {
+	if err := f.ioctl("DIOCGETSTATUS"); err != nil {
+		return pf.Status{}, err
+	}
+	return pf.Status{Running: f.enabled}, nil
+}
+
+// ioctl records an ioctl call and reports whether fail refuses it.
+func (f *fakePF) ioctl(name string) error {
+	f.calls = append(f.calls, []string{name})
+	if f.fail != nil && f.fail([]string{name}) {
+		return fmt.Errorf("%s: injected failure", name)
+	}
+	return nil
+}
+
 func (f *fakePF) run(stdin []byte, args []string) (Output, error) {
 	a := strings.Join(args, " ")
 	switch {
-	case a == "-s info":
-		status := "Disabled"
-		if f.enabled {
-			status = "Enabled"
-		}
-		return out("No ALTQ support in kernel\nALTQ related functions disabled\nStatus: " + status + " for 0 days 00:00:01           Debug: Urgent\n\nState Table\n"), nil
 	case a == "-E":
 		f.enabled = true
 		var tok string

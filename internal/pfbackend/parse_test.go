@@ -229,28 +229,6 @@ func TestRefersToApple(t *testing.T) {
 	}
 }
 
-func TestParseStatus(t *testing.T) {
-	tests := []struct {
-		out     string
-		want    bool
-		wantErr bool
-	}{
-		{"Status: Enabled for 0 days 00:00:01           Debug: Urgent\n", true, false},
-		{"No ALTQ support in kernel\nStatus: Disabled for 0 days 00:00:01          Debug: Urgent\n\nState Table\n", false, false},
-		{"Status: Unknown\n", false, true},
-		{"", false, true},
-	}
-	for _, tt := range tests {
-		got, err := parseStatus([]byte(tt.out))
-		if (err != nil) != tt.wantErr || got != tt.want {
-			t.Errorf("parseStatus(%q) = (%v, %v), want (%v, error %v)", tt.out, got, err, tt.want, tt.wantErr)
-		}
-		if err != nil && !errors.Is(err, errOutput) {
-			t.Errorf("parseStatus(%q) error = %v, want errOutput", tt.out, err)
-		}
-	}
-}
-
 func TestParseEntries(t *testing.T) {
 	captured := "   10.0.0.0/8\n   198.18.1.1\n  !198.18.1.20\n  !::1\n   2001:db8::1\n"
 	entries, negated, err := parseEntries([]byte(captured))
