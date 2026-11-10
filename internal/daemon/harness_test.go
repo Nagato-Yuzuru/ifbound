@@ -60,8 +60,10 @@ var (
 	en0   = reconcile.Interface{Name: "en0", Class: policy.ClassHardware}
 	utun0 = reconcile.Interface{Name: "utun0", Class: policy.ClassTunnel}
 
-	pfDisabled = reconcile.Problem{Text: "pf is disabled", Voids: true}
-	conflict   = reconcile.Problem{Text: "foreign resolver entry for example.com"}
+	// unreferenced voids enforcement and keeps the loaded ruleset, so
+	// only a convergence notices it, and a Load does not repair it.
+	unreferenced = reconcile.Problem{Text: "the main ruleset does not reference the anchor", Voids: true}
+	conflict     = reconcile.Problem{Text: "foreign resolver entry for example.com"}
 )
 
 func parse(t *testing.T, text string) policy.Config {

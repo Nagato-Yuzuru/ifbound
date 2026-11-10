@@ -448,7 +448,7 @@ func (rg *rig) toggleWrites() {
 func (rg *rig) toggleVoids() {
 	rg.f.voids = !rg.f.voids
 	if rg.f.voids {
-		rg.world.SetProblems([]reconcile.Problem{{Text: "pf is disabled", Voids: true}}, nil)
+		rg.world.SetProblems([]reconcile.Problem{{Text: "the main ruleset does not reference the anchor", Voids: true}}, nil)
 	} else {
 		rg.world.SetProblems(nil, nil)
 	}

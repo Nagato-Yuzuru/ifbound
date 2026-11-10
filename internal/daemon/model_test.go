@@ -1373,7 +1373,7 @@ func (r *omRun) setSaveFail(on bool) {
 
 func (r *omRun) setProblems(idx int) {
 	var be, rs []reconcile.Problem
-	void := reconcile.Problem{Text: "pf is disabled", Voids: true}
+	void := reconcile.Problem{Text: "the main ruleset does not reference the anchor", Voids: true}
 	soft := reconcile.Problem{Text: "a soft backend problem"}
 	conflict := reconcile.Problem{Text: "foreign resolver entry"}
 	switch idx {

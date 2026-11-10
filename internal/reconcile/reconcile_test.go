@@ -369,7 +369,7 @@ func TestConvergeRewritesResolverEntryWhenListenChanges(t *testing.T) {
 
 func TestConvergeReportsExternalProblems(t *testing.T) {
 	f := installV1(t)
-	want := []reconcile.Problem{{Text: "pf is disabled", Voids: true}, {Text: "foreign entry for example.com"}}
+	want := []reconcile.Problem{{Text: "the main ruleset does not reference the anchor", Voids: true}, {Text: "foreign entry for example.com"}}
 	f.world.SetProblems(want[:1], want[1:])
 
 	rep := f.converge(t)
@@ -395,7 +395,7 @@ func (c noteCompiler) Compile(ps []policy.Policy, ifaces []reconcile.Interface, 
 func TestConvergeReportsCompilerProblemsFirst(t *testing.T) {
 	f := installV1(t)
 	f.rec.Compiler = noteCompiler{}
-	backend := reconcile.Problem{Text: "pf is disabled", Voids: true}
+	backend := reconcile.Problem{Text: "the main ruleset does not reference the anchor", Voids: true}
 	f.world.SetProblems([]reconcile.Problem{backend}, nil)
 	in := f.inputs()
 	in.Accounts = reconcile.Accounts{Users: map[string]uint32{"b": 2, "a": 1}}

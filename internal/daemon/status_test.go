@@ -144,7 +144,7 @@ func TestStatusFollowsEachLoopPass(t *testing.T) {
 		h := newHarness(t, configV1)
 		defer h.stop()
 		h.wantState(daemon.StateReady)
-		h.world.SetProblems([]reconcile.Problem{pfDisabled}, nil)
+		h.world.SetProblems([]reconcile.Problem{unreferenced}, nil)
 		heal()
 		if st := published(t, h.d); st.State != daemon.StateUnenforced {
 			t.Errorf("Status after the self-heal = %v, want unenforced", st.State)

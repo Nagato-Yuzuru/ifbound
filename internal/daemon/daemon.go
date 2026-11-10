@@ -131,10 +131,18 @@ type request func(ctx context.Context, l *loop)
 // Its methods are safe for concurrent use. It implements ipc.Handler and
 // ipc.ProbeHandler.
 //
-// The daemon learns of a problem that voids enforcement, such as a
-// disabled firewall, only at a convergence: for up to SelfHealInterval
-// after it appears, reports are still acknowledged, and addresses that
-// were acknowledged earlier are exposed in the same window.
+// The daemon learns of a problem that voids enforcement and keeps the
+// loaded ruleset, such as a main ruleset that does not reference the
+// anchor, only at a convergence: for up to SelfHealInterval after it
+// appears, reports are still acknowledged, and addresses that were
+// acknowledged earlier are exposed in the same window. A disabled
+// firewall is not such a problem: the Backend then reports no loaded
+// ruleset. The next report that matches a policy gets no
+// acknowledgement and starts a convergence, which enables the firewall
+// again. Until that report or the next self-heal, addresses that were
+// acknowledged earlier are exposed. The convergence still sees the
+// Problem that it read before its Load, so acknowledgements start again
+// only at the next convergence.
 type Daemon struct {
 	cfg      Config
 	requests chan request

@@ -21,6 +21,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfrules"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
+	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
 )
 
 const testPolicies = `
@@ -645,6 +646,21 @@ func TestVoidingProblems(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The fake Backend of reconciletest runs the same cases.
+func TestBackendContract(t *testing.T) {
+	reconciletest.RunBackendContract(t, func(t *testing.T) reconciletest.ContractTarget {
+		r := newRig(t)
+		disable := func() {
+			r.k.enabled, r.k.refs = false, nil // another tool ran pfctl -d
+			// The Backend enables pf at most once in EnableInterval. The
+			// contract does not know the limit, so the next Load comes
+			// after it.
+			r.clk.t = r.clk.t.Add(pfbackend.EnableInterval)
+		}
+		return reconciletest.ContractTarget{Backend: r.b, Ruleset: compileRS(t, testPolicies), Disable: disable}
+	})
 }
 
 // Enable: a reference with a token, rate limit, warning, never -d

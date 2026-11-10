@@ -37,6 +37,7 @@ type World struct {
 	// applied are the resolver entries that the fake system uses now.
 	applied  map[policy.Domain]netip.AddrPort
 	delay    bool
+	disabled bool
 	bproblem []reconcile.Problem
 	rproblem []reconcile.Problem
 	writes   int
@@ -80,7 +81,8 @@ func (w *World) SetAfterWrite(f func()) {
 }
 
 // SetProblems sets the external problems that the Backend and the
-// Resolver report.
+// Resolver report. They stay until the next SetProblems: no write
+// repairs them. DisableFirewall gives the Problem of a disabled firewall.
 func (w *World) SetProblems(backend, resolver []reconcile.Problem) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -221,6 +223,16 @@ func (w *World) ExternalLoad(body []byte) {
 	w.ruleset = reconcile.NewRuleset(body)
 }
 
+// DisableFirewall disables the firewall, as an external "pfctl -d"
+// would. It is not a write: no hook runs. The ruleset and the tables
+// stay, but the Backend reports no loaded ruleset until a Load enables
+// the firewall again.
+func (w *World) DisableFirewall() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.disabled = true
+}
+
 // RemoveResolverEntry deletes a resolver entry, as an external tool
 // would. It is not a write: no hook runs. The system applies it as it
 // applies a Remove.
@@ -265,26 +277,42 @@ type Backend struct{ w *World }
 
 var _ reconcile.Backend = (*Backend)(nil)
 
-// Read implements reconcile.Backend.
+// Read implements reconcile.Backend. While the firewall is disabled, the
+// ruleset ID is "" and a Problem voids the enforcement.
 func (b *Backend) Read(context.Context) (reconcile.BackendState, error) {
 	b.w.mu.Lock()
 	defer b.w.mu.Unlock()
+	problems := slices.Clone(b.w.bproblem)
+	if b.w.disabled {
+		problems = append(problems, reconcile.Problem{Text: "the firewall is disabled", Voids: true})
+	}
 	return reconcile.BackendState{
-		Ruleset:  b.w.ruleset.ID(),
+		Ruleset:  b.w.loadedIDLocked(),
 		Tables:   b.w.tablesLocked(),
-		Problems: slices.Clone(b.w.bproblem),
+		Problems: problems,
 	}, nil
 }
 
 // LoadedID implements reconcile.Backend.
 func (b *Backend) LoadedID(context.Context) (string, error) {
-	return b.w.Ruleset().ID(), nil
+	b.w.mu.Lock()
+	defer b.w.mu.Unlock()
+	return b.w.loadedIDLocked(), nil
 }
 
-// Load implements reconcile.Backend.
+// loadedIDLocked returns the ID of the loaded ruleset, or "" while the
+// firewall is disabled: no rule is in effect then.
+func (w *World) loadedIDLocked() string {
+	if w.disabled {
+		return ""
+	}
+	return w.ruleset.ID()
+}
+
+// Load implements reconcile.Backend. It enables the firewall.
 func (b *Backend) Load(_ context.Context, rs reconcile.Ruleset) error {
 	return b.w.write(func() {
-		b.w.ruleset = rs
+		b.w.ruleset, b.w.disabled = rs, false
 		for _, name := range declared(rs) {
 			if b.w.tables[name] == nil {
 				b.w.tables[name] = make(map[netip.Prefix]struct{})
