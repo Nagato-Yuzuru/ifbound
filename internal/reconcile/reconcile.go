@@ -12,6 +12,10 @@
 // blocks stays in its table until it expires or its policy leaves the
 // loaded ruleset. A host address stays while Inputs.Hosts has it. See Reconciler.Converge.
 //
+// No table holds a learned or host address that Blockable refuses. The
+// rule applies to every path to a table: AddObserved, Converge, and
+// Adoptable. It does not apply to the destinations of the configuration.
+//
 // This package defines the platform interfaces. The platform packages
 // implement them; the reconciletest package has fakes.
 package reconcile
@@ -175,17 +179,29 @@ func (r Reconciler) ConvergeResolver(ctx context.Context, in Inputs) (Report, er
 	return rep, err
 }
 
+// Blockable reports whether a table can hold a as a learned or host
+// address. Traffic to a loopback address (all of 127.0.0.0/8 and ::1) or
+// to an unspecified address (0.0.0.0 and ::) does not leave the host. A
+// block of it stops only local services, ifbound-dns too. The rule is
+// the same for the IPv4-mapped form of an address.
+func Blockable(a netip.Addr) bool {
+	a = a.Unmap()
+	return !a.IsLoopback() && !a.IsUnspecified()
+}
+
 // AddObserved adds the addresses to the table of one policy. It is the
 // fast path for a DNS report: it neither reads the actual state nor
-// recompiles. A nil error means the Backend holds every address in the
-// table.
+// recompiles. It skips the addresses that Blockable refuses. A nil error
+// means the Backend holds every other address in the table.
 func (r Reconciler) AddObserved(ctx context.Context, name policy.Name, addrs []netip.Addr) error {
-	if len(addrs) == 0 {
-		return nil
+	entries := make([]netip.Prefix, 0, len(addrs))
+	for _, a := range addrs {
+		if Blockable(a) {
+			entries = append(entries, host(a))
+		}
 	}
-	entries := make([]netip.Prefix, len(addrs))
-	for i, a := range addrs {
-		entries[i] = host(a)
+	if len(entries) == 0 {
+		return nil
 	}
 	if err := r.Backend.AddEntries(ctx, name, entries); err != nil {
 		return fmt.Errorf("adding to table %s: %w", name, err)
@@ -245,7 +261,8 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 // table, and a revert of the configuration must find its addresses. A
 // daemon that starts without a snapshot adopts them, so a lost snapshot
 // keeps addresses blocked instead of unblocking them all. Host-file
-// addresses look learned too; the caller tells them apart.
+// addresses look learned too; the caller tells them apart. An address
+// that Blockable refuses is not adoptable: Converge removes it.
 func (r Reconciler) Adoptable(ctx context.Context, policies []policy.Policy) (map[policy.Name][]netip.Addr, error) {
 	actual, err := r.Backend.Read(ctx)
 	if err != nil {
@@ -258,7 +275,7 @@ func (r Reconciler) Adoptable(ctx context.Context, policies []policy.Policy) (ma
 	out := make(map[policy.Name][]netip.Addr)
 	for name, entries := range actual.Tables {
 		for _, e := range entries {
-			if _, ok := static[name][e]; ok || !e.IsSingleIP() {
+			if _, ok := static[name][e]; ok || !e.IsSingleIP() || !Blockable(e.Addr()) {
 				continue
 			}
 			out[name] = append(out[name], e.Addr())
@@ -432,16 +449,17 @@ func atOrBelow(d, apex policy.Domain) bool {
 func compareDomains(a, b policy.Domain) int { return strings.Compare(a.String(), b.String()) }
 
 // desiredTables has a key for every policy, also when its table is empty:
-// a missing key marks a table to drop.
+// a missing key marks a table to drop. It skips the learned and host
+// addresses that Blockable refuses, so Converge removes them from the
+// tables.
 func desiredTables(in Inputs) map[policy.Name]prefixSet {
 	out := make(map[policy.Name]prefixSet, len(in.Policies))
 	for _, p := range in.Policies {
 		s := staticEntries(p)
-		for _, a := range in.Book.Addrs(p.Name) {
-			s[host(a)] = struct{}{}
-		}
-		for _, a := range in.Hosts[p.Name] {
-			s[host(a)] = struct{}{}
+		for _, a := range slices.Concat(in.Book.Addrs(p.Name), in.Hosts[p.Name]) {
+			if Blockable(a) {
+				s[host(a)] = struct{}{}
+			}
 		}
 		out[p.Name] = s
 	}

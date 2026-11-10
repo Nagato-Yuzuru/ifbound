@@ -538,3 +538,31 @@ func TestAddObservedWithNoAddressWritesNothing(t *testing.T) {
 		t.Errorf("writes %d -> %d, want none", before, f.world.Writes())
 	}
 }
+
+// Blockable refuses only the addresses that traffic to does not leave the
+// host. A link-local address leaves the host, so a table can hold it.
+func TestBlockableRefusesOnlyHostLocalAddresses(t *testing.T) {
+	for s, want := range map[string]bool{
+		"127.0.0.1":          false,
+		"127.0.0.0":          false,
+		"127.255.255.255":    false,
+		"::1":                false,
+		"0.0.0.0":            false,
+		"::":                 false,
+		"::ffff:127.0.0.1":   false,
+		"::ffff:0.0.0.0":     false,
+		"126.255.255.255":    true,
+		"128.0.0.0":          true,
+		"0.0.0.1":            true,
+		"::2":                true,
+		"169.254.1.1":        true,
+		"fe80::1":            true,
+		"203.0.113.1":        true,
+		"::ffff:203.0.113.1": true,
+		"3fff::1":            true,
+	} {
+		if got := reconcile.Blockable(netip.MustParseAddr(s)); got != want {
+			t.Errorf("Blockable(%s) = %v, want %v", s, got, want)
+		}
+	}
+}

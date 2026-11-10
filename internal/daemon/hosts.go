@@ -139,11 +139,8 @@ func (h *hostsState) problem() (reconcile.Problem, bool) {
 // as a CNAME to the first name, and it follows that CNAME across all
 // lines, also when the first name is an alias of another line. So a
 // matching name takes the addresses of each first name that its CNAME
-// chain reaches.
-//
-// A loopback or unspecified address is not a host address: traffic to it
-// does not leave the host, and a block of it would stop local services,
-// ifbound-dns too.
+// chain reaches. The Reconciler skips the addresses that
+// reconcile.Blockable refuses.
 //
 // It also logs, in one event, the lines with a name that the entries
 // cannot show, when the name is at or below an apex. Such a line can hold
@@ -200,11 +197,7 @@ func newHostGraph(entries []hostsfile.Entry) hostGraph {
 	g := hostGraph{addrs: make(map[string][]netip.Addr), targets: make(map[string][]string)}
 	for _, e := range entries {
 		first := e.Name.String()
-		if !e.Addr.IsLoopback() && !e.Addr.IsUnspecified() {
-			g.addrs[first] = append(g.addrs[first], e.Addr)
-		} else if _, ok := g.addrs[first]; !ok {
-			g.addrs[first] = nil // the name is still in the file
-		}
+		g.addrs[first] = append(g.addrs[first], e.Addr)
 		for _, a := range e.Aliases {
 			g.targets[a.String()] = append(g.targets[a.String()], first)
 		}

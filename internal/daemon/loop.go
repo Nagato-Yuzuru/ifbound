@@ -616,12 +616,16 @@ func (l *loop) checkInstalled(ctx context.Context) error {
 }
 
 // canonical returns the addresses in the form that the AddrBook keys
-// them by: IPv4-mapped IPv6 unmapped. The same slice goes to the book and
-// to the tables, so a table entry and its book key cannot differ.
+// them by: IPv4-mapped IPv6 unmapped. It drops the addresses that
+// reconcile.Blockable refuses, so the snapshot does not keep them. The
+// same slice goes to the book and to the tables, so a table entry and
+// its book key cannot differ.
 func canonical(addrs []netip.Addr) []netip.Addr {
-	out := make([]netip.Addr, len(addrs))
-	for i, a := range addrs {
-		out[i] = a.Unmap()
+	out := make([]netip.Addr, 0, len(addrs))
+	for _, a := range addrs {
+		if reconcile.Blockable(a) {
+			out = append(out, a.Unmap())
+		}
 	}
 	return out
 }
