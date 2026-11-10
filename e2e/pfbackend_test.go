@@ -415,6 +415,59 @@ func TestPfBackendNatPassVoids(t *testing.T) {
 	}
 }
 
+// TestPfBackendRulesBeforeTheAnchorVoid checks rules that another tool
+// loads in an anchor that pf evaluates before the ifbound anchor: a quick
+// anchor rule that calls an anchor with a pass rule, and an anchor rule
+// that calls an anchor out of its own subtree, which holds a quick pass
+// rule. Real pf then passes a protected packet on the default route (the
+// physical interface), and Read reports a voiding Problem that names the
+// anchor of the rule.
+func TestPfBackendRulesBeforeTheAnchorVoid(t *testing.T) {
+	// "000.e2e" comes before "000.ifbound" in byte order.
+	const earlier = "com.apple/000.e2e-ifbound"
+	type foreign struct{ anchor, rules string }
+	tests := []struct {
+		name  string
+		loads []foreign // in order
+		want  string    // a part of the text of the voiding Problem
+	}{
+		{"quick anchor that calls a pass rule", []foreign{
+			{earlier, "anchor \"vpn\" quick all\n"},
+			{earlier + "/vpn", "pass out all no state\n"},
+		}, "in the anchor " + earlier + " "},
+		{"absolute call out of the subtree", []foreign{
+			{earlier, "anchor \"/ifbound-e2e-vpn\" all\n"},
+			{"ifbound-e2e-vpn", "pass out quick all no state\n"},
+		}, "in the anchor ifbound-e2e-vpn "},
+		{"relative call out of the subtree", []foreign{
+			{earlier, "anchor \"../zzz.ifbound-e2e\" all\n"},
+			{"com.apple/zzz.ifbound-e2e", "pass out quick all no state\n"},
+		}, "in the anchor com.apple/zzz.ifbound-e2e "},
+	}
+	dst := netip.MustParseAddrPort("192.0.2.12:9")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, _ := newPfBackend(t)
+			config := "[[policy]]\nname = \"e2e-q\"\nto = [\"192.0.2.12\"]\nonly_via = []\n"
+			load(t, b, compilePolicies(t, config))
+			addEntries(t, b, "e2e-q", "192.0.2.12/32")
+			if err := udpExchange(t, dst); !errors.Is(err, syscall.ECONNREFUSED) {
+				t.Fatalf("UDP to %s before the rules of the other tool: %v, want ECONNREFUSED", dst, err)
+			}
+			for _, l := range tt.loads {
+				loadAnchor(t, l.anchor, l.rules)
+			}
+			if err := udpExchange(t, dst); !errors.Is(err, errNoAnswer) {
+				t.Errorf("UDP to %s with the rules of the other tool: %v, want no answer (pf passes it)", dst, err)
+			}
+			ps := readState(t, b).Problems
+			if !slices.ContainsFunc(ps, func(p reconcile.Problem) bool { return p.Voids && strings.Contains(p.Text, tt.want) }) {
+				t.Errorf("problems = %v, want a voiding Problem with %q", ps, tt.want)
+			}
+		})
+	}
+}
+
 // TestPfBackendTopLevelRuleIsAChange checks that a rule that another tool
 // adds at the top level of the ifbound anchor, with a read-modify-write
 // that keeps the sentinel rules, gives no loaded ruleset, and that Load

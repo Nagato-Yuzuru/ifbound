@@ -382,7 +382,7 @@ func TestReadProblems(t *testing.T) {
 			f.anchors["com.apple/0.tool"] = []string{passQuickRule}
 		}, []string{"in the anchor com.apple/0.tool comes before"}},
 		{"quick pass below an earlier com.apple anchor", func(f *fakePF) {
-			f.anchors["com.apple/0.tool"] = []string{`anchor "com.apple/0.tool/*" all`}
+			f.anchors["com.apple/0.tool"] = []string{`anchor "*" all`}
 			f.anchors["com.apple/0.tool/x"] = []string{passQuickRule}
 		}, []string{"in the anchor com.apple/0.tool/x comes before"}},
 		{"non-quick pass in an earlier com.apple anchor", func(f *fakePF) {
@@ -398,11 +398,12 @@ func TestReadProblems(t *testing.T) {
 				return slices.Contains(args, "com.apple/0.tool") && slices.Contains(args, "-sr")
 			}
 		}, []string{"cannot read the rules of the anchor com.apple/0.tool"}},
+		// A later anchor can hold a route rule.
 		{"pfctl cannot read the filter rules of a later anchor", func(f *fakePF) {
 			f.complain = func(args []string) bool {
 				return slices.Contains(args, "com.apple/200.AirDrop") && slices.Contains(args, "-sr")
 			}
-		}, nil},
+		}, []string{"cannot read the rules of the anchor com.apple/200.AirDrop"}},
 		{"set skip on en0", func(f *fakePF) { f.ifaces = []string{"en0 (skip)", "lo0"} }, []string{"skips the interface en0"}},
 		{"set skip on lo0", func(f *fakePF) { f.ifaces = []string{"en0", "lo0 (skip)"} }, nil},
 		{"anchor reference for inbound packets only", func(f *fakePF) {

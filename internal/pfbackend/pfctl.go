@@ -250,18 +250,53 @@ func passQuick(rule string) bool {
 	return len(f) > 0 && f[0] == "pass" && slices.Contains(f, "quick")
 }
 
-// anchorRule returns the anchor path of a printed anchor rule, without a
-// trailing "/*".
-func anchorRule(rule string) (string, bool) {
-	rest, ok := strings.CutPrefix(rule, `anchor "`)
+// anchorRule returns the anchor call of a printed anchor rule, as pf
+// keeps it (pf_anchor_copyout), and whether the rule is quick. ok is
+// false when pfctl prints no anchor name.
+func anchorRule(rule string) (call string, quick, ok bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(rule), `anchor "`)
 	if !ok {
-		return "", false
+		return "", false, false
 	}
-	name, _, ok := strings.Cut(rest, `"`)
-	if !ok || name == "" {
-		return "", false
+	call, rest, ok = strings.Cut(rest, `"`)
+	if !ok || call == "" {
+		return "", false, false
 	}
-	return strings.TrimSuffix(name, "/*"), true
+	return call, slices.Contains(strings.Fields(rest), "quick"), true
+}
+
+// callTarget returns the anchor that an anchor call in the anchor from
+// refers to, as pf_anchor_setup reads the call: a path that starts with
+// "/" is absolute, each "../" goes up one anchor, and other paths are
+// below from. wildcard is true when the call ends with "/*": pf then
+// evaluates the anchors directly below path, and not path.
+func callTarget(from, call string) (path string, wildcard bool) {
+	if abs, ok := strings.CutPrefix(call, "/"); ok {
+		path = abs
+	} else {
+		path = from
+		for {
+			rest, ok := strings.CutPrefix(call, "../")
+			if !ok {
+				break
+			}
+			call = rest
+			path = path[:max(strings.LastIndex(path, "/"), 0)]
+		}
+		if path != "" {
+			path += "/"
+		}
+		path += call
+	}
+	return strings.CutSuffix(path, "/*")
+}
+
+// routes reports whether a rule that pfctl printed routes packets to an
+// interface.
+func routes(rule string) bool {
+	return slices.ContainsFunc(strings.Fields(rule), func(w string) bool {
+		return w == "route-to" || w == "reply-to" || w == "dup-to" || w == "fastroute"
+	})
 }
 
 // natPass reports whether a NAT rule that pfctl printed passes the

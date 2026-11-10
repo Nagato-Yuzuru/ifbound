@@ -362,7 +362,7 @@ func (f *fakePF) load(path string, stdin []byte) {
 	}
 	f.anchors[path] = rules
 	for _, rule := range rules {
-		if name, ok := anchorRule(rule); ok {
+		if name, _, ok := anchorRule(rule); ok {
 			if _, ok := f.anchors[path+"/"+name]; !ok {
 				f.anchors[path+"/"+name] = nil
 			}

@@ -62,7 +62,7 @@ func rulesOf(lines []string, kind pf.RulesetKind) []pf.Rule {
 		if strings.HasPrefix(line, "block ") {
 			r.Action = pf.ActionDrop
 		}
-		if name, ok := anchorRule(line); ok && kind == pf.RulesetFilter {
+		if name, _, ok := anchorRule(line); ok && kind == pf.RulesetFilter {
 			r.AnchorCall = name
 		}
 		if _, rest, ok := strings.Cut(line, `label "`); ok {
