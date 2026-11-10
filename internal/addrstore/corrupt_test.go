@@ -1,6 +1,7 @@
 package addrstore
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"maps"
@@ -19,8 +20,9 @@ const (
 	countAt = 10
 )
 
-// A damaged page header makes bbolt panic, or read outside the file. Open
-// returns ErrCorrupt for a book with such a page, and the process lives.
+// A damaged page header makes bbolt panic, read outside the file, or read
+// entries that are not there. Open returns ErrCorrupt for a book with such
+// a page, and the process lives.
 func TestOpenOfABookWithADamagedPageReturnsErrCorrupt(t *testing.T) {
 	path := dbPath(t)
 	s, _ := openCounted(t, path, "")
@@ -33,36 +35,55 @@ func TestOpenOfABookWithADamagedPageReturnsErrCorrupt(t *testing.T) {
 	}
 	good := readBytes(t, path)
 
-	damages := []struct {
+	type damage struct {
 		name  string
 		field int
 		value [2]byte
-	}{
+	}
+	damages := []damage{
 		{"flags", flagsAt, [2]byte{0xff, 0xff}},
 		{"element count", countAt, [2]byte{0xff, 0x7f}},
 	}
+	// A freelist count of one entry for each page of the file names a
+	// page two times, or a page outside the file. The entries stay inside
+	// the freelist page, so bbolt reads them without a fault.
+	var pageCount [2]byte
+	binary.NativeEndian.PutUint16(pageCount[:], uint16(len(good)/pageSize))
+	freelistDamage := damage{"element count of one entry for each page", countAt, pageCount}
 	for id, typ := range used {
+		damages := damages
+		if typ == "freelist" {
+			damages = append(slices.Clip(damages), freelistDamage)
+		}
 		for _, d := range damages {
 			t.Run(fmt.Sprintf("%s of %s page %d", d.name, typ, id), func(t *testing.T) {
 				image := slices.Clone(good)
 				copy(image[id*pageSize+d.field:], d.value[:])
-				bad := filepath.Join(t.TempDir(), "bad.db")
-				if err := os.WriteFile(bad, image, 0o600); err != nil {
-					t.Fatal(err)
-				}
-				s, err := Open(bad, "", retain)
-				if err == nil {
-					_ = s.Close() //nolint:errcheck // the test failed already
-				}
-				if !errors.Is(err, ErrCorrupt) {
-					t.Errorf("Open = %v, want ErrCorrupt", err)
-				}
-				// Open closed the file: a new Open does not wait for its lock.
-				if _, err := Open(bad, "", retain); !errors.Is(err, ErrCorrupt) {
-					t.Errorf("second Open = %v, want ErrCorrupt", err)
-				}
+				openDamaged(t, image)
 			})
 		}
+	}
+}
+
+// openDamaged writes image to a new file, and checks that two Opens of
+// that file return ErrCorrupt.
+func openDamaged(t *testing.T, image []byte) {
+	t.Helper()
+	bad := filepath.Join(t.TempDir(), "bad.db")
+	if err := os.WriteFile(bad, image, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(bad, "", retain)
+	if err == nil {
+		_ = s.Close() //nolint:errcheck // the test failed already
+	}
+	if !errors.Is(err, ErrCorrupt) {
+		t.Errorf("Open = %v, want ErrCorrupt", err)
+	}
+	// Open unlocked the file: a new Open does not wait for its lock. On
+	// Linux, the lock stays after a close while a map of the file exists.
+	if _, err := Open(bad, "", retain); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("second Open = %v, want ErrCorrupt", err)
 	}
 }
 

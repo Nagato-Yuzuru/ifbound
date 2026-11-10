@@ -208,9 +208,12 @@ func open(path, legacy string, retain time.Duration, update func(*bbolt.DB, func
 	case errors.Is(err, syscall.ELOOP):
 		return nil, fmt.Errorf("open addrstore: %w: %s is a symlink", ErrBadPath, path)
 	case errors.Is(err, ErrCorrupt) && file != nil:
-		// bbolt stopped inside Open and did not return the DB. Close its
-		// file to release the lock. Its memory map of the file stays.
-		_ = file.Close() //nolint:errcheck // the corrupt file is the error to report; nothing was written
+		// bbolt stopped inside Open and did not return the DB, so its
+		// memory map of the file stays. On Linux, the map keeps the open
+		// file alive after Close, and the lock stays with it. Thus unlock
+		// the file before the close, as DB.Close does.
+		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN) //nolint:errcheck // the corrupt file is the error to report; after a failed unlock, the next Open fails with a timeout
+		_ = file.Close()                                   //nolint:errcheck // the corrupt file is the error to report; nothing was written
 		return nil, fmt.Errorf("open addrstore %s: %w", path, err)
 	case err != nil:
 		return nil, fmt.Errorf("open addrstore %s: %w", path, err)
@@ -256,6 +259,9 @@ func guard(fn func() error) (err error) {
 // prepare merges the legacy snapshot into the book, removes the
 // snapshot, and loads the index.
 func (s *Store) prepare(legacy string) error {
+	if err := s.checkFreelist(); err != nil {
+		return err
+	}
 	version, err := s.version()
 	if err != nil {
 		return err
@@ -283,6 +289,39 @@ func (s *Store) prepare(legacy string) error {
 		return err
 	}
 	s.index = index
+	return nil
+}
+
+// checkFreelist returns an error that wraps ErrCorrupt when the freelist
+// that Open read does not name each free page one time only. bbolt reads
+// the freelist without a check. A damaged count makes it read entries
+// that are not there. Past the end of its map, other memory of the
+// process often follows (on Linux, for example), so that read does not
+// always fault. A commit could then use a page two times, or a page that
+// is not in the file. A free page is a page of the file under its
+// high-water mark, and a meta page is never free.
+func (s *Store) checkFreelist() error {
+	free := 0
+	err := s.db.View(func(tx *bbolt.Tx) error {
+		for id := 2; ; id++ {
+			info, err := tx.Page(id)
+			if err != nil {
+				return err
+			}
+			if info == nil {
+				return nil
+			}
+			if info.Type == "free" {
+				free++
+			}
+		}
+	})
+	if err != nil {
+		return err
+	}
+	if n := s.db.Stats().FreePageN; n != free {
+		return fmt.Errorf("%w: the freelist has %d entries for %d free pages", ErrCorrupt, n, free)
+	}
 	return nil
 }
 
