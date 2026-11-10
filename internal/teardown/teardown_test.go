@@ -18,11 +18,20 @@ import (
 )
 
 // ref is a pf reference: pf gives a released value again, so only the
-// value with its creation time names one reference.
+// value with its creation time and the pid of its owner names one
+// reference.
 type ref struct {
 	value string
 	born  time.Time
+	pid   int
 }
+
+// The pids of the processes that take a pf reference.
+const (
+	ifbounddPID = 412
+	otherPID    = 77
+	thirdPID    = 903
+)
 
 // kernel is the pf state that the fake Backend changes. It outlives one
 // Run, as the kernel outlives a process.
@@ -36,7 +45,7 @@ type kernel struct {
 	tables bool  // the anchor holds tables
 }
 
-func (k *kernel) enable() ref {
+func (k *kernel) enable(pid int) ref {
 	var v string
 	if n := len(k.free); n > 0 {
 		v, k.free = k.free[n-1], k.free[:n-1]
@@ -44,7 +53,7 @@ func (k *kernel) enable() ref {
 		k.next++
 		v = strconv.Itoa(1000 + k.next)
 	}
-	r := ref{value: v, born: k.now}
+	r := ref{value: v, born: k.now, pid: pid}
 	k.refs = append(k.refs, r)
 	return r
 }
@@ -58,8 +67,8 @@ const (
 
 // fakeBackend unloads with the steps of pfbackend.Unload: it reads the
 // token labels, gives back each labelled token that pf holds with the
-// same creation time, then flushes the rules (with the labels) and the
-// tables. A new fakeBackend is a new process: it knows only the labels.
+// same creation time and pid, then flushes the rules (with the labels)
+// and the tables. A new fakeBackend is a new process: it knows only the labels.
 type fakeBackend struct {
 	k *kernel
 	// stop makes the Unload step with this name fail.
@@ -108,8 +117,8 @@ func newRig(t *testing.T) *rig {
 	t.Helper()
 	k := &kernel{now: time.Date(2026, 10, 30, 9, 0, 0, 0, time.UTC)}
 	r := &rig{k: k, w: reconciletest.NewWorld(), lock: filepath.Join(t.TempDir(), "enforcement.lock")}
-	r.other = k.enable()
-	k.labels = []ref{k.enable()}
+	r.other = k.enable(otherPID)
+	k.labels = []ref{k.enable(ifbounddPID)}
 	k.rules, k.tables = true, true
 	d, err := policy.ParseDomain("corp.example")
 	if err != nil {
@@ -157,8 +166,9 @@ type stop struct {
 }
 
 // A stop at each step, then a second Run in a new process, finishes the
-// teardown. Between the runs, a third tool takes a pf reference, and pf
-// can give it the value that ifbound released.
+// teardown. Between the runs, a third tool takes a pf reference in the
+// same second, and pf can give it the value that ifbound released. Only
+// the pid then tells the two references apart.
 func TestRunFinishesAfterAStopAtEachStep(t *testing.T) {
 	stops := []stop{{unload: stepRelease}, {unload: stepRules}, {unload: stepTables}}
 	for n := 1; n <= 2; n++ { // the apex entry and the canary entry
@@ -193,8 +203,7 @@ func runAfterAStop(t *testing.T, s stop) {
 		t.Errorf("a Run whose unload failed changed the resolver entries to %v: they keep the protected names failing", r.w.ResolverEntries())
 	}
 	r.w.SetBeforeWrite(nil)
-	r.k.now = r.k.now.Add(time.Minute)
-	third := r.k.enable()
+	third := r.k.enable(thirdPID)
 	second, _ := r.teardown("")
 	if err := second.Run(t.Context()); err != nil {
 		t.Fatalf("second Run: %v", err)
