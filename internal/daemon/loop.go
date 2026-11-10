@@ -5,12 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/netip"
 	"slices"
 	"sync/atomic"
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
@@ -337,8 +337,8 @@ func (l *loop) adopt(ctx context.Context, book *addrbook.AddrBook, policies []po
 		if l.hosts.read {
 			// The host file is their source of truth, not the snapshot.
 			hosts := l.hosts.addrs[name] // sorted
-			addrs = slices.DeleteFunc(addrs, func(a netip.Addr) bool {
-				_, found := slices.BinarySearchFunc(hosts, a, netip.Addr.Compare)
+			addrs = slices.DeleteFunc(addrs, func(a blockable.Addr) bool {
+				_, found := slices.BinarySearchFunc(hosts, a, blockable.Addr.Compare)
 				return found
 			})
 		}
@@ -570,11 +570,14 @@ func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) 
 }
 
 // record puts the addresses of o in the book, the tables, and the
-// snapshot of each policy in names, in this order. After a failure, the
-// book keeps the addresses. The next report or convergence completes the
+// snapshot of each policy in names, in this order. It skips the
+// addresses that blockable.New refuses, so the snapshot does not keep
+// them either. The same slice goes to the book and to the tables, so a
+// table entry and its book key cannot differ. After a failure, the book
+// keeps the addresses. The next report or convergence completes the
 // work.
 func (l *loop) record(ctx context.Context, book *addrbook.AddrBook, names []policy.Name, o ipc.Observation) error {
-	addrs := canonical(o.Addrs)
+	addrs := blockable.Filter(o.Addrs)
 	needSave := false
 	for _, name := range names {
 		ns, err := book.Observe(name, addrs, o.TTL)
@@ -613,21 +616,6 @@ func (l *loop) checkInstalled(ctx context.Context) error {
 		return ErrUnenforced
 	}
 	return nil
-}
-
-// canonical returns the addresses in the form that the AddrBook keys
-// them by: IPv4-mapped IPv6 unmapped. It drops the addresses that
-// reconcile.Blockable refuses, so the snapshot does not keep them. The
-// same slice goes to the book and to the tables, so a table entry and
-// its book key cannot differ.
-func canonical(addrs []netip.Addr) []netip.Addr {
-	out := make([]netip.Addr, 0, len(addrs))
-	for _, a := range addrs {
-		if reconcile.Blockable(a) {
-			out = append(out, a.Unmap())
-		}
-	}
-	return out
 }
 
 // status costs one map lookup per policy, so the loop can publish it at

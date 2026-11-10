@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfrules"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
@@ -21,9 +22,9 @@ import (
 const loPolicy = "[[policy]]\nname = \"e2e-lo\"\nto = [\"lo.example\"]\nonly_via = []\n"
 
 // fixedBook gives the same learned addresses to every policy.
-type fixedBook []netip.Addr
+type fixedBook []blockable.Addr
 
-func (b fixedBook) Addrs(policy.Name) []netip.Addr { return b }
+func (b fixedBook) Addrs(policy.Name) []blockable.Addr { return b }
 
 // startUDPEcho serves a UDP echo on 127.0.0.1, as ifbound-dns serves
 // mDNSResponder there, and returns its address.
@@ -88,10 +89,12 @@ func TestLoopbackAnswerDoesNotBlockLocalService(t *testing.T) {
 		netip.MustParseAddr("0.0.0.0"), netip.MustParseAddr("::"),
 	}
 	learned := netip.MustParseAddr("192.0.2.10")
-	if _, err := rec.Converge(t.Context(), reconcile.Inputs{Policies: cfg.Policies, Book: fixedBook(append(slices.Clone(local), learned))}); err != nil {
+	// The daemon builds learned addresses with blockable.Filter, as here.
+	book := fixedBook(blockable.Filter(append(slices.Clone(local), learned)))
+	if _, err := rec.Converge(t.Context(), reconcile.Inputs{Policies: cfg.Policies, Book: book}); err != nil {
 		t.Fatalf("Converge: %v", err)
 	}
-	if err := rec.AddObserved(t.Context(), "e2e-lo", local); err != nil {
+	if err := rec.AddObserved(t.Context(), "e2e-lo", blockable.Filter(local)); err != nil {
 		t.Fatalf("AddObserved: %v", err)
 	}
 

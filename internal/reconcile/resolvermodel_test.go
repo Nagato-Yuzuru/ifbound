@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
@@ -59,7 +60,7 @@ deny_via = ["en1"]
 // does not depend on the addresses.
 type noAddrs struct{}
 
-func (noAddrs) Addrs(policy.Name) []netip.Addr { return nil }
+func (noAddrs) Addrs(policy.Name) []blockable.Addr { return nil }
 
 // refDesired is the reference desired set of resolver domains.
 func refDesired(apexes []string) map[string]bool {

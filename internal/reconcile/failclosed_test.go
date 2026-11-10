@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
 )
@@ -166,6 +167,20 @@ func prepare(t *testing.T, tr transition) *fixture {
 // domains returns the domains of the resolver entries, sorted.
 func domains(w *reconciletest.World) []string {
 	return entryDomains(w.ResolverEntries())
+}
+
+// learned returns ss as blockable addresses. It panics when
+// blockable.New refuses one.
+func learned(ss ...string) []blockable.Addr {
+	out := make([]blockable.Addr, len(ss))
+	for i, s := range ss {
+		a, ok := blockable.New(netip.MustParseAddr(s))
+		if !ok {
+			panic("blockable.New refuses " + s)
+		}
+		out[i] = a
+	}
+	return out
 }
 
 func prefixes(ss ...string) []netip.Prefix {

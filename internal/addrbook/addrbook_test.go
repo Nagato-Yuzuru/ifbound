@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
@@ -34,9 +35,33 @@ func newBook(t *testing.T) (*addrbook.AddrBook, *fakeClock) {
 	return addrbook.New(retain, c.now), c
 }
 
+// blockables returns addrs as blockable addresses. It fails the test
+// when blockable.New refuses one.
+func blockables(t testing.TB, addrs ...netip.Addr) []blockable.Addr {
+	t.Helper()
+	out := make([]blockable.Addr, len(addrs))
+	for i, a := range addrs {
+		b, ok := blockable.New(a)
+		if !ok {
+			t.Fatalf("blockable.New(%v) refused", a)
+		}
+		out[i] = b
+	}
+	return out
+}
+
+// plain returns the addresses of bs.
+func plain(bs []blockable.Addr) []netip.Addr {
+	out := make([]netip.Addr, len(bs))
+	for i, b := range bs {
+		out[i] = b.Addr()
+	}
+	return out
+}
+
 func observe(t *testing.T, b *addrbook.AddrBook, name policy.Name, ttl time.Duration, addrs ...netip.Addr) bool {
 	t.Helper()
-	need, err := b.Observe(name, addrs, ttl)
+	need, err := b.Observe(name, blockables(t, addrs...), ttl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +197,7 @@ func TestNeedSaveFailedSaveThenRetry(t *testing.T) {
 		t.Fatal("retry after a failed save: needSave = false")
 	}
 	save(t, b, good)
-	if got := restart(t, c, good).Addrs("p"); !slices.Equal(got, []netip.Addr{a1}) {
+	if got := plain(restart(t, c, good).Addrs("p")); !slices.Equal(got, []netip.Addr{a1}) {
 		t.Fatalf("restart addrs = %v", got)
 	}
 }
@@ -233,27 +258,17 @@ func TestObserveRefusesBadInput(t *testing.T) {
 		want  error
 	}{
 		{"empty policy", "", []netip.Addr{a1}, 0, addrbook.ErrEmptyPolicy},
-		{"invalid addr", "p", []netip.Addr{a2, {}}, 0, addrbook.ErrInvalidAddr},
-		{"zoned addr", "p", []netip.Addr{a2, netip.MustParseAddr("fe80::1%en0")}, 0, addrbook.ErrZonedAddr},
 		{"negative ttl", "p", []netip.Addr{a2}, -1, addrbook.ErrNegativeTTL},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := b.Observe(tt.pol, tt.addrs, tt.ttl); !errors.Is(err, tt.want) {
+			if _, err := b.Observe(tt.pol, blockables(t, tt.addrs...), tt.ttl); !errors.Is(err, tt.want) {
 				t.Fatalf("err = %v, want %v", err, tt.want)
 			}
 			if len(b.Addrs("p")) != 0 {
 				t.Fatal("refused observe changed the book")
 			}
 		})
-	}
-}
-
-func TestObserveUnmapsIPv4InIPv6(t *testing.T) {
-	b, _ := newBook(t)
-	observe(t, b, "p", 0, netip.MustParseAddr("::ffff:192.0.2.1"), a1)
-	if got := b.Addrs("p"); !slices.Equal(got, []netip.Addr{a1}) {
-		t.Fatalf("addrs = %v", got)
 	}
 }
 
@@ -277,7 +292,7 @@ func TestExpireAndPruneAreSorted(t *testing.T) {
 	if got := b.Prune([]policy.Name{"c"}); len(got) != 9 || !sorted(got) {
 		t.Fatalf("prune: %d entries, sorted=%v", len(got), sorted(got))
 	}
-	if got := b.Addrs("c"); len(got) != 3 || !slices.IsSortedFunc(got, netip.Addr.Compare) {
+	if got := b.Addrs("c"); len(got) != 3 || !slices.IsSortedFunc(got, blockable.Addr.Compare) {
 		t.Fatalf("addrs = %v", got)
 	}
 	if got := b.Addrs("a"); len(got) != 0 {

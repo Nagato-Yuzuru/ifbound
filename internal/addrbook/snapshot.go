@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
@@ -123,7 +124,7 @@ func (b *AddrBook) encode() ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			f.Entries = append(f.Entries, snapshotEntry{name, a, seen, int64(r.ttl), exp})
+			f.Entries = append(f.Entries, snapshotEntry{name, a.Addr(), seen, int64(r.ttl), exp})
 		}
 	}
 	return json.Marshal(f)
@@ -191,6 +192,8 @@ func syncDir(dir string) error {
 // link, a missing directory and every other read error are errors. Load
 // never loads a part of a snapshot, and a failed Load leaves the book
 // unchanged. Load does not drop expired entries. The next Expire does.
+// Load drops an entry with an address that blockable.New refuses: an
+// earlier version can have saved it. The next Save does not write it.
 //
 // If the configured retain is larger than when the snapshot was saved,
 // the expiry becomes the later of the stored one and
@@ -245,7 +248,7 @@ func badf(format string, args ...any) error {
 // decode reads a snapshot. It accepts each key once, spelled exactly,
 // and nothing after the document. It decodes in two passes: the key set
 // depends on the version.
-func (b *AddrBook) decode(data []byte) (map[policy.Name]map[netip.Addr]*record, error) {
+func (b *AddrBook) decode(data []byte) (map[policy.Name]map[blockable.Addr]*record, error) {
 	var head struct {
 		Version *int `json:"version"`
 	}
@@ -303,15 +306,19 @@ func parseAddr(s string) (netip.Addr, error) {
 	return a, nil
 }
 
-func (b *AddrBook) decodeEntries(items []loadedEntry) (map[policy.Name]map[netip.Addr]*record, error) {
-	out := make(map[policy.Name]map[netip.Addr]*record)
+func (b *AddrBook) decodeEntries(items []loadedEntry) (map[policy.Name]map[blockable.Addr]*record, error) {
+	out := make(map[policy.Name]map[blockable.Addr]*record)
 	for i, item := range items {
-		name, k, r, err := b.decodeEntry(item)
+		name, a, r, err := b.decodeEntry(item)
 		if err != nil {
 			return nil, fmt.Errorf("item %d: %w", i, err)
 		}
+		k, ok := blockable.New(a)
+		if !ok {
+			continue
+		}
 		if out[name] == nil {
-			out[name] = make(map[netip.Addr]*record)
+			out[name] = make(map[blockable.Addr]*record)
 		}
 		if _, dup := out[name][k]; dup {
 			return nil, fmt.Errorf("item %d: %w", i, errDuplicate)

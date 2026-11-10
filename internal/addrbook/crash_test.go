@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 )
 
 type crash struct{}
@@ -21,13 +23,13 @@ func TestCrashBeforeRenameKeepsOldSnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "book.json")
 
 	b := New(time.Hour*24, clock)
-	if _, err := b.Observe("p", []netip.Addr{a1}, 0); err != nil {
+	if _, err := b.Observe("p", blockable.Filter([]netip.Addr{a1}), 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := b.Save(path); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := b.Observe("p", []netip.Addr{a2}, 0); err != nil {
+	if _, err := b.Observe("p", blockable.Filter([]netip.Addr{a2}), 0); err != nil {
 		t.Fatal(err)
 	}
 	b.rename = func(string, string) error { panic(crash{}) }
@@ -56,7 +58,7 @@ func TestCrashBeforeRenameKeepsOldSnapshot(t *testing.T) {
 	if err := b2.Load(path); err != nil {
 		t.Fatal(err)
 	}
-	if got := b2.Addrs("p"); len(got) != 1 || got[0] != a1 {
+	if got := b2.Addrs("p"); len(got) != 1 || got[0].Addr() != a1 {
 		t.Fatalf("old snapshot lost: %v", got)
 	}
 
@@ -79,7 +81,7 @@ func TestCrashBeforeRenameKeepsOldSnapshot(t *testing.T) {
 func TestFailedRenameKeepsNeedSave(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	b := New(time.Hour*24, func() time.Time { return now })
-	addrs := []netip.Addr{netip.MustParseAddr("192.0.2.1")}
+	addrs := blockable.Filter([]netip.Addr{netip.MustParseAddr("192.0.2.1")})
 	if _, err := b.Observe("p", addrs, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +100,7 @@ func TestFailedRenameKeepsNeedSave(t *testing.T) {
 func TestSaveRenamesFullTempInSameDir(t *testing.T) {
 	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	b := New(time.Hour, func() time.Time { return now })
-	if _, err := b.Observe("p", []netip.Addr{netip.MustParseAddr("192.0.2.1")}, 0); err != nil {
+	if _, err := b.Observe("p", blockable.Filter([]netip.Addr{netip.MustParseAddr("192.0.2.1")}), 0); err != nil {
 		t.Fatal(err)
 	}
 	path := filepath.Join(t.TempDir(), "book.json")

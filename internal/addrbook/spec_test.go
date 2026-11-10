@@ -28,7 +28,7 @@ func oBook(r time.Duration) (*addrbook.AddrBook, *fakeClock) {
 
 func mustObserve(t *testing.T, b *addrbook.AddrBook, name policy.Name, ttl time.Duration, addrs ...netip.Addr) bool {
 	t.Helper()
-	need, err := b.Observe(name, addrs, ttl)
+	need, err := b.Observe(name, blockables(t, addrs...), ttl)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,7 +180,7 @@ func TestNextExpiryIsFirstExpiredInstant(t *testing.T) {
 }
 
 func TestSortedAndPruneNil(t *testing.T) {
-	addrs := []netip.Addr{a2, a3, a1, netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("::1")}
+	addrs := []netip.Addr{a2, a3, a1, netip.MustParseAddr("10.0.0.1"), netip.MustParseAddr("::2")}
 	want := slices.Clone(addrs)
 	slices.SortFunc(want, netip.Addr.Compare)
 	for range 20 {
@@ -188,7 +188,7 @@ func TestSortedAndPruneNil(t *testing.T) {
 		for _, p := range []policy.Name{"z", "a", "m"} {
 			mustObserve(t, b, p, 0, addrs...)
 		}
-		if got := b.Addrs("m"); !slices.Equal(got, want) {
+		if got := plain(b.Addrs("m")); !slices.Equal(got, want) {
 			t.Fatalf("Addrs = %v", got)
 		}
 		c.advance(retain + 1)
@@ -282,14 +282,14 @@ func TestLoadPaths(t *testing.T) {
 		if err := b.Load(good); !errors.Is(err, addrbook.ErrNotEmpty) {
 			t.Fatalf("err = %v", err)
 		}
-		if got := b.Addrs("x"); !slices.Equal(got, []netip.Addr{a1}) || len(b.Addrs("p")) != 0 {
+		if got := plain(b.Addrs("x")); !slices.Equal(got, []netip.Addr{a1}) || len(b.Addrs("p")) != 0 {
 			t.Fatal("failed Load changed the book")
 		}
 	})
 	t.Run("good", func(t *testing.T) {
 		b, _ := oBook(retain)
 		must(t, b.Load(good))
-		if !slices.Equal(b.Addrs("p"), []netip.Addr{a1, a2}) || !slices.Equal(b.Addrs("q"), []netip.Addr{a3}) {
+		if !slices.Equal(plain(b.Addrs("p")), []netip.Addr{a1, a2}) || !slices.Equal(plain(b.Addrs("q")), []netip.Addr{a3}) {
 			t.Fatal("round trip lost entries")
 		}
 	})
@@ -588,9 +588,6 @@ func TestObserveRejectsChangeNothing(t *testing.T) {
 		want  error
 	}{
 		{"empty policy", "", []netip.Addr{a1}, 0, addrbook.ErrEmptyPolicy},
-		{"invalid addr last", "p", []netip.Addr{a1, a2, {}}, 0, addrbook.ErrInvalidAddr},
-		{"zoned addr last", "p", []netip.Addr{a1, netip.MustParseAddr("fe80::1%en0")}, 0, addrbook.ErrZonedAddr},
-		{"zoned 4in6", "p", []netip.Addr{a1, netip.MustParseAddr("::ffff:192.0.2.9%en0")}, 0, addrbook.ErrZonedAddr},
 		{"negative ttl", "p", []netip.Addr{a1}, -time.Nanosecond, addrbook.ErrNegativeTTL},
 	}
 	for _, tt := range cases {
@@ -598,7 +595,7 @@ func TestObserveRejectsChangeNothing(t *testing.T) {
 			b, c := oBook(retain)
 			mustObserve(t, b, "p", 0, a3)
 			c.advance(time.Hour)
-			need, err := b.Observe(tt.pol, tt.addrs, tt.ttl)
+			need, err := b.Observe(tt.pol, blockables(t, tt.addrs...), tt.ttl)
 			if !errors.Is(err, tt.want) || need {
 				t.Fatalf("need=%v err=%v, want %v", need, err, tt.want)
 			}
@@ -607,11 +604,5 @@ func TestObserveRejectsChangeNothing(t *testing.T) {
 				t.Fatalf("refused Observe changed the book: %+v", e)
 			}
 		})
-	}
-	b, _ := oBook(retain)
-	mustObserve(t, b, "p", 0, netip.MustParseAddr("::ffff:192.0.2.1"))
-	mustObserve(t, b, "p", 0, a1)
-	if got := b.Addrs("p"); !slices.Equal(got, []netip.Addr{a1}) || !got[0].Is4() {
-		t.Fatalf("4in6 not unmapped: %v", got)
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfrules"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
@@ -258,7 +259,7 @@ func TestConvergeCopyStartsAgain(t *testing.T) {
 // end of the old states does not repeat it.
 func TestConvergeEndsNewEntryOnce(t *testing.T) {
 	f := newStatesFixture(t, onlyConfig, en0, utun4)
-	f.in.Hosts = map[policy.Name][]netip.Addr{"vpn": {netip.MustParseAddr("192.0.2.99")}}
+	f.in.Hosts = map[policy.Name][]blockable.Addr{"vpn": learned("192.0.2.99")}
 	got := f.change(t, en0)
 	slices.SortFunc(got, netip.Prefix.Compare)
 	if want := prefixes("192.0.2.10/32", "192.0.2.11/32", "192.0.2.99/32"); !slices.Equal(got, want) {

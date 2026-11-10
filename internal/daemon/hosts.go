@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/hostsfile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
@@ -36,7 +37,7 @@ type hostsState struct {
 	// duplicates. Before the first good
 	// read, they are the learned-looking kernel entries: the last run can
 	// have put host addresses there.
-	addrs map[policy.Name][]netip.Addr
+	addrs map[policy.Name][]blockable.Addr
 	// gen is the configuration generation that addrs was made for.
 	gen uint64
 	// dirty is true when good changed after addrs was made.
@@ -139,15 +140,14 @@ func (h *hostsState) problem() (reconcile.Problem, bool) {
 // as a CNAME to the first name, and it follows that CNAME across all
 // lines, also when the first name is an alias of another line. So a
 // matching name takes the addresses of each first name that its CNAME
-// chain reaches. The Reconciler skips the addresses that
-// reconcile.Blockable refuses.
+// chain reaches. It skips the addresses that blockable.New refuses.
 //
 // It also logs, in one event, the lines with a name that the entries
 // cannot show, when the name is at or below an apex. Such a line can hold
 // a protected address that no table has.
-func (l *loop) mapHosts(ctx context.Context, conf activeConfig) map[policy.Name][]netip.Addr {
+func (l *loop) mapHosts(ctx context.Context, conf activeConfig) map[policy.Name][]blockable.Addr {
 	g := newHostGraph(l.hosts.good.Entries)
-	out := make(map[policy.Name][]netip.Addr)
+	out := make(map[policy.Name][]blockable.Addr)
 	var bad []string
 	var badErrs []error
 	for name := range g.names() {
@@ -159,13 +159,13 @@ func (l *loop) mapHosts(ctx context.Context, conf activeConfig) map[policy.Name]
 		if len(policies) == 0 {
 			continue
 		}
-		addrs := g.resolve(name)
+		addrs := blockable.Filter(g.resolve(name))
 		for _, p := range policies {
 			out[p] = append(out[p], addrs...)
 		}
 	}
 	for p, addrs := range out {
-		slices.SortFunc(addrs, netip.Addr.Compare)
+		slices.SortFunc(addrs, blockable.Addr.Compare)
 		out[p] = slices.Compact(addrs)
 	}
 	if len(bad) > 0 {

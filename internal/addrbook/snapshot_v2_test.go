@@ -126,7 +126,7 @@ func TestV2SnapshotLoadsWithAllEntriesAndTimes(t *testing.T) {
 		"aliasonly": nil,
 	}
 	for name, want := range wantAddrs {
-		if got := b.Addrs(name); !slices.Equal(got, want) {
+		if got := plain(b.Addrs(name)); !slices.Equal(got, want) {
 			t.Errorf("Addrs(%s) = %v, want %v", name, got, want)
 		}
 	}
@@ -213,7 +213,7 @@ func TestV2AliasItemsAreIgnored(t *testing.T) {
 			if err := b.Load(path); err != nil {
 				t.Fatalf("Load = %v, want nil", err)
 			}
-			if got := b.Addrs("web"); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("192.0.2.1")}) {
+			if got := plain(b.Addrs("web")); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("192.0.2.1")}) {
 				t.Errorf("Addrs(web) = %v", got)
 			}
 		})
