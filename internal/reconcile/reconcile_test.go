@@ -1,6 +1,7 @@
 package reconcile_test
 
 import (
+	"context"
 	"errors"
 	"maps"
 	"net/netip"
@@ -326,6 +327,46 @@ func TestConvergeExpiryRemovesAddress(t *testing.T) {
 	}
 }
 
+// An add-only convergence loads the ruleset and adds the desired
+// entries, but removes no desired-state entry and drops no table: here
+// an expired address, and the table of a removed policy. It still
+// removes an entry that blockable.New refuses, because that removal
+// opens no path off the host. The resolver entries converge as in a
+// normal pass. A normal convergence with the same inputs then removes
+// the rest.
+func TestConvergeAddOnlyRemovesNothing(t *testing.T) {
+	f := installV1(t)
+	seed(t, f.world, map[policy.Name][]string{"web": {"127.0.0.1/32"}, "ads": {"::1/128"}})
+	f.reconfigure(t, configV2)
+	f.now = f.now.Add(2 * time.Hour)
+	f.book.Expire()
+	f.hosts = map[policy.Name][]blockable.Addr{"web": learned("10.1.1.1")}
+	in := f.inputs()
+	in.AddOnly = true
+
+	rep, err := f.rec.Converge(t.Context(), in)
+	if err != nil {
+		t.Fatalf("Converge: %v", err)
+	}
+
+	checkTables(t, f.world, tables{
+		"web":  {"198.51.100.0/24", "192.0.2.10/32", "203.0.113.1/32", "10.1.1.1/32"},
+		"ads":  {"2001:db8::/32", "3fff::1/128"},
+		"mail": {"203.0.113.0/28"},
+	})
+	if got, want := f.world.Ruleset().ID(), f.compiled(t, en0); got != want || rep.Installed != want {
+		t.Errorf("loaded ruleset = %q, installed = %q, want %q", got, rep.Installed, want)
+	}
+	checkResolver(t, f.world, f.cfg.DNS.Listen, "example.com", "example.net", "mail.example.org", canary)
+
+	f.converge(t)
+
+	checkTables(t, f.world, tables{
+		"web":  {"198.51.100.0/24", "192.0.2.10/32", "10.1.1.1/32"},
+		"mail": {"203.0.113.0/28"},
+	})
+}
+
 // A host address is desired while the host file maps it, also when the
 // book has none. A host address that the book also has stays when the
 // host file drops it. A policy that is not configured gets no table.
@@ -373,6 +414,68 @@ func TestConvergeReportsExternalProblems(t *testing.T) {
 
 	if !slices.Equal(rep.Problems, want) {
 		t.Errorf("problems = %+v, want %+v", rep.Problems, want)
+	}
+}
+
+// The Backend Problems of a Report come from a read after the last
+// Backend write. A Load that enables the firewall clears the Problem of
+// the disabled firewall in the same convergence, and a Problem that the
+// Load does not repair stays. A Load that fails keeps the Problem.
+func TestConvergeReportsProblemsAfterTheLoad(t *testing.T) {
+	unreferenced := reconcile.Problem{Text: "the main ruleset does not reference the anchor", Voids: true}
+	disabled := reconcile.Problem{Text: reconciletest.DisabledText, Voids: true}
+	for _, tt := range []struct {
+		name    string
+		refuse  bool
+		want    []reconcile.Problem
+		wantErr error
+	}{
+		{"the load enables the firewall", false, []reconcile.Problem{unreferenced}, nil},
+		{"the load fails", true, []reconcile.Problem{unreferenced, disabled}, reconciletest.ErrInjected},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := installV1(t)
+			f.world.DisableFirewall()
+			f.world.SetProblems([]reconcile.Problem{unreferenced}, nil)
+			f.world.SetEnableRefused(tt.refuse)
+
+			rep, err := f.rec.Converge(t.Context(), f.inputs())
+
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("err = %v, want %v", err, tt.wantErr)
+			}
+			if !slices.Equal(rep.Problems, tt.want) {
+				t.Errorf("problems = %+v, want %+v", rep.Problems, tt.want)
+			}
+		})
+	}
+}
+
+// readOnce is a Backend whose Reads after the first one fail.
+type readOnce struct {
+	*reconciletest.Backend
+	reads int
+}
+
+func (b *readOnce) Read(ctx context.Context) (reconcile.BackendState, error) {
+	b.reads++
+	if b.reads > 1 {
+		return reconcile.BackendState{}, reconciletest.ErrInjected
+	}
+	return b.Backend.Read(ctx)
+}
+
+// Without the read after the Load, the convergence does not know the
+// Problems of the loaded ruleset, so it installs nothing.
+func TestConvergeNotInstalledWhenTheReadAfterTheLoadFails(t *testing.T) {
+	f := installV1(t)
+	f.world.DisableFirewall()
+	f.rec.Backend = &readOnce{Backend: f.world.Backend()}
+
+	rep, err := f.rec.Converge(t.Context(), f.inputs())
+
+	if !errors.Is(err, reconciletest.ErrInjected) || rep.Installed != "" {
+		t.Errorf("err %v, installed %q; want ErrInjected and nothing installed", err, rep.Installed)
 	}
 }
 

@@ -174,9 +174,13 @@ func policyNames(cfg policy.Config) []policy.Name {
 	return names
 }
 
-// reconcile is the one path to the desired state. It never converges
-// before the snapshot is loaded: an empty book would remove every learned
-// address.
+// reconcile is the one path to the desired state. While the snapshot
+// does not load, it converges add-only (see reconcile.Inputs.AddOnly)
+// with an empty book: the ruleset, the IP and CIDR destinations, and the
+// host addresses need no book, but a removal would unblock every learned
+// address. The phase then stays StateStarting with the snapshot error as
+// the first reason, so no report is acknowledged. The first pass that
+// loads the snapshot is a normal convergence.
 //
 // The host file comes first: adoption must know which kernel entries are
 // host addresses. Without a configuration, it does nothing.
@@ -188,6 +192,8 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		conf   activeConfig
 		retain time.Duration
 		book   *addrbook.AddrBook
+		// loadErr is the error of the snapshot load in loadingMode.
+		loadErr error
 	)
 	began := time.Now()
 	switch m := l.mode.(type) {
@@ -196,13 +202,10 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	case loadingMode:
 		conf, retain = m.conf, m.retain
 		l.refreshHosts(ctx, conf)
-		b, err := l.loadBook(ctx, conf, retain)
-		if err != nil {
-			l.setPhase(ctx, startingPhase(err.Error()))
-			l.logConverge(ctx, trigger, time.Since(began), reconcile.Report{}, logattr.ErrorTypeSnapshot, err)
-			return err
+		book, loadErr = l.loadBook(ctx, conf, retain)
+		if loadErr != nil {
+			book = addrbook.New(retain, time.Now)
 		}
-		book = b
 	case runningMode:
 		conf, retain, book = m.conf, m.retain, m.book
 		l.refreshHosts(ctx, conf)
@@ -216,8 +219,9 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		Apexes:   conf.apexes,
 		Listen:   conf.cfg.DNS.Listen,
 		Accounts: l.accounts.snap,
+		AddOnly:  loadErr != nil,
 	})
-	if rep.Installed != "" {
+	if rep.Installed != "" && loadErr == nil {
 		// No loaded rule refers to a removed policy now, and its table is
 		// gone. Until this point a revert of the configuration must still
 		// find its addresses.
@@ -235,6 +239,19 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		// such a configuration. The check protects only DNS, so the
 		// daemon enforces the file.
 		rep.Problems = append(rep.Problems, reconcile.Problem{Text: "the configuration fails the upstream check: " + conf.upstream.Error()})
+	}
+	if loadErr != nil {
+		// Without the book, the daemon cannot record an address, so the
+		// phase acknowledges nothing, also when the ruleset is installed.
+		rep.Problems = slices.Insert(rep.Problems, 0, reconcile.Problem{Text: loadErr.Error()})
+		l.setPhase(ctx, waitPhase{state: StateStarting, reasons: convergedPhase(rep, err).reasons})
+		errType := logattr.ErrorTypeSnapshot
+		if err != nil {
+			errType = logattr.ErrorTypePlatform
+		}
+		err = errors.Join(loadErr, err)
+		l.logConverge(ctx, trigger, time.Since(began), rep, errType, err)
+		return err
 	}
 	p := convergedPhase(rep, err)
 	if st, ok := l.selfTestProblem(); ok && p.acks() {

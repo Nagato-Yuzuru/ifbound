@@ -845,8 +845,9 @@ func (r *omRun) expectAdoptionLocked(now time.Time) {
 }
 
 // computeAdoption derives what an adoption must save from the kernel
-// tables and the current config. The daemon writes nothing while it is
-// starting, so the tables are those of the restart, less external flushes.
+// tables and the current config. The daemon removes nothing while it is
+// starting, and it adds only configured destinations, so the tables are
+// those of the restart, plus such destinations, less external flushes.
 // Every table counts, also one of a policy that the config removed: its
 // removal is not installed while the daemon is starting. Only a
 // configured IP destination is not adopted.
@@ -1566,16 +1567,8 @@ func (r *omRun) recoverAndCheck() {
 	r.mu.Lock()
 	r.failAt, r.failFrom, r.saveFail, r.voidOn, r.nonvoidOn = 0, 0, false, false, false
 	r.mu.Unlock()
-	disabled := r.world.FirewallDisabled()
 	time.Sleep(daemon.SelfHealInterval)
 	synctest.Wait()
-	if disabled {
-		// Known behavior: the self-heal whose Load enables the firewall
-		// again still reports the Problem that it read before the Load.
-		// One more self-heal clears it.
-		time.Sleep(daemon.SelfHealInterval)
-		synctest.Wait()
-	}
 	r.statusCheck()
 	if st := r.status(); st.State != daemon.StateReady {
 		r.violate("liveness: state %v (%q) after all faults cleared", st.State, st.Reasons)

@@ -59,6 +59,14 @@ type Inputs struct {
 	// Accounts, the Compiler knows no account and drops every scope, so
 	// each scoped policy applies to all traffic.
 	Accounts Accounts
+	// AddOnly makes the Backend part skip step 4 of Converge: it removes
+	// no undesired entry and drops no table. Use it when Book can be
+	// incomplete, for example when the snapshot does not load: a table
+	// entry that Book does not have can then be an acknowledged address.
+	// The tables then hold the desired entries and possibly more. Step 1
+	// still runs: its removal opens no path off the host. The SysResolver
+	// part does not change.
+	AddOnly bool
 }
 
 // Report describes one convergence.
@@ -76,8 +84,27 @@ type Report struct {
 	// is loaded, and every table it refers to holds its desired entries.
 	Installed string
 	// Problems lists the external problems that the Compiler, the Backend,
-	// and the SysResolver reported, in that order.
+	// and the SysResolver reported, in that order. The Backend problems
+	// come from a read after the last Backend write of the convergence
+	// (see Converge), when the Backend part completed.
 	Problems []Problem
+	// Resolver tells what the SysResolver part saw and did.
+	Resolver ResolverReport
+}
+
+// ResolverReport describes the SysResolver part of one convergence. The
+// zero ResolverReport means that the read of the part failed.
+type ResolverReport struct {
+	// Digest is a SHA-256 digest of the state that the read of the part
+	// gave: its entries, its Problems, and its shadowed domains. The
+	// encoding is canonical, so equal states give equal digests, also in
+	// another order. The read comes before the writes of the part. Digest
+	// is "" when the read failed.
+	Digest string
+	// Shadowed is ResolverState.Shadowed of that read.
+	Shadowed []policy.Domain
+	// Wrote is true when the part wrote or removed at least one entry.
+	Wrote bool
 }
 
 // Reconciler converges the platform state. All fields are required. The
@@ -127,6 +154,12 @@ type memory struct {
 //     on more interfaces (see below).
 //  4. Remove the entries that are no longer desired, then drop the tables
 //     of removed policies. The loaded ruleset no longer refers to them.
+//     With Inputs.AddOnly, this step does not run.
+//  5. If step 3 loaded the ruleset, read the Backend again. A Load can
+//     repair a Problem, for example it enables a disabled firewall, so
+//     the Report gets the Backend Problems of this read. Only a Load
+//     changes them: a table write does not. Without a Load, the Report
+//     gets the Backend Problems of the read before step 1.
 //
 // pf states are floating: a connection that started on an allowed
 // interface can continue on an interface that the policy denies now. The
@@ -223,6 +256,7 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 	if err != nil {
 		return fmt.Errorf("reading backend: %w", err)
 	}
+	backendProblems := len(rep.Problems)
 	rep.Problems = append(rep.Problems, actual.Problems...)
 	want, err := desiredTables(in)
 	if err != nil {
@@ -242,7 +276,8 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 		r.mem = &memory{owner: r}
 	}
 	cur := verdicts(in.Policies, ifaces, rs)
-	if actual.Ruleset != rs.ID() {
+	loaded := actual.Ruleset != rs.ID()
+	if loaded {
 		if err := r.Backend.Load(ctx, rs); err != nil {
 			return fmt.Errorf("loading ruleset: %w", err)
 		}
@@ -252,8 +287,18 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 	} else if err := r.endNarrowed(ctx, in.Policies, cur, want, have, rep); err != nil {
 		return err
 	}
-	if err := r.removeUndesired(ctx, in.Policies, want, have, rep); err != nil {
-		return err
+	if !in.AddOnly {
+		if err := r.removeUndesired(ctx, in.Policies, want, have, rep); err != nil {
+			return err
+		}
+	}
+	if loaded {
+		// Step 5. The Problems of the first read can be stale now.
+		after, err := r.Backend.Read(ctx)
+		if err != nil {
+			return fmt.Errorf("reading backend after the load: %w", err)
+		}
+		rep.Problems = append(rep.Problems[:backendProblems], after.Problems...)
 	}
 	rep.Installed = rs.ID()
 	return nil
@@ -412,6 +457,8 @@ func (r Reconciler) convergeResolver(ctx context.Context, in Inputs, rep *Report
 		return fmt.Errorf("reading resolver entries: %w", err)
 	}
 	rep.Problems = append(rep.Problems, actual.Problems...)
+	rep.Resolver.Digest = actual.digest()
+	rep.Resolver.Shadowed = slices.Clone(actual.Shadowed)
 	have := make(map[policy.Domain]netip.AddrPort, len(actual.Entries))
 	for _, e := range actual.Entries {
 		have[e.Domain] = e.Server
@@ -431,6 +478,7 @@ func (r Reconciler) convergeResolver(ctx context.Context, in Inputs, rep *Report
 			continue
 		}
 		rep.Writes++
+		rep.Resolver.Wrote = true
 	}
 	var old []policy.Domain
 	for d := range have {
@@ -448,6 +496,7 @@ func (r Reconciler) convergeResolver(ctx context.Context, in Inputs, rep *Report
 			continue
 		}
 		rep.Writes++
+		rep.Resolver.Wrote = true
 	}
 	return errors.Join(errs...)
 }

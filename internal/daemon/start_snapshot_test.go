@@ -60,7 +60,7 @@ func worldWithLearned(t *testing.T, dir string) *reconciletest.World {
 }
 
 // A snapshot that does not load keeps the daemon in starting. It
-// writes nothing: the kernel tables keep every address, the snapshot
+// removes nothing: the kernel tables keep every address, the snapshot
 // file stays as it is, and no report is acked.
 func TestRefusedSnapshotDropsNoKernelAddress(t *testing.T) {
 	entries := `[{"policy":"web","addr":"192.0.2.1","last_seen_unix_nano":1,"ttl_nano":0,"expiry_unix_nano":2}]`
@@ -88,7 +88,6 @@ func checkRefusedSnapshot(t *testing.T, doc string) {
 	if err := os.WriteFile(snap, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writes := w.Writes()
 
 	rg := newRig(t, w, dir, rigCfgA)
 	for range 3 {
@@ -101,9 +100,6 @@ func checkRefusedSnapshot(t *testing.T, doc string) {
 	_, err := rg.d.Observe(context.Background(), ipc.Observation{QName: "example.com", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.9")}})
 	if !errors.Is(err, daemon.ErrNotReady) {
 		t.Errorf("Observe = %v, want ErrNotReady", err)
-	}
-	if got := w.Writes(); got != writes {
-		t.Errorf("platform writes = %d, want none", got-writes)
 	}
 	if got := w.Tables(); !slices.Equal(got["web"], tables["web"]) || !slices.Equal(got["ads"], tables["ads"]) {
 		t.Errorf("tables %v, want %v", got, tables)

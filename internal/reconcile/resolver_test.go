@@ -106,3 +106,127 @@ func FuzzDomainIsPathComponent(f *testing.F) {
 		}
 	})
 }
+
+// seenResolver wraps a SysResolver. Its Read adds the shadowed domains
+// of the test, or fails with errRead when fail is set.
+type seenResolver struct {
+	reconcile.SysResolver
+	shadowed []policy.Domain
+	fail     bool
+}
+
+var errRead = errors.New("injected read fault")
+
+func (r *seenResolver) Read(ctx context.Context) (reconcile.ResolverState, error) {
+	if r.fail {
+		return reconcile.ResolverState{}, errRead
+	}
+	st, err := r.SysResolver.Read(ctx)
+	st.Shadowed = slices.Clone(r.shadowed)
+	return st, err
+}
+
+// Report.Resolver tells what the read of the resolver part saw, and
+// whether the part changed an entry. The digest changes exactly when the
+// entries, the Problems, or the shadowed domains of the read change. The
+// order of the read does not change it. Wrote is set exactly when the
+// part wrote or removed an entry.
+func TestConvergeReportsWhatTheResolverReadSaw(t *testing.T) {
+	f := newFixture(t, configV1)
+	r := &seenResolver{SysResolver: f.world.Resolver()}
+	f.rec.Resolver = r
+	conflict := reconcile.Problem{Text: "foreign entry for example.com"}
+	shadowed := []policy.Domain{mustDomain(t, "www.example.com"), mustDomain(t, "a.example.net")}
+	noAds := header + `
+[[policy]]
+name = "web"
+to = ["example.com", "*.example.net"]
+only_via = ["en0"]
+`
+	steps := []struct {
+		name    string
+		do      func(t *testing.T)
+		changed bool
+		wrote   bool
+		wantErr error
+	}{
+		{"the first pass writes the entries", func(*testing.T) {}, true, true, nil},
+		{"the read sees the written entries", func(*testing.T) {}, true, false, nil},
+		{"nothing changed", func(*testing.T) {}, false, false, nil},
+		{"a resolver Problem appears", func(*testing.T) { f.world.SetProblems(nil, []reconcile.Problem{conflict}) }, true, false, nil},
+		{"shadowed domains appear", func(*testing.T) { r.shadowed = shadowed }, true, false, nil},
+		{"the same shadowed domains in another order", func(*testing.T) {
+			r.shadowed = []policy.Domain{shadowed[1], shadowed[0]}
+		}, false, false, nil},
+		{"the Problem and the shadowed domains go away", func(*testing.T) {
+			f.world.SetProblems(nil, nil)
+			r.shadowed = nil
+		}, true, false, nil},
+		{"an entry goes away outside ifbound", func(t *testing.T) {
+			f.world.RemoveResolverEntry(mustDomain(t, "example.com"))
+		}, true, true, nil},
+		{"the pass only removes an entry", func(t *testing.T) { f.reconfigure(t, noAds) }, true, true, nil},
+		{"a write fails", func(t *testing.T) {
+			f.rec.Resolver = &seenResolver{SysResolver: refusingResolver{SysResolver: f.world.Resolver(), bad: "example.com"}}
+			f.world.RemoveResolverEntry(mustDomain(t, "example.com"))
+		}, true, false, errUnmanaged},
+	}
+	var last string
+	for i, s := range steps {
+		s.do(t)
+		rep, err := f.rec.Converge(t.Context(), f.inputs())
+		if !errors.Is(err, s.wantErr) {
+			t.Fatalf("%s: err = %v, want %v", s.name, err, s.wantErr)
+		}
+		if rep.Resolver.Digest == "" {
+			t.Errorf("%s: empty digest after a read that succeeded", s.name)
+		}
+		if changed := rep.Resolver.Digest != last; i > 0 && changed != s.changed {
+			t.Errorf("%s: digest changed = %v, want %v", s.name, changed, s.changed)
+		}
+		if rep.Resolver.Wrote != s.wrote {
+			t.Errorf("%s: Wrote = %v, want %v", s.name, rep.Resolver.Wrote, s.wrote)
+		}
+		if want := r.shadowed; s.wantErr == nil && !slices.Equal(rep.Resolver.Shadowed, want) {
+			t.Errorf("%s: Shadowed = %v, want %v", s.name, rep.Resolver.Shadowed, want)
+		}
+		last = rep.Resolver.Digest
+	}
+}
+
+// When the entries, the Problems, and the shadowed domains return to an
+// earlier state, the digest is the earlier one again.
+func TestResolverDigestDependsOnlyOnTheReadState(t *testing.T) {
+	f := installV1(t)
+	r := &seenResolver{SysResolver: f.world.Resolver()}
+	f.rec.Resolver = r
+	before := f.converge(t).Resolver.Digest
+
+	r.shadowed = []policy.Domain{mustDomain(t, "www.example.com")}
+	f.world.SetProblems(nil, []reconcile.Problem{{Text: "foreign entry for example.com"}})
+	if f.converge(t).Resolver.Digest == before {
+		t.Fatal("the digest did not change with the Problems and the shadowed domains")
+	}
+	r.shadowed = nil
+	f.world.SetProblems(nil, nil)
+
+	if got := f.converge(t).Resolver.Digest; got != before {
+		t.Errorf("digest = %s, want the earlier %s", got, before)
+	}
+}
+
+// A read that fails sees nothing: the digest is empty, and the part
+// writes nothing.
+func TestConvergeReportsNoResolverDigestWhenTheReadFails(t *testing.T) {
+	f := installV1(t)
+	f.rec.Resolver = &seenResolver{SysResolver: f.world.Resolver(), shadowed: []policy.Domain{mustDomain(t, "www.example.com")}, fail: true}
+
+	rep, err := f.rec.Converge(t.Context(), f.inputs())
+
+	if !errors.Is(err, errRead) {
+		t.Fatalf("err = %v, want errRead", err)
+	}
+	if rep.Resolver.Digest != "" || rep.Resolver.Shadowed != nil || rep.Resolver.Wrote {
+		t.Errorf("Resolver = %+v, want the zero value", rep.Resolver)
+	}
+}

@@ -148,8 +148,8 @@ type request func(ctx context.Context, l *loop)
 // pfbackend.EnableInterval, which is longer than SelfHealInterval. When
 // another tool disables the firewall again and again, the firewall can
 // stay disabled across several self-heals. The convergence that enables
-// the firewall still reports the Problem that it read before its Load, so
-// acknowledgements start again only at the next convergence.
+// the firewall reads the Backend again after its Load, so
+// acknowledgements start again with that convergence.
 type Daemon struct {
 	cfg      Config
 	requests chan request
@@ -218,11 +218,19 @@ func (c Config) check() error {
 // configuration that fails policy.Config.CheckUpstreams still applies;
 // the failure makes the state StateDegraded.
 //
-// A snapshot that does not load keeps the daemon in StateStarting. A
-// snapshot without an address of a configured policy, such as a missing
-// file, makes the daemon adopt the learned-looking kernel entries and
-// save them before it leaves StateStarting. The self-heal timer retries
-// the load and the convergence until both succeed.
+// A snapshot that does not load keeps the daemon in StateStarting, with
+// the load error as the first reason. The daemon then still loads the
+// ruleset and adds the IP and CIDR destinations and the host addresses
+// to their tables, but it drops no table, also not the table of a policy
+// that the configuration removed, and it removes only the entries that
+// blockable.New refuses (see reconcile.Inputs.AddOnly). So after a
+// reboot the destinations that need no snapshot are blocked, and an
+// address that the kernel tables hold stays blocked. A snapshot without
+// an address of a configured policy, such as a missing file, makes the
+// daemon adopt the learned-looking kernel entries and save them before
+// it leaves StateStarting. The self-heal timer retries the load and the
+// convergence until both succeed. The first pass that loads the snapshot
+// is a normal convergence: it can remove entries.
 //
 // Each convergence first asks Config.Hosts for the version of the host
 // file, and reads it again when the version changed. While the file
