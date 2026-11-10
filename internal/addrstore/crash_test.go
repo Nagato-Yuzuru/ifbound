@@ -64,9 +64,15 @@ func TestCrashInAGroupCommitLeavesTheOldOrTheNewBook(t *testing.T) {
 		crash(fmt.Sprintf("after data page %d of %d", i+1, len(data)), oldBook)
 	}
 	from, to := page(meta)
-	// The checksum of the meta page covers its first bytes, so a torn
-	// write there is a broken meta page.
-	copy(image[from:from+32], newer[from:from+32])
+	// A torn write of the meta page: the new page header and the new meta
+	// fields, but the old checksum. The first changed byte is at offset
+	// 32, so the copy must reach past it. The checksum is at offset 72:
+	// 16 bytes of page header and 56 bytes of meta fields before it.
+	const checksumAt = 72
+	if slices.Equal(image[from:from+checksumAt], newer[from:from+checksumAt]) {
+		t.Fatal("the meta fields before the checksum did not change")
+	}
+	copy(image[from:from+checksumAt], newer[from:from+checksumAt])
 	crash("inside the meta page", oldBook)
 	copy(image[from:to], newer[from:to])
 	crash("after the meta page", newBook)

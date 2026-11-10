@@ -169,6 +169,16 @@ func (Prune) isOp()  {}
 func (Adopt) isOp()  {}
 func (Flush) isOp()  {}
 
+// queuedOp is an Op that the committer runs alone, in its order. Adopt is
+// not one: Apply sends it as writes.
+//
+//sumtype:decl
+type queuedOp interface{ isQueuedOp() }
+
+func (Expire) isQueuedOp() {}
+func (Prune) isQueuedOp()  {}
+func (Flush) isQueuedOp()  {}
+
 // Apply runs op on the committer, after the requests before it. It
 // returns the number of entries that Expire or Prune removed, and 0 for
 // the other operations.
@@ -188,7 +198,9 @@ func (s *Store) Apply(ctx context.Context, op Op) (int, error) {
 			return 0, err
 		}
 		return s.send(ctx, request{op: op})
-	case Prune, Flush:
+	case Prune:
+		return s.send(ctx, request{op: op})
+	case Flush:
 		return s.send(ctx, request{op: op})
 	case Adopt:
 		var writes []write
@@ -211,10 +223,10 @@ func (s *Store) Apply(ctx context.Context, op Op) (int, error) {
 }
 
 // request is one unit of work for the committer: a group member with
-// writes, or an Op.
+// writes, or an op.
 type request struct {
 	writes []write
-	op     Op
+	op     queuedOp
 	reply  chan result
 }
 
@@ -296,7 +308,7 @@ func (s *Store) group(first request) (group []request, next *request) {
 	}
 }
 
-func (s *Store) runOp(op Op) (int, error) {
+func (s *Store) runOp(op queuedOp) (int, error) {
 	switch op := op.(type) {
 	case Expire:
 		at := op.At.UnixNano()
@@ -305,9 +317,6 @@ func (s *Store) runOp(op Op) (int, error) {
 		return s.remove(func(name policy.Name, _ *stamp) bool { return !slices.Contains(op.Keep, name) })
 	case Flush:
 		return 0, s.flush()
-	case Adopt:
-		// Apply sends Adopt as writes, never as an op.
-		return 0, fmt.Errorf("%w: %T", errUnknownOp, op)
 	default:
 		return 0, fmt.Errorf("%w: %T", errUnknownOp, op)
 	}

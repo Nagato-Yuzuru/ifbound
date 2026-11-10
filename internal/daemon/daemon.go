@@ -108,11 +108,12 @@ type Config struct {
 	// wheel, so a zero is a field that the caller did not set. A
 	// negative value keeps the group of the new file, for tests.
 	ConfigGID int
-	// AddrStore is the path of the address book file (see addrstore).
+	// AddrStore is the path of the address book file (see addrstore). It
+	// must be absolute and clean.
 	AddrStore string
 	// Snapshot is the path of the JSON snapshot of the address book that
-	// earlier versions wrote. The first open of AddrStore imports it
-	// once and removes it. Empty means none.
+	// earlier versions wrote. Each open of AddrStore merges it into the
+	// book when it exists, and removes it. Empty means none.
 	Snapshot string
 	// Hosts reads the host file. It is required.
 	Hosts HostsReader
@@ -206,6 +207,8 @@ func (c Config) check() error {
 	switch {
 	case !filepath.IsAbs(c.ConfigPath) || filepath.Clean(c.ConfigPath) != c.ConfigPath:
 		return fmt.Errorf("%w: ConfigPath %q is not an absolute clean path", ErrBadConfig, c.ConfigPath)
+	case !filepath.IsAbs(c.AddrStore) || filepath.Clean(c.AddrStore) != c.AddrStore:
+		return fmt.Errorf("%w: AddrStore %q is not an absolute clean path", ErrBadConfig, c.AddrStore)
 	case c.ConfigGID == 0:
 		return fmt.Errorf("%w: ConfigGID is zero", ErrBadConfig)
 	case c.Hosts == nil:
@@ -231,8 +234,8 @@ func (c Config) check() error {
 // the failure makes the state StateDegraded.
 //
 // An address book that does not open, such as one whose JSON snapshot
-// does not import, keeps the daemon in StateStarting, with the open
-// error as the first reason. The daemon then still loads the ruleset and
+// does not import or one with a damaged page, keeps the daemon in
+// StateStarting, with the open error as the first reason. The daemon then still loads the ruleset and
 // adds the IP and CIDR destinations and the host addresses to their
 // tables, but it drops no table, also not the table of a policy that the
 // configuration removed, and it removes only the entries that

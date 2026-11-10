@@ -37,8 +37,10 @@ import (
 	"io/fs"
 	"net/netip"
 	"os"
+	"runtime/debug"
 	"slices"
 	"sync"
+	"syscall"
 	"time"
 
 	"go.etcd.io/bbolt"
@@ -80,10 +82,11 @@ var (
 	ErrTimeRange = errors.New("addrstore: time outside the stored range")
 	// ErrBadPath is the error of Open for a path that is a symlink.
 	ErrBadPath = errors.New("addrstore: bad store path")
-	// ErrCorrupt is the error of Open for a file that is not in the file
-	// format: an unknown version or an invalid entry. The book does not
-	// start empty in this case. An empty book could unblock addresses
-	// that applications still use.
+	// ErrCorrupt is the error for a file that is not in the file format:
+	// an unknown version, an invalid entry, or a damaged page. Open
+	// returns it, and so does a commit that reads a damaged page. The
+	// book does not start empty in this case. An empty book could unblock
+	// addresses that applications still use.
 	ErrCorrupt = errors.New("addrstore: corrupt store")
 	// ErrClosed is the error of a request after Close.
 	ErrClosed = errors.New("addrstore: closed")
@@ -142,8 +145,8 @@ type Store struct {
 	db     *bbolt.DB
 	retain time.Duration
 	slack  int64
-	// update runs one write transaction. It is db.Update; a test gives a
-	// function that counts or fails the commits.
+	// update runs one write transaction under guard. It runs db.Update; a
+	// test gives a function that counts or fails the commits.
 	update func(func(*bbolt.Tx) error) error
 
 	reqs      chan request
@@ -160,20 +163,23 @@ type Store struct {
 }
 
 // Open opens the book at path, and creates the file when it is missing.
-// Retain is the floor of the keep time. At the first open of a file,
-// Open imports the JSON snapshot at legacy, which earlier versions
-// wrote, in one transaction, and then removes that snapshot. A legacy
-// path that does not exist imports nothing; an empty legacy imports
-// nothing. Open skips the entries whose address blockable.New refuses.
+// Retain is the floor of the keep time. When the JSON snapshot at legacy
+// exists, Open merges it into the book in one transaction, and then
+// removes it. Earlier versions wrote that snapshot, also after a
+// downgrade from this version. The merge keeps the later expiry of each
+// address, so a merge of the same snapshot again changes nothing. It
+// skips the entries whose address blockable.New refuses. It can bring
+// back an entry that this version removed; the next Expire or Prune
+// removes it again.
 //
 // When retain is larger than when an entry was written, the expiry of
 // the entry becomes the later of the stored one and last_seen +
 // max(ttl, retain). Open does not remove expired entries: Expire does.
 //
 // Open returns an error that wraps ErrBadPath for a symlink path,
-// ErrCorrupt for a file that is not in the file format, and the error of
-// addrbook.Read for a snapshot that does not import. After an error,
-// nothing is open. Call Close when done.
+// ErrCorrupt for a file that is not in the file format or has a damaged
+// page, and the error of addrbook.Read for a snapshot that does not
+// import. After an error, nothing is open. Call Close when done.
 func Open(path, legacy string, retain time.Duration) (*Store, error) {
 	return open(path, legacy, retain, nil)
 }
@@ -181,64 +187,107 @@ func Open(path, legacy string, retain time.Duration) (*Store, error) {
 // open is Open with the transaction function of the committer. A nil
 // update is db.Update.
 func open(path, legacy string, retain time.Duration, update func(*bbolt.DB, func(*bbolt.Tx) error) error) (*Store, error) {
-	if fi, err := os.Lstat(path); err == nil && fi.Mode()&fs.ModeSymlink != 0 {
-		return nil, fmt.Errorf("open addrstore: %w: %s is a symlink", ErrBadPath, path)
+	var file *os.File
+	opts := &bbolt.Options{
+		Timeout: lockWait,
+		// The open refuses a symlink itself, so a link that replaces the
+		// file after a check cannot redirect it.
+		OpenFile: func(name string, flag int, perm os.FileMode) (*os.File, error) {
+			f, err := os.OpenFile(name, flag|syscall.O_NOFOLLOW, perm)
+			file = f
+			return f, err
+		},
 	}
-	db, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: lockWait})
-	if err != nil {
+	var db *bbolt.DB
+	err := guard(func() error {
+		var err error
+		db, err = bbolt.Open(path, 0o600, opts)
+		return err
+	})
+	switch {
+	case errors.Is(err, syscall.ELOOP):
+		return nil, fmt.Errorf("open addrstore: %w: %s is a symlink", ErrBadPath, path)
+	case errors.Is(err, ErrCorrupt) && file != nil:
+		// bbolt stopped inside Open and did not return the DB. Close its
+		// file to release the lock. Its memory map of the file stays.
+		_ = file.Close() //nolint:errcheck // the corrupt file is the error to report; nothing was written
 		return nil, fmt.Errorf("open addrstore %s: %w", path, err)
+	case err != nil:
+		return nil, fmt.Errorf("open addrstore %s: %w", path, err)
+	}
+	commit := db.Update
+	if update != nil {
+		commit = func(fn func(*bbolt.Tx) error) error { return update(db, fn) }
 	}
 	s := &Store{
 		db:     db,
 		retain: retain,
 		slack:  int64(min(maxSaveSlack, retain/2)),
-		update: db.Update,
+		update: func(fn func(*bbolt.Tx) error) error { return guard(func() error { return commit(fn) }) },
 		reqs:   make(chan request),
 		stop:   make(chan struct{}),
 		done:   make(chan struct{}),
 		facts:  make(chan BookFacts, 1),
 	}
-	if update != nil {
-		s.update = func(fn func(*bbolt.Tx) error) error { return update(db, fn) }
-	}
-	if err := s.prepare(path, legacy); err != nil {
+	if err := guard(func() error { return s.prepare(legacy) }); err != nil {
 		_ = db.Close() //nolint:errcheck // the error of prepare is the one to report; nothing was written that a failed close could lose
-		return nil, err
+		return nil, fmt.Errorf("open addrstore %s: %w", path, err)
 	}
 	s.publish()
 	go s.run()
 	return s, nil
 }
 
-// prepare imports the legacy snapshot at the first open, removes it, and
-// loads the index.
-func (s *Store) prepare(path, legacy string) error {
+// guard runs fn and returns its error. It returns an error that wraps
+// ErrCorrupt when fn panics or reads memory that is not there. bbolt
+// reads the file through a memory map and trusts its pages: a damaged
+// page makes it panic, or read outside the map. Every read of a page
+// goes through guard: Open, and each transaction of the committer.
+func guard(fn func() error) (err error) {
+	defer debug.SetPanicOnFault(debug.SetPanicOnFault(true))
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: %v", ErrCorrupt, r)
+		}
+	}()
+	return fn()
+}
+
+// prepare merges the legacy snapshot into the book, removes the
+// snapshot, and loads the index.
+func (s *Store) prepare(legacy string) error {
 	version, err := s.version()
 	if err != nil {
-		return fmt.Errorf("open addrstore %s: %w", path, err)
+		return err
 	}
-	if version == 0 {
-		if err := s.importLegacy(legacy); err != nil {
-			return fmt.Errorf("open addrstore %s: %w", path, err)
+	var entries []addrbook.Entry
+	if legacy != "" {
+		if entries, err = addrbook.Read(legacy); err != nil {
+			return fmt.Errorf("import: %w", err)
+		}
+	}
+	if version != formatVersion || len(entries) > 0 {
+		if err := s.importEntries(entries); err != nil {
+			return fmt.Errorf("import: %w", err)
 		}
 	}
 	if legacy != "" {
-		// After the import commits, a crash can leave the snapshot. The
-		// version shows that it is imported, so remove it here.
+		// After the merge commits, a crash can leave the snapshot. The
+		// next Open merges it again, which changes nothing.
 		if err := os.Remove(legacy); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("open addrstore %s: remove the imported snapshot: %w", path, err)
+			return fmt.Errorf("remove the imported snapshot: %w", err)
 		}
 	}
 	index, err := s.load()
 	if err != nil {
-		return fmt.Errorf("open addrstore %s: %w", path, err)
+		return err
 	}
 	s.index = index
 	return nil
 }
 
 // version returns the format version of the file, or 0 when the file has
-// none: it is new, or an earlier import did not commit.
+// none: it is new, or its first import did not commit.
 func (s *Store) version() (uint64, error) {
 	var v uint64
 	err := s.db.View(func(tx *bbolt.Tx) error {
@@ -259,27 +308,29 @@ func (s *Store) version() (uint64, error) {
 	return v, err
 }
 
-// importLegacy writes the entries of the legacy snapshot and the format
-// version in one transaction.
-func (s *Store) importLegacy(legacy string) error {
-	var entries []addrbook.Entry
-	if legacy != "" {
-		var err error
-		if entries, err = addrbook.Read(legacy); err != nil {
-			return fmt.Errorf("import: %w", err)
-		}
-	}
+// importEntries merges entries into the book, and writes the format
+// version, in one transaction. For an address that the book has, the
+// stored entry becomes the merge of the two: the later expiry wins.
+func (s *Store) importEntries(entries []addrbook.Entry) error {
 	return s.update(func(tx *bbolt.Tx) error {
 		book, err := tx.CreateBucketIfNotExists([]byte(bookBucket))
 		if err != nil {
 			return err
 		}
 		for _, e := range entries {
+			k := key{e.Policy, e.Addr}
 			st, err := stampOf(e)
 			if err != nil {
-				return fmt.Errorf("import %s %s: %w", e.Policy, e.Addr, err)
+				return fmt.Errorf("%s %s: %w", e.Policy, e.Addr, err)
 			}
-			if err := put(book, key{e.Policy, e.Addr}, st); err != nil {
+			old, ok, err := s.get(book, k)
+			if err != nil {
+				return err
+			}
+			if ok {
+				st = merge(old, st)
+			}
+			if err := put(book, k, st); err != nil {
 				return err
 			}
 		}
@@ -289,6 +340,27 @@ func (s *Store) importLegacy(legacy string) error {
 		}
 		return meta.Put([]byte(versionKey), binary.BigEndian.AppendUint64(nil, formatVersion))
 	})
+}
+
+// get returns the stored entry of k, and false when the book has none.
+func (s *Store) get(book *bbolt.Bucket, k key) (stamp, bool, error) {
+	pb := book.Bucket([]byte(k.policy))
+	if pb == nil {
+		return stamp{}, false, nil
+	}
+	addr, err := k.addr.Addr().MarshalBinary()
+	if err != nil {
+		return stamp{}, false, err
+	}
+	v := pb.Get(addr)
+	if v == nil {
+		return stamp{}, false, nil
+	}
+	_, st, _, err := s.decode(addr, v)
+	if err != nil {
+		return stamp{}, false, fmt.Errorf("%w: policy %s: %v", ErrCorrupt, k.policy, err)
+	}
+	return st, true, nil
 }
 
 func stampOf(e addrbook.Entry) (stamp, error) {
@@ -426,8 +498,8 @@ func (s *Store) Addrs(name policy.Name) []blockable.Addr {
 // latest value that no receive took yet: the Store replaces an old value
 // that nobody took. Open puts the first value in it, and the Store puts
 // a new value before a Commit that changed the book, an Expire, a Prune,
-// or a Flush that wrote returns. It
-// has one receiver: the owner of the Store.
+// or a Flush that wrote returns. It has one receiver: the owner of the
+// Store.
 func (s *Store) Facts() <-chan BookFacts { return s.facts }
 
 // publish sends the facts of the index. Only one goroutine at a time

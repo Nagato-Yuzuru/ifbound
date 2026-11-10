@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -353,7 +354,7 @@ func TestSlackRefreshesInAnyOrderGiveTheSameExpiry(t *testing.T) {
 			s, c := openCounted(t, path, "")
 			record(t, s, "web", 0, t0, "192.0.2.1")
 			before := c.count()
-			refreshAll(t, s, ats, order)
+			refreshInOrder(t, s, ats, order)
 			if got := c.count() - before; got != 0 {
 				t.Errorf("%d commits for refreshes inside the slack, want 0", got)
 			}
@@ -371,20 +372,15 @@ func TestSlackRefreshesInAnyOrderGiveTheSameExpiry(t *testing.T) {
 	}
 }
 
-// refreshAll touches 192.0.2.1 of web at each time of ats, started in
-// the order of order, all at the same time. Each must be a refresh in
-// memory.
-func refreshAll(t *testing.T, s *Store, ats []time.Time, order []int) {
+// refreshInOrder touches 192.0.2.1 of web at each time of ats, in the
+// order of order. Each must be a refresh in memory.
+func refreshInOrder(t *testing.T, s *Store, ats []time.Time, order []int) {
 	t.Helper()
-	var wg sync.WaitGroup
 	for _, i := range order {
-		wg.Go(func() {
-			if p, err := s.Touch(names("web"), addrs("192.0.2.1"), 0, ats[i]); err != nil || !p.Empty() {
-				t.Errorf("Touch at %v: Empty %v, err %v; want a refresh in memory", ats[i], p.Empty(), err)
-			}
-		})
+		if p, err := s.Touch(names("web"), addrs("192.0.2.1"), 0, ats[i]); err != nil || !p.Empty() {
+			t.Errorf("Touch at %v: Empty %v, err %v; want a refresh in memory", ats[i], p.Empty(), err)
+		}
 	}
-	wg.Wait()
 }
 
 // Without Flush, a refresh inside the slack stays in memory: a crash
@@ -458,9 +454,12 @@ func TestPruneRemovesThePoliciesNotKept(t *testing.T) {
 	}
 }
 
-// A refresh that races with Expire either keeps its entry or asks for a
-// commit. It never reports a known entry that Expire then removes.
-func TestRefreshRacingExpireNeverLosesAKnownEntry(t *testing.T) {
+// A refresh at the same time as Expire either keeps its entry or asks for
+// a commit. It never reports a known entry that Expire then removes. The
+// test does not force an order: the scheduler picks one in each round,
+// so a round can miss the race of the two compare-and-swaps on one slot.
+// The race detector checks the rounds.
+func TestConcurrentRefreshAndExpireNeverLoseAKnownEntry(t *testing.T) {
 	s, _ := openCounted(t, dbPath(t), "")
 	for i := range 50 {
 		a := fmt.Sprintf("192.0.2.%d", 1+i)
@@ -570,18 +569,34 @@ func TestRequestAfterCloseFails(t *testing.T) {
 	}
 }
 
+// Open refuses a symlink at the path, also one to a valid book. The open
+// itself refuses it, so the link target does not change.
 func TestOpenRefusesASymlink(t *testing.T) {
 	dir := t.TempDir()
-	target := filepath.Join(dir, "real.db")
-	link := filepath.Join(dir, "addrbook.db")
-	if err := os.Symlink(target, link); err != nil {
+	dangling := filepath.Join(dir, "missing.db")
+	valid := filepath.Join(dir, "valid.db")
+	s, err := Open(valid, "", retain)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(link, "", retain); !errors.Is(err, ErrBadPath) {
-		t.Errorf("Open(symlink) = %v, want ErrBadPath", err)
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the link target exists after the refused Open: %v", err)
+	before := readBytes(t, valid)
+	for _, target := range []string{dangling, valid} {
+		link := filepath.Join(t.TempDir(), "addrbook.db")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(link, "", retain); !errors.Is(err, ErrBadPath) {
+			t.Errorf("Open(symlink to %s) = %v, want ErrBadPath", filepath.Base(target), err)
+		}
+	}
+	if _, err := os.Stat(dangling); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the dangling link target exists after the refused Open: %v", err)
+	}
+	if !slices.Equal(readBytes(t, valid), before) {
+		t.Error("the valid book changed after the refused Open")
 	}
 }
 
@@ -632,9 +647,9 @@ func jsonEntry(p, a string, exp time.Duration) string {
 		p, a, t0.UnixNano(), t0.Add(exp).UnixNano())
 }
 
-// The first Open imports the JSON snapshot, skips the refused addresses,
-// and removes the snapshot. A later Open does not import again.
-func TestOpenImportsTheJSONSnapshotOnce(t *testing.T) {
+// Open imports the JSON snapshot into a new book, skips the refused
+// addresses, and removes the snapshot.
+func TestOpenImportsTheJSONSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	path, legacy := filepath.Join(dir, "addrbook.db"), filepath.Join(dir, "addrbook.json")
 	writeJSON(t, legacy,
@@ -659,18 +674,48 @@ func TestOpenImportsTheJSONSnapshotOnce(t *testing.T) {
 	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the imported snapshot is still there: %v", err)
 	}
+}
+
+// Open merges a JSON snapshot into a book that has entries: an earlier
+// version wrote it after a downgrade. For each address the later expiry
+// wins, and a new address is added.
+func TestOpenMergesTheJSONSnapshotIntoTheBook(t *testing.T) {
+	dir := t.TempDir()
+	path, legacy := filepath.Join(dir, "addrbook.db"), filepath.Join(dir, "addrbook.json")
+	s, err := Open(path, legacy, retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record(t, s, "web", 0, t0, "192.0.2.1")                  // expires at t0+1h
+	record(t, s, "web", 0, t0.Add(2*time.Hour), "192.0.2.2") // expires at t0+3h
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-
-	writeJSON(t, legacy, jsonEntry("web", "198.51.100.1", retain))
+	writeJSON(t, legacy,
+		jsonEntry("web", "192.0.2.1", 3*time.Hour),    // later than the book
+		jsonEntry("web", "192.0.2.2", 90*time.Minute), // earlier than the book
+		jsonEntry("ads", "198.51.100.7", 2*time.Hour)) // not in the book
 	s2, err := Open(path, legacy, retain)
 	if err != nil {
-		t.Fatalf("second Open: %v", err)
+		t.Fatalf("Open with the snapshot: %v", err)
 	}
 	t.Cleanup(func() { _ = s2.Close() }) //nolint:errcheck // a second Close returns the same result
-	if got := strs(s2.Addrs("web")); !slices.Equal(got, []string{"192.0.2.1"}) {
-		t.Errorf("web after the second Open = %v, want only the first import", got)
+	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the merged snapshot is still there: %v", err)
+	}
+	expire := []struct {
+		at   time.Duration
+		want int
+	}{
+		{retain + time.Nanosecond, 0},         // 192.0.2.1 has the later expiry of the snapshot
+		{90*time.Minute + time.Nanosecond, 0}, // 192.0.2.2 keeps the later expiry of the book
+		{2*time.Hour + time.Nanosecond, 1},    // 198.51.100.7 of ads
+		{3*time.Hour + time.Nanosecond, 2},    // both web addresses
+	}
+	for _, e := range expire {
+		if n, err := s2.Apply(context.Background(), Expire{At: t0.Add(e.at)}); err != nil || n != e.want {
+			t.Errorf("Expire at t0+%v = %d, %v; want %d, nil", e.at, n, err, e.want)
+		}
 	}
 }
 
@@ -700,12 +745,14 @@ func TestOpenRefusesACorruptJSONSnapshot(t *testing.T) {
 	}
 }
 
-// A crash after the import committed and before the removal of the
-// snapshot does not import the snapshot again.
-func TestCrashBeforeTheRemovalOfTheSnapshotDoesNotImportAgain(t *testing.T) {
+// A crash after the merge committed and before the removal of the
+// snapshot leaves the snapshot. The next Open merges it again, and the
+// book does not change.
+func TestCrashBeforeTheRemovalOfTheSnapshotMergesItAgainWithNoChange(t *testing.T) {
 	dir := t.TempDir()
 	path, legacy := filepath.Join(dir, "addrbook.db"), filepath.Join(dir, "addrbook.json")
-	writeJSON(t, legacy, jsonEntry("web", "192.0.2.1", retain))
+	snapshot := []string{jsonEntry("web", "192.0.2.1", 2*time.Hour), jsonEntry("ads", "198.51.100.7", 3*time.Hour)}
+	writeJSON(t, legacy, snapshot...)
 	var image []byte
 	c := &commits{after: func() {
 		var err error
@@ -717,22 +764,25 @@ func TestCrashBeforeTheRemovalOfTheSnapshotDoesNotImportAgain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	want := latestFacts(t, s)
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// The crash state: the file as the import left it, and the snapshot,
-	// here with other entries so that a second import shows.
+	// The crash state: the file as the merge left it, and the snapshot.
 	if err := os.WriteFile(path, image, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeJSON(t, legacy, jsonEntry("web", "198.51.100.1", retain))
+	writeJSON(t, legacy, snapshot...)
 	s2, err := Open(path, legacy, retain)
 	if err != nil {
 		t.Fatalf("Open after the crash: %v", err)
 	}
 	defer s2.Close() //nolint:errcheck // the test checks no write after this point
-	if got := strs(s2.Addrs("web")); !slices.Equal(got, []string{"192.0.2.1"}) {
-		t.Errorf("web = %v, want only the first import", got)
+	if got := latestFacts(t, s2); !maps.Equal(got.Counts, want.Counts) || !got.NextExpiry.Equal(want.NextExpiry) {
+		t.Errorf("facts after the second merge = %+v, want %+v", got, want)
+	}
+	if n, err := s2.Apply(context.Background(), Expire{At: t0.Add(2*time.Hour + time.Nanosecond)}); err != nil || n != 1 {
+		t.Errorf("Expire after the first expiry = %d, %v; want 1, nil", n, err)
 	}
 	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the snapshot is still there: %v", err)

@@ -24,9 +24,9 @@ import (
 // configuration.
 var errNoConfig = errors.New("daemon: no configuration")
 
-// reasonNotLoaded is the reason of StateStarting before the first load of
-// the snapshot.
-const reasonNotLoaded = "the snapshot is not loaded yet"
+// reasonNotLoaded is the reason of StateStarting before the first open of
+// the address book.
+const reasonNotLoaded = "the address book is not loaded yet"
 
 // storeFunc stores a configuration as configstore.Store does.
 type storeFunc func(path string, data []byte, gid int) (policy.Config, configstore.Digest, error)
@@ -53,7 +53,7 @@ const (
 type loop struct {
 	rec reconcile.Reconciler
 	// addrStore is the path of the address book, and snapshot the path
-	// of the JSON snapshot that its first open imports.
+	// of the JSON snapshot that each open of the book merges.
 	addrStore string
 	snapshot  string
 	openBook  openBookFunc
@@ -380,7 +380,7 @@ func (l *loop) logStatesEnded(ctx context.Context, cause string, policies []poli
 func (l *loop) loadBook(ctx context.Context, conf activeConfig, retain time.Duration) (addrBook, error) {
 	book, err := l.openBook(l.addrStore, l.snapshot, retain)
 	if err != nil {
-		return nil, fmt.Errorf("loading snapshot: %w", err)
+		return nil, fmt.Errorf("loading the address book: %w", err)
 	}
 	if !slices.ContainsFunc(policyNames(conf.cfg), func(n policy.Name) bool { return len(book.Addrs(n)) > 0 }) {
 		if err := l.adopt(ctx, book, conf.cfg.Policies); err != nil {
@@ -656,7 +656,7 @@ func (l *loop) record(ctx context.Context, book addrBook, names []policy.Name, o
 		}
 	}
 	if err := book.Commit(ctx, p); err != nil {
-		return fmt.Errorf("saving snapshot: %w", err)
+		return fmt.Errorf("saving the address book: %w", err)
 	}
 	return nil
 }

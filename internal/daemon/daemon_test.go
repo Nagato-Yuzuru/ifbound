@@ -24,7 +24,7 @@ import (
 )
 
 // writeSnapshot writes a JSON snapshot of an earlier version, which the
-// daemon imports at its first start. Each entry was seen now, with a ttl
+// daemon merges into the address book at its next start. Each entry was seen now, with a ttl
 // of one minute, and expires after the retain of one hour.
 func writeSnapshot(t *testing.T, path string, entries map[policy.Name]string) {
 	t.Helper()
@@ -132,7 +132,7 @@ func TestSnapshotLoadErrorLoadsTheRulesetAndRemovesNothing(t *testing.T) {
 func wantAddOnly(h *harness) {
 	h.t.Helper()
 	st := h.wantState(daemon.StateStarting)
-	if len(st.Reasons) == 0 || !strings.Contains(st.Reasons[0], "loading snapshot") {
+	if len(st.Reasons) == 0 || !strings.Contains(st.Reasons[0], "loading the address book") {
 		h.t.Errorf("reasons = %q, want the snapshot error first", st.Reasons)
 	}
 	if !h.references("web") || !h.references("ads") {
@@ -666,7 +666,7 @@ func TestObserveNotAckedWhenSaveFails(t *testing.T) {
 
 		err := h.observe(obs("www.example.net", "203.0.113.1"))
 
-		if !errors.Is(err, daemon.ErrInjectedBook) || !strings.Contains(err.Error(), "saving snapshot") {
+		if !errors.Is(err, daemon.ErrInjectedBook) || !strings.Contains(err.Error(), "saving the address book") {
 			t.Errorf("Observe = %v, want the save error", err)
 		}
 		if got := h.saved("web"); len(got) != 0 {

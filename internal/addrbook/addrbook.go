@@ -1,6 +1,7 @@
 // Package addrbook reads the address book snapshot that earlier versions
 // of ifboundd wrote as a JSON file. The address book is now in
-// addrstore, which imports the snapshot once with Read.
+// addrstore, which merges the snapshot with Read at each open where the
+// file exists.
 package addrbook
 
 import (

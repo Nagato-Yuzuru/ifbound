@@ -172,7 +172,7 @@ func TestAddOnlyConvergenceEventErrorType(t *testing.T) {
 			logattr.ErrorType:        logattr.ErrorTypeSnapshot,
 			logattr.EnforcementState: logattr.StateStarting,
 		})
-		if msg := ok.attrs[logattr.ExceptionMessage].String(); !strings.Contains(msg, "loading snapshot") {
+		if msg := ok.attrs[logattr.ExceptionMessage].String(); !strings.Contains(msg, "loading the address book") {
 			t.Errorf("%s = %q, want the snapshot error", logattr.ExceptionMessage, msg)
 		}
 
@@ -185,7 +185,7 @@ func TestAddOnlyConvergenceEventErrorType(t *testing.T) {
 			logattr.EnforcementState: logattr.StateStarting,
 		})
 		msg := failed.attrs[logattr.ExceptionMessage].String()
-		if !strings.Contains(msg, "loading snapshot") || !strings.Contains(msg, reconciletest.ErrInjected.Error()) {
+		if !strings.Contains(msg, "loading the address book") || !strings.Contains(msg, reconciletest.ErrInjected.Error()) {
 			t.Errorf("%s = %q, want the snapshot error and the injected error", logattr.ExceptionMessage, msg)
 		}
 	})
