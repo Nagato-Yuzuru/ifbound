@@ -23,9 +23,29 @@ linters:
     - nolintlint
     - godox
     - depguard
+    - forbidigo
   settings:
     depguard:
       rules:
+        daemon-core-pure:
+          # core.Step is a pure function: the shell in package daemon does
+          # every I/O, and the time comes with each event. lax lets the
+          # longer allow match net/netip win over the deny of net.
+          files: ["**/internal/daemon/core/**"]
+          list-mode: lax
+          allow:
+            - net/netip
+          deny:
+            - pkg: os
+              desc: core does no I/O; the shell does it
+            - pkg: context
+              desc: core does not block or cancel; the shell does it
+            - pkg: sync
+              desc: core starts no goroutine and shares no state
+            - pkg: syscall
+              desc: core does no I/O; the shell does it
+            - pkg: net
+              desc: core does no I/O; the shell does it
         toml-position-walk:
           # One walk over unstable.Parser gives the places of fields and finds
           # duplicate keys. A second walker would drift from it.
@@ -51,6 +71,11 @@ linters:
           deny:
             - pkg: encoding/json$
               desc: use encoding/json/v2
+    forbidigo:
+      forbid:
+        # The exclusions below limit this rule to internal/daemon/core.
+        - pattern: ^time\.(Now|Since|Until|After|AfterFunc|Sleep|NewTimer|NewTicker|Tick)$
+          msg: core reads no clock and starts no timer; the time comes with each event
     errcheck:
       check-blank: true # a blank drop needs //nolint:errcheck with a reason; nolintlint enforces the reason
     godox:
@@ -77,6 +102,9 @@ linters:
         - name: deep-exit
   exclusions:
     rules:
+      - path-except: internal/daemon/core/
+        linters:
+          - forbidigo # the clock rule is for the pure core only
       - path: _test\.go
         linters:
           - err113 # ad-hoc errors are fine in test bodies

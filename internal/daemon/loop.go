@@ -12,6 +12,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
+	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
@@ -65,8 +66,17 @@ type loop struct {
 	// configuration resets it.
 	selfTest selfTest
 
-	hosts    hostsState
-	accounts accountsState
+	hosts hostsState
+
+	// core is the state that core.Step decides on. Only drive changes it.
+	core core.State
+	// accountReader is nil when there is no reader: the account
+	// snapshot then stays zero.
+	accountReader AccountReader
+	// accountResults receives the result of the account read in flight.
+	// It has room for one result, and core starts at most one read at a
+	// time.
+	accountResults chan core.AccountsRead
 
 	// recheck asks Run for a convergence after the current request. A
 	// report sets it when it finds a loaded ruleset that is not the
@@ -89,7 +99,9 @@ func newLoop(c Config, store storeFunc, pub *atomic.Pointer[Status]) *loop {
 		pub:      pub,
 		mode:     unconfiguredMode{phase: startingPhase(reasonNotLoaded)},
 		hosts:    hostsState{reader: c.Hosts},
-		accounts: newAccountsState(c.Accounts),
+
+		accountReader:  c.Accounts,
+		accountResults: make(chan core.AccountsRead, 1),
 	}
 	return l
 }
@@ -218,7 +230,7 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		Hosts:    l.hosts.addrs,
 		Apexes:   conf.apexes,
 		Listen:   conf.cfg.DNS.Listen,
-		Accounts: l.accounts.snap,
+		Accounts: l.core.AccountIDs(),
 		AddOnly:  loadErr != nil,
 	})
 	if rep.Installed != "" && loadErr == nil {
@@ -452,7 +464,7 @@ func (l *loop) reconfigure(ctx context.Context, cfg policy.Config, digest config
 	l.setConfig(cfg, digest)
 	l.setPhase(ctx, unenforcedPhase("the new configuration is not installed yet"))
 	l.publish()
-	l.readAccounts(ctx)
+	l.wantAccounts(ctx)
 	return l.reconcile(ctx, logattr.TriggerConfig)
 }
 
