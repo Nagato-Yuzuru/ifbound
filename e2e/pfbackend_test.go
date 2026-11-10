@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -78,6 +79,7 @@ func pfctl(t testing.TB, args ...string) string {
 // rulesets of the anchor stay.
 func loadOnly(t *testing.T, anchor, flag, rules string) {
 	t.Helper()
+	skipUpCallOnArm64(t, rules)
 	cmd := exec.CommandContext(t.Context(), pfbackend.Path, "-a", anchor, flag, "-f", "-")
 	cmd.Stdin = strings.NewReader(rules)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -376,10 +378,26 @@ func TestPfBackendAddEndsStates(t *testing.T) {
 	}
 }
 
+// skipUpCallOnArm64 skips the test when rules hold an anchor call that
+// starts with "../" and the kernel is arm64. pf_anchor_setup removes each
+// "../" from the call, but it then appends the rest with the length of the
+// full call. The arm64 kernel checks the bounds of the call, so the load
+// stops the kernel with a panic ("Bounds safety trap"), and the host
+// restarts. The Intel kernel does not check the bounds, so the test runs
+// there. The test binary is built for the architecture of the host, so
+// GOARCH is the architecture of the kernel.
+func skipUpCallOnArm64(t testing.TB, rules string) {
+	t.Helper()
+	if runtime.GOARCH == "arm64" && strings.Contains(rules, `anchor "../`) {
+		t.Skip(`an anchor call that starts with "../" stops the arm64 kernel with a panic`)
+	}
+}
+
 // loadAnchor loads rules into an anchor of another tool, and flushes the
 // anchor at the end of the test.
 func loadAnchor(t testing.TB, anchor, rules string) {
 	t.Helper()
+	skipUpCallOnArm64(t, rules)
 	cmd := exec.CommandContext(t.Context(), pfbackend.Path, "-a", anchor, "-f", "-")
 	cmd.Stdin = strings.NewReader(rules)
 	if out, err := cmd.CombinedOutput(); err != nil {
