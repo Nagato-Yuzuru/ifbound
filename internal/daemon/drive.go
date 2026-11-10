@@ -3,14 +3,20 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 )
 
 // drive gives ev to core.Step and runs the effects that it returns, in
-// their order. A sync effect runs on the loop before drive returns, so it
-// ends before the loop takes the next outside event.
+// their order. A sync effect runs on the loop, and runSync gives its
+// result to drive at once, before the next effect runs. So a sync chain
+// ends before drive returns, and before the loop takes the next outside
+// event. The result must not wait in a queue: a Converge later in the
+// list would then run while the host file read is still in flight, and
+// that pass would use the host addresses of the read before.
 //
 // Each case gives the effect to the function of its sub sum, so the
 // compiler checks the sub sum of each effect. gochecksumtype does not
@@ -22,11 +28,19 @@ func (l *loop) drive(ctx context.Context, ev core.Event) {
 		switch e := e.(type) {
 		case core.Converge:
 			l.runSync(ctx, e)
+		case core.ReadHosts:
+			l.runSync(ctx, e)
+		case core.ReadKernelHosts:
+			l.runSync(ctx, e)
 		case core.ReadAccounts:
 			l.runAsync(ctx, e)
 		case core.AccountsOverdue:
 			l.emit(ctx, e)
 		case core.AccountLookupsFailed:
+			l.emit(ctx, e)
+		case core.HostsReadFailed:
+			l.emit(ctx, e)
+		case core.KernelHostsFailed:
 			l.emit(ctx, e)
 		default:
 			panic(fmt.Sprintf("daemon: unknown effect %T", e))
@@ -34,13 +48,21 @@ func (l *loop) drive(ctx context.Context, ev core.Event) {
 	}
 }
 
+// runSync runs e, and gives its result, if it has one, to drive.
 func (l *loop) runSync(ctx context.Context, e core.SyncEffect) {
+	var res core.Event
 	switch e := e.(type) {
 	case core.Converge:
 		_ = l.reconcile(ctx, e.Trigger) //nolint:errcheck // the phase holds the outcome
+		return
+	case core.ReadHosts:
+		res = l.readHosts(ctx, e)
+	case core.ReadKernelHosts:
+		res = l.readKernelHosts(ctx, e)
 	default:
 		panic(fmt.Sprintf("daemon: unknown sync effect %T", e))
 	}
+	l.drive(ctx, res)
 }
 
 func (l *loop) runAsync(ctx context.Context, e core.AsyncEffect) {
@@ -58,6 +80,12 @@ func (l *loop) emit(ctx context.Context, e core.OutEffect) {
 		l.log.WarnContext(ctx, "account read takes longer than its budget")
 	case core.AccountLookupsFailed:
 		l.logLookupsFailed(ctx, e)
+	case core.HostsReadFailed:
+		l.log.WarnContext(ctx, "host file read failed",
+			slog.String(logattr.ErrorType, logattr.ErrorTypeHostsRead), slog.String(logattr.ExceptionMessage, e.Err.Error()))
+	case core.KernelHostsFailed:
+		l.log.WarnContext(ctx, "reading the kernel entries for the host file failed",
+			slog.String(logattr.ErrorType, logattr.ErrorTypePlatform), slog.String(logattr.ExceptionMessage, e.Err.Error()))
 	default:
 		panic(fmt.Sprintf("daemon: unknown out effect %T", e))
 	}

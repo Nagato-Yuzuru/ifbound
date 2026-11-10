@@ -102,6 +102,39 @@ func TestObservedIgnoresAStaleResult(t *testing.T) {
 	}
 }
 
+func TestObservedKeepEndsTheFlightAndKeepsTheSampleAndTheFailure(t *testing.T) {
+	var o Observed[int]
+	o, _ = o.Start(1, at(0), budget)
+	o, ok := o.Keep(1, at(time.Second))
+	if !ok {
+		t.Fatal("Keep of the flight was refused")
+	}
+	if _, ok := o.InFlight(); ok {
+		t.Error("a flight is left after Keep")
+	}
+	if _, ok := o.Last(); ok {
+		t.Error("Keep without a sample made one")
+	}
+
+	o = finish(t, o, 2, 10, nil, at(2*time.Second))
+	o = finish(t, o, 3, 0, errRead, at(3*time.Second))
+	o, _ = o.Start(4, at(4*time.Second), budget)
+	o, ok = o.Keep(4, at(5*time.Second))
+	if !ok {
+		t.Fatal("Keep of the flight was refused")
+	}
+	wantSample(t, o, 10, at(2*time.Second))
+	if f, ok := o.Failing(); !ok || f.Count != 1 || !f.At.Equal(at(3*time.Second)) {
+		t.Errorf("Failing = %+v, %v after Keep; want the one failure at %v", f, ok, at(3*time.Second))
+	}
+
+	o, _ = o.Start(5, at(6*time.Second), budget)
+	before := o
+	if got, ok := o.Keep(4, at(7*time.Second)); ok || got != before {
+		t.Errorf("Keep with the ID of an older read: %v, %+v; want refused and no change", ok, got)
+	}
+}
+
 func TestObservedOverdueFromTheDeadline(t *testing.T) {
 	var o Observed[int]
 	if o.Overdue(at(time.Hour)) {

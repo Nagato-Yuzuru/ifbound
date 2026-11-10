@@ -8,7 +8,9 @@ package core
 import (
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
+	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
 // State is what Step knows. Only Step changes it. The zero State is the
@@ -23,6 +25,11 @@ type State struct {
 	// scope is the names that the last AccountsWanted gave. A pending
 	// read uses them.
 	scope accountNames
+
+	hosts Observed[HostFile]
+	// kernelHosts is the learned-looking kernel entries. They count as
+	// host addresses until a read of hosts is good.
+	kernelHosts Observed[map[policy.Name][]blockable.Addr]
 }
 
 // accountNames is the user names and the group names that the scopes of
@@ -46,7 +53,8 @@ func (e Tick) at() time.Time { return e.At }
 type Effect interface{ isEffect() }
 
 // SyncEffect runs on the loop. The shell runs it before it takes the next
-// outside event.
+// outside event, and gives its result back to Step before it runs the
+// next effect.
 //
 //sumtype:decl
 type SyncEffect interface {
@@ -101,6 +109,12 @@ func Step(s State, ev Event) (State, []Effect) {
 		var changed bool
 		s, out, changed = s.applyAccounts(ev, out)
 		converge = converge || changed
+	case HostsWanted:
+		s, out = s.readHosts(out)
+	case HostsRead:
+		s, out = s.applyHosts(ev, out)
+	case KernelRead:
+		s, out = s.applyKernelHosts(ev, out)
 	}
 	if converge {
 		out = append(out, Converge{Trigger: logattr.TriggerAccounts})

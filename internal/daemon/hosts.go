@@ -9,39 +9,23 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
+	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
 	"github.com/Nagato-Yuzuru/ifbound/internal/hostsfile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
-	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
-// hostsState is what the daemon knows of the host file. macOS answers a
-// name from the host file before it asks DNS, so a host entry for a
-// protected name never reaches ifbound-dns. Its address goes into the
-// table of each matching policy instead. The file is the source of truth
-// for these addresses: they do not expire and are not in the snapshot.
-type hostsState struct {
-	reader HostsReader
-	// good is the content of the last good read. A missing file is a good
-	// read with no entries.
-	good hostsfile.Hosts
-	// read is true after the first good read.
-	read bool
-	// version identifies the file of the last good read.
-	version hostsfile.Version
-	// err is the error of the last read, or nil.
-	err error
-	// addrs are the host addresses of each policy, sorted, without
-	// duplicates. Before the first good
-	// read, they are the learned-looking kernel entries: the last run can
-	// have put host addresses there.
+// mappedHosts is the host addresses of each policy that the shell mapped
+// from a good read of the host file, sorted, without duplicates.
+type mappedHosts struct {
+	// file is the ID of the read, and gen is the configuration
+	// generation.
+	file  core.ReqID
+	gen   uint64
 	addrs map[policy.Name][]blockable.Addr
-	// gen is the configuration generation that addrs was made for.
-	gen uint64
-	// dirty is true when good changed after addrs was made.
-	dirty bool
 }
 
 // HostsReader reads the host file. hostsfs.Reader implements it.
@@ -62,77 +46,55 @@ type HostsReader interface {
 	Read(v hostsfile.Version) (hostsfile.Hosts, error)
 }
 
-// refreshHosts reads the host file again when it changed or the last
-// read failed, and maps its entries again when the content or the
-// configuration changed. conf is the active configuration. A file that
-// exists but cannot be read keeps the addresses of the last good read:
-// other readers can still read it, so its entries can be in use.
-func (l *loop) refreshHosts(ctx context.Context, conf activeConfig) {
-	h := &l.hosts
-	if v, err := h.reader.Version(); err != nil {
-		h.fail(ctx, l.log, err)
-	} else if !h.read || h.err != nil || v != h.version {
-		l.readHosts(ctx, v)
-	}
+// readHosts runs the host file read of e. The file must have the same
+// version after the read: a writer that is not done can leave a part of
+// the file or no file, and the next read reads again.
+func (l *loop) readHosts(ctx context.Context, e core.ReadHosts) core.HostsRead {
+	r := l.hostsReader
+	res := core.HostsRead{ID: e.ID}
+	v, err := r.Version()
 	switch {
-	case !h.read:
-		l.keepKernelHosts(ctx, conf.cfg.Policies)
-	case h.dirty || h.gen != conf.gen:
-		h.addrs = l.mapHosts(ctx, conf)
-		h.gen, h.dirty = conf.gen, false
+	case err != nil:
+		res.Err = err
+	case e.Known && v == e.Last:
+	default:
+		content, err := r.Read(v)
+		if err != nil {
+			res.Err = err
+			break
+		}
+		if after, err := r.Version(); err != nil || after != v {
+			break
+		}
+		if !v.Exists {
+			l.log.DebugContext(ctx, "host file is missing")
+		}
+		res.New, res.Version, res.Hosts = true, v, content
 	}
+	res.At = time.Now()
+	return res
 }
 
-// readHosts reads the file that Version found as v. The file must have
-// the same version after the read: a writer that is not done can leave a
-// part of the file or no file, and the next pass reads again.
-func (l *loop) readHosts(ctx context.Context, v hostsfile.Version) {
-	h := &l.hosts
-	content, err := h.reader.Read(v)
-	if err != nil {
-		h.fail(ctx, l.log, err)
-		return
-	}
-	if after, err := h.reader.Version(); err != nil || after != v {
-		return
-	}
-	if !v.Exists {
-		l.log.DebugContext(ctx, "host file is missing")
-	}
-	h.good, h.version, h.err, h.read, h.dirty = content, v, nil, true, true
+// readKernelHosts reads the learned-looking kernel entries of the
+// configured policies.
+func (l *loop) readKernelHosts(ctx context.Context, e core.ReadKernelHosts) core.KernelRead {
+	found, err := l.rec.Adoptable(ctx, l.policies())
+	return core.KernelRead{At: time.Now(), ID: e.ID, Addrs: found, Err: err}
 }
 
-// keepKernelHosts runs while no read of the host file has succeeded. The
-// last run can have put host addresses in the tables, and the file can
-// still have their entries. So the learned-looking kernel entries count
-// as host addresses until a read succeeds. A failed kernel read keeps
-// the earlier ones.
-func (l *loop) keepKernelHosts(ctx context.Context, policies []policy.Policy) {
-	found, err := l.rec.Adoptable(ctx, policies)
-	if err != nil {
-		l.log.WarnContext(ctx, "reading the kernel entries for the host file failed",
-			slog.String(logattr.ErrorType, logattr.ErrorTypePlatform), slog.String(logattr.ExceptionMessage, err.Error()))
-		return
+// hostAddrs returns the host addresses of each policy for a convergence
+// under conf. Before the first good read of the host file, they are the
+// kernel host entries. It maps the file again only when the read or the
+// configuration changed, so the warnings of mapHosts do not repeat.
+func (l *loop) hostAddrs(ctx context.Context, conf activeConfig) map[policy.Name][]blockable.Addr {
+	file, read := l.core.HostFile()
+	if !read {
+		return l.core.KernelHosts()
 	}
-	l.hosts.addrs = found
-}
-
-func (h *hostsState) fail(ctx context.Context, log *slog.Logger, err error) {
-	if h.err == nil {
-		log.WarnContext(ctx, "host file read failed",
-			slog.String(logattr.ErrorType, logattr.ErrorTypeHostsRead), slog.String(logattr.ExceptionMessage, err.Error()))
+	if m := l.mapped; m.file != file.ID || m.gen != conf.gen {
+		l.mapped = mappedHosts{file: file.ID, gen: conf.gen, addrs: l.mapHosts(ctx, conf, file.Hosts)}
 	}
-	h.err = err
-}
-
-// problem returns the Problem of a failed read, if there is one. It does
-// not void enforcement: the tables keep the host addresses that they
-// have.
-func (h *hostsState) problem() (reconcile.Problem, bool) {
-	if h.err == nil {
-		return reconcile.Problem{}, false
-	}
-	return reconcile.Problem{Text: "the host file cannot be read, so changes to its entries for protected names are not applied: " + h.err.Error()}, true
+	return l.mapped.addrs
 }
 
 // mapHosts gives the addresses of the host file to the policies that
@@ -145,8 +107,8 @@ func (h *hostsState) problem() (reconcile.Problem, bool) {
 // It also logs, in one event, the lines with a name that the entries
 // cannot show, when the name is at or below an apex. Such a line can hold
 // a protected address that no table has.
-func (l *loop) mapHosts(ctx context.Context, conf activeConfig) map[policy.Name][]blockable.Addr {
-	g := newHostGraph(l.hosts.good.Entries)
+func (l *loop) mapHosts(ctx context.Context, conf activeConfig, hosts hostsfile.Hosts) map[policy.Name][]blockable.Addr {
+	g := newHostGraph(hosts.Entries)
 	out := make(map[policy.Name][]blockable.Addr)
 	var bad []string
 	var badErrs []error
@@ -174,7 +136,7 @@ func (l *loop) mapHosts(ctx context.Context, conf activeConfig) map[policy.Name]
 			slog.String(logattr.ErrorType, logattr.ErrorTypeInvariant), slog.String(logattr.ExceptionMessage, errors.Join(badErrs...).Error()))
 	}
 	var lines []string
-	for _, line := range l.hosts.good.Unrepresentable {
+	for _, line := range hosts.Unrepresentable {
 		if below := belowApex(conf.apexes, line.Names); len(below) > 0 {
 			lines = append(lines, fmt.Sprintf("line %d: %s", line.Number, strings.Join(below, " ")))
 		}

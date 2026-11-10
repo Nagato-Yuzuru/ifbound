@@ -64,11 +64,10 @@ func (o Observed[T]) Start(id ReqID, now time.Time, budget time.Duration) (Obser
 // read makes a new sample and ends the failure series. A failed read
 // keeps the last sample. The pending read stays for the caller to start.
 func (o Observed[T]) Finish(id ReqID, v T, err error, now time.Time) (Observed[T], bool) {
-	if o.flight == nil || o.flight.ID != id {
+	o, ok := o.Keep(id, now)
+	if !ok {
 		return o, false
 	}
-	o.late = !now.Before(o.flight.Deadline)
-	o.flight = nil
 	if err != nil {
 		f := Failure{Err: err, Since: now, At: now, Count: 1}
 		if o.failure != nil {
@@ -79,6 +78,19 @@ func (o Observed[T]) Finish(id ReqID, v T, err error, now time.Time) (Observed[T
 	}
 	o.last = &Sample[T]{Value: v, At: now}
 	o.failure = nil
+	return o, true
+}
+
+// Keep ends the read id with no value and no error: the read gave nothing
+// new. The last sample and the failure stay. It reports false, and
+// changes nothing, when id is not the read in flight. The pending read
+// stays for the caller to start.
+func (o Observed[T]) Keep(id ReqID, now time.Time) (Observed[T], bool) {
+	if o.flight == nil || o.flight.ID != id {
+		return o, false
+	}
+	o.late = !now.Before(o.flight.Deadline)
+	o.flight = nil
 	return o, true
 }
 

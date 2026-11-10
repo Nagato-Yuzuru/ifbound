@@ -66,10 +66,12 @@ type loop struct {
 	// configuration resets it.
 	selfTest selfTest
 
-	hosts hostsState
-
 	// core is the state that core.Step decides on. Only drive changes it.
 	core core.State
+	// hostsReader reads the host file. mapped is the last mapping of a
+	// good read of it.
+	hostsReader HostsReader
+	mapped      mappedHosts
 	// accountReader is nil when there is no reader: the account
 	// snapshot then stays zero.
 	accountReader AccountReader
@@ -98,8 +100,8 @@ func newLoop(c Config, store storeFunc, pub *atomic.Pointer[Status]) *loop {
 		log:      c.Logger,
 		pub:      pub,
 		mode:     unconfiguredMode{phase: startingPhase(reasonNotLoaded)},
-		hosts:    hostsState{reader: c.Hosts},
 
+		hostsReader:    c.Hosts,
 		accountReader:  c.Accounts,
 		accountResults: make(chan core.AccountsRead, 1),
 	}
@@ -204,30 +206,39 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		conf   activeConfig
 		retain time.Duration
 		book   *addrbook.AddrBook
+		hosts  map[policy.Name][]blockable.Addr
 		// loadErr is the error of the snapshot load in loadingMode.
 		loadErr error
 	)
 	began := time.Now()
+	switch l.mode.(type) {
+	case unconfiguredMode:
+	case loadingMode, runningMode:
+		// The time of the event can make the account read overdue, and
+		// Step then asks for a convergence. drive runs it to its end, so
+		// this pass reads the mode after it.
+		l.drive(ctx, core.HostsWanted{At: began})
+	}
 	switch m := l.mode.(type) {
 	case unconfiguredMode:
 		return errNoConfig
 	case loadingMode:
 		conf, retain = m.conf, m.retain
-		l.refreshHosts(ctx, conf)
+		hosts = l.hostAddrs(ctx, conf)
 		book, loadErr = l.loadBook(ctx, conf, retain)
 		if loadErr != nil {
 			book = addrbook.New(retain, time.Now)
 		}
 	case runningMode:
 		conf, retain, book = m.conf, m.retain, m.book
-		l.refreshHosts(ctx, conf)
+		hosts = l.hostAddrs(ctx, conf)
 	default:
 		return errNoConfig
 	}
 	rep, err := l.rec.Converge(ctx, reconcile.Inputs{
 		Policies: conf.cfg.Policies,
 		Book:     book,
-		Hosts:    l.hosts.addrs,
+		Hosts:    hosts,
 		Apexes:   conf.apexes,
 		Listen:   conf.cfg.DNS.Listen,
 		Accounts: l.core.AccountIDs(),
@@ -240,7 +251,7 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		book.Prune(policyNames(conf.cfg))
 	}
 	l.logStatesEnded(ctx, logattr.StatesCauseNarrowed, rep.Narrowed)
-	if p, ok := l.hosts.problem(); ok {
+	if p, ok := core.HostsProblem(l.core); ok {
 		rep.Problems = append(rep.Problems, p)
 	}
 	if p, ok := l.accountsProblem(conf.cfg.Policies); ok {
@@ -363,9 +374,10 @@ func (l *loop) adopt(ctx context.Context, book *addrbook.AddrBook, policies []po
 		return nil
 	}
 	for name, addrs := range found {
-		if l.hosts.read {
+		if _, read := l.core.HostFile(); read {
 			// The host file is their source of truth, not the snapshot.
-			hosts := l.hosts.addrs[name] // sorted
+			// reconcile mapped it before it loads the book.
+			hosts := l.mapped.addrs[name] // sorted
 			addrs = slices.DeleteFunc(addrs, func(a blockable.Addr) bool {
 				_, found := slices.BinarySearchFunc(hosts, a, blockable.Addr.Compare)
 				return found
