@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -13,10 +14,11 @@ import (
 // drive gives ev to core.Step and runs the effects that it returns, in
 // their order. A sync effect runs on the loop, and runSync gives its
 // result to drive at once, before the next effect runs. So a sync chain
-// ends before drive returns, and before the loop takes the next outside
-// event. The result must not wait in a queue: a Converge later in the
-// list would then run while the host file read is still in flight, and
-// that pass would use the host addresses of the read before.
+// ends before drive returns: reconcile reads the host values right after
+// its drive. A Converge does not run a pass here: runSync records it, and
+// Run starts the pass after the current request or event. So a pass
+// never runs inside another pass, and the place of Converge in the list
+// does not change what the pass sees.
 //
 // Each case gives the effect to the function of its sub sum, so the
 // compiler checks the sub sum of each effect. gochecksumtype does not
@@ -53,7 +55,7 @@ func (l *loop) runSync(ctx context.Context, e core.SyncEffect) {
 	var res core.Event
 	switch e := e.(type) {
 	case core.Converge:
-		_ = l.reconcile(ctx, e.Trigger) //nolint:errcheck // the phase holds the outcome
+		l.pending = cmp.Or(l.pending, e.Trigger)
 		return
 	case core.ReadHosts:
 		res = l.readHosts(ctx, e)

@@ -121,6 +121,9 @@ type harnessSpec struct {
 	hosts *fakeHosts
 	// reader, when not nil, is the host file reader in place of hosts.
 	reader daemon.HostsReader
+	// onLog, when not nil, gets each log event of the daemon on the
+	// goroutine that logs it.
+	onLog func(event)
 }
 
 // newSpec returns a spec on a new World, with cfgText as the stored
@@ -199,7 +202,7 @@ func launchHook(t *testing.T, s harnessSpec, hook func(*daemon.Daemon)) *harness
 	if s.hosts == nil {
 		s.hosts = &fakeHosts{}
 	}
-	logs := &capturedLogs{}
+	logs := &capturedLogs{onEvent: s.onLog}
 	d := daemon.New(daemon.Config{
 		ConfigPath: s.store,
 		ConfigGID:  -1,

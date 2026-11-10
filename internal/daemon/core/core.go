@@ -21,7 +21,7 @@ type State struct {
 	// nextID is the ID of the last read that Step started.
 	nextID ReqID
 
-	accounts Observed[Accounts]
+	accounts accountReads
 	// scope is the names that the last AccountsWanted gave. A pending
 	// read uses them.
 	scope accountNames
@@ -81,7 +81,9 @@ type OutEffect interface {
 }
 
 // Converge asks for one convergence with a trigger, a value of
-// logattr.ConvergeTrigger.
+// logattr.ConvergeTrigger. The shell does not start the pass in the
+// middle of the effects: it starts it after the current outside event,
+// so a pass never runs inside another pass.
 type Converge struct{ Trigger string }
 
 func (Converge) isEffect() {}
@@ -89,15 +91,16 @@ func (Converge) isSync()   {}
 
 // Step returns the state and the effects that follow ev. A time in ev
 // that is older than the latest one does not move the time back. Step
-// asks for at most one convergence for each event.
+// asks for at most one convergence for each event, and Converge is then
+// the last effect.
 func Step(s State, ev Event) (State, []Effect) {
-	wasOverdue := s.accounts.Overdue(s.now)
+	wasOverdue := s.accounts.overdue(s.now)
 	if t := ev.at(); t.After(s.now) {
 		s.now = t
 	}
 	var out []Effect
 	converge := false
-	if !wasOverdue && s.accounts.Overdue(s.now) {
+	if !wasOverdue && s.accounts.overdue(s.now) {
 		out, converge = s.accountsOverdue(out), true
 	}
 	switch ev := ev.(type) {
@@ -125,8 +128,8 @@ func Step(s State, ev Event) (State, []Effect) {
 // NextWake returns the time at which the shell gives Step a Tick. It
 // reports false when nothing is due.
 func NextWake(s State) (time.Time, bool) {
-	if f, ok := s.accounts.InFlight(); ok && s.now.Before(f.Deadline) {
-		return f.Deadline, true
+	if _, ok := s.accounts.InFlight(); ok && s.now.Before(s.accounts.deadline) {
+		return s.accounts.deadline, true
 	}
 	return time.Time{}, false
 }

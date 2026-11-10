@@ -92,10 +92,6 @@ func (HostsReadFailed) isOut()      {}
 func (KernelHostsFailed) isEffect() {}
 func (KernelHostsFailed) isOut()    {}
 
-// syncBudget is the budget of a sync read. The loop waits for the read,
-// so nothing checks its deadline.
-const syncBudget = 0
-
 // HostFile returns the content of the last good host file read. It
 // reports false before the first good read.
 func (s State) HostFile() (HostFile, bool) {
@@ -123,11 +119,12 @@ func HostsProblem(s State) (reconcile.Problem, bool) {
 	return reconcile.Problem{Text: "the host file cannot be read, so changes to its entries for protected names are not applied: " + f.Err.Error()}, true
 }
 
-// readHosts starts a read of the host file. During a read it starts
-// nothing: the next read starts when the read in flight ends.
+// readHosts starts a read of the host file. ReadHosts is a sync effect:
+// the shell gives its result back before the next event, so no host read
+// is in flight here, and no trigger comes during a read.
 func (s State) readHosts(out []Effect) (State, []Effect) {
 	id := s.nextID + 1
-	o, started := s.hosts.Start(id, s.now, syncBudget)
+	o, started := s.hosts.Start(id)
 	s.hosts = o
 	if !started {
 		return s, out
@@ -156,7 +153,7 @@ func (s State) applyHosts(ev HostsRead, out []Effect) (State, []Effect) {
 	case ev.New:
 		o, ok = s.hosts.Finish(ev.ID, HostFile{ID: ev.ID, Version: ev.Version, Hosts: ev.Hosts}, nil, s.now)
 	default:
-		o, ok = s.hosts.Keep(ev.ID, s.now)
+		o, ok = s.hosts.Keep(ev.ID)
 	}
 	if !ok {
 		return s, out
@@ -165,21 +162,18 @@ func (s State) applyHosts(ev HostsRead, out []Effect) (State, []Effect) {
 	if f, failing := o.Failing(); failing && !wasFailing {
 		out = append(out, HostsReadFailed{Err: f.Err})
 	}
-	if o.Again() {
-		return s.readHosts(out)
-	}
 	if _, read := o.Last(); !read {
 		return s.readKernelHosts(out)
 	}
 	return s, out
 }
 
-// readKernelHosts starts a read of the kernel host entries. During a
-// read it starts nothing: the next read starts when the read in flight
-// ends.
+// readKernelHosts starts a read of the kernel host entries.
+// ReadKernelHosts is a sync effect too, so no kernel read is in flight
+// here.
 func (s State) readKernelHosts(out []Effect) (State, []Effect) {
 	id := s.nextID + 1
-	o, started := s.kernelHosts.Start(id, s.now, syncBudget)
+	o, started := s.kernelHosts.Start(id)
 	s.kernelHosts = o
 	if !started {
 		return s, out
@@ -199,9 +193,6 @@ func (s State) applyKernelHosts(ev KernelRead, out []Effect) (State, []Effect) {
 	s.kernelHosts = o
 	if ev.Err != nil {
 		out = append(out, KernelHostsFailed{Err: ev.Err})
-	}
-	if o.Again() {
-		return s.readKernelHosts(out)
 	}
 	return s, out
 }

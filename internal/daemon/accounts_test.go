@@ -2,17 +2,22 @@ package daemon_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
+	"github.com/Nagato-Yuzuru/ifbound/internal/hostsfile"
+	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
@@ -414,8 +419,128 @@ func TestHungLookupDoesNotBlockTheLoop(t *testing.T) {
 	})
 }
 
+// slowForeignCheck is a Backend whose next LoadedID after arm takes
+// longer than AccountReadTimeout and finds a ruleset that ifbound did not
+// install. Run then converges right after the report, at a time past the
+// deadline of the account read in flight.
+type slowForeignCheck struct {
+	*reconciletest.Backend
+	arm *atomic.Bool
+}
+
+func (b slowForeignCheck) LoadedID(ctx context.Context) (string, error) {
+	if b.arm.CompareAndSwap(true, false) {
+		time.Sleep(daemon.AccountReadTimeout + time.Second) // in the bubble: moves the fake clock
+		return "changed-outside", nil
+	}
+	return b.Backend.LoadedID(ctx)
+}
+
+// passProbe watches the convergence passes from the outside. Each pass
+// reads the host file first and writes its convergence event last. So a
+// host file read comes between two convergence events, and a pass that
+// runs inside another pass ends with no read of its own. At each
+// convergence event, the probe also records whether the web table has
+// the address of the host entry.
+type passProbe struct {
+	daemon.HostsReader
+	world *reconciletest.World
+	want  netip.Prefix
+
+	mu     sync.Mutex
+	armed  bool
+	read   bool // a host file read came after the last convergence event
+	passes []probedPass
+}
+
+type probedPass struct {
+	trigger          string
+	ownRead, hasHost bool
+}
+
+func (p *passProbe) Version() (hostsfile.Version, error) {
+	p.mu.Lock()
+	p.read = true
+	p.mu.Unlock()
+	return p.HostsReader.Version()
+}
+
+func (p *passProbe) onLog(e event) {
+	if e.msg != "convergence" {
+		return
+	}
+	has := slices.Contains(p.world.Tables()["web"], p.want)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.armed {
+		p.passes = append(p.passes, probedPass{trigger: e.attrs[logattr.ConvergeTrigger].String(), ownRead: p.read, hasHost: has})
+	}
+	p.read = false
+}
+
+func (p *passProbe) start() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.armed, p.read = true, false
+}
+
+func (p *passProbe) seen() []probedPass {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.passes)
+}
+
+// A pass can make the account read overdue: its host file read takes the
+// time of the pass. The convergence that the overdue read asks for does
+// not run inside that pass: the pass already uses the newest accounts and
+// its problem. Each pass uses the new host file.
+func TestPassThatMakesTheAccountReadOverdueRunsAloneWithTheNewHostFile(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := newSpec(t, configScoped)
+		var arm atomic.Bool
+		s.be = slowForeignCheck{Backend: s.world.Backend(), arm: &arm}
+		accts := newAccounts()
+		s.accounts = accts
+		s.hosts = &fakeHosts{}
+		probe := &passProbe{HostsReader: s.hosts, world: s.world, want: host("10.9.9.9")}
+		s.reader, s.onLog = probe, probe.onLog
+		h := launch(t, s)
+		defer h.stop()
+		h.wantState(daemon.StateReady)
+
+		release := accts.hangLookups()
+		defer func() { release(); synctest.Wait() }()
+		heal() // the account read starts and hangs
+		probe.start()
+		h.writeHosts("10.9.9.9 example.com\n")
+		arm.Store(true)
+		overdue := len(h.logs.events("account read takes longer than its budget"))
+		if _, err := h.d.Observe(t.Context(), obs("example.com", "192.0.2.80")); !errors.Is(err, daemon.ErrUnenforced) {
+			t.Fatalf("Observe with a foreign ruleset = %v, want ErrUnenforced", err)
+		}
+		synctest.Wait()
+
+		if n := len(h.logs.events("account read takes longer than its budget")) - overdue; n != 1 {
+			t.Fatalf("%d overdue warnings after the report, want 1: the pass did not make the read overdue", n)
+		}
+		passes := probe.seen()
+		if len(passes) == 0 {
+			t.Fatal("no convergence after the report")
+		}
+		for i, p := range passes {
+			if !p.ownRead {
+				t.Errorf("pass %d (%s) ended with no host file read of its own: it ran inside another pass; passes %+v", i, p.trigger, passes)
+			}
+			if !p.hasHost {
+				t.Errorf("pass %d (%s) ended without the address of the new host entry; passes %+v", i, p.trigger, passes)
+			}
+		}
+	})
+}
+
 // A directory that is always slower than AccountReadTimeout keeps one
-// stable problem, and the ids of each late read still apply.
+// stable problem and one warning, and the ids of each late read still
+// apply.
 func TestSlowDirectoryKeepsOneProblem(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		accts := newAccounts()
@@ -438,6 +563,9 @@ func TestSlowDirectoryKeepsOneProblem(t *testing.T) {
 		}
 		if n := h.stateChanges() - before; n != 0 {
 			t.Errorf("%d state changes in one minute with a slow directory, want 0", n)
+		}
+		if n := len(h.logs.events("account read takes longer than its budget")); n != 1 {
+			t.Errorf("%d overdue warnings for a directory that is always slow, want 1", n)
 		}
 		h.wantOwners("web user alice 601", "web user carol 503", "web group admin 80", "web group staff 20", mailOwner)
 

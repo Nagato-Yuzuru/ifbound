@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -80,10 +81,12 @@ type loop struct {
 	// time.
 	accountResults chan core.AccountsRead
 
-	// recheck asks Run for a convergence after the current request. A
-	// report sets it when it finds a loaded ruleset that is not the
-	// installed one.
-	recheck bool
+	// pending is the trigger of the convergence that Run starts after the
+	// current request or event, or "" when there is none. A report sets it
+	// when it finds a loaded ruleset that is not the installed one, and a
+	// Converge effect of core sets it. A second trigger before the pass
+	// does not replace the first. Each pass clears it (see reconcile).
+	pending string
 	// failed is the error.type and the error text of the last
 	// convergence, or "" when it succeeded. A failure that repeats is
 	// logged at debug.
@@ -199,6 +202,13 @@ func policyNames(cfg policy.Config) []policy.Name {
 // The host file comes first: adoption must know which kernel entries are
 // host addresses. Without a configuration, it does nothing.
 //
+// A pass covers each pending convergence: it converges the whole desired
+// state from the inputs that it reads, and the trigger only names the
+// cause in the log. A Converge of core is pending only when its change is
+// in core, and a pending ruleset_changed is in the loaded ruleset that
+// the pass reads. The drive of the host file is the last change to core
+// in the pass, so the pass clears the pending trigger after it.
+//
 // Each pass that it starts writes one convergence event (see
 // logConverge), and one more event when it ended pf states.
 func (l *loop) reconcile(ctx context.Context, trigger string) error {
@@ -214,11 +224,11 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	switch l.mode.(type) {
 	case unconfiguredMode:
 	case loadingMode, runningMode:
-		// The time of the event can make the account read overdue, and
-		// Step then asks for a convergence. drive runs it to its end, so
-		// this pass reads the mode after it.
+		// The time of the event can make the account read overdue. Step
+		// then asks for a convergence, and this pass covers it.
 		l.drive(ctx, core.HostsWanted{At: began})
 	}
+	l.pending = ""
 	switch m := l.mode.(type) {
 	case unconfiguredMode:
 		return errNoConfig
@@ -653,7 +663,7 @@ func (l *loop) checkInstalled(ctx context.Context) error {
 	}
 	if m, ok := l.mode.(runningMode); !ok || !m.phase.acks() || id != m.phase.installed {
 		l.setPhase(ctx, unenforcedPhase("the loaded ruleset changed outside ifbound"))
-		l.recheck = true
+		l.pending = cmp.Or(l.pending, logattr.TriggerRulesetChanged)
 		return ErrUnenforced
 	}
 	return nil
