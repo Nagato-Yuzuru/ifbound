@@ -94,12 +94,16 @@ func TestLoopbackAnswerDoesNotBlockLocalService(t *testing.T) {
 	if _, err := rec.Converge(t.Context(), reconcile.Inputs{Policies: cfg.Policies, Book: book}); err != nil {
 		t.Fatalf("Converge: %v", err)
 	}
-	if err := rec.AddObserved(t.Context(), "e2e-lo", blockable.Filter(local)); err != nil {
+	// A report with a refused and a valid address: only the valid one
+	// reaches the table.
+	reported := netip.MustParseAddr("192.0.2.11")
+	if err := rec.AddObserved(t.Context(), "e2e-lo", blockable.Filter([]netip.Addr{netip.MustParseAddr("127.0.0.53"), reported})); err != nil {
 		t.Fatalf("AddObserved: %v", err)
 	}
 
-	want := []netip.Prefix{netip.PrefixFrom(learned, 32)}
-	if got := readState(t, b).Tables["e2e-lo"]; !slices.Equal(got, want) {
+	want := []netip.Prefix{netip.PrefixFrom(learned, 32), netip.PrefixFrom(reported, 32)}
+	got := slices.SortedFunc(slices.Values(readState(t, b).Tables["e2e-lo"]), netip.Prefix.Compare)
+	if !slices.Equal(got, want) {
 		t.Errorf("table e2e-lo = %v, want %v", got, want)
 	}
 	if err := udpExchange(t, echo); err != nil {

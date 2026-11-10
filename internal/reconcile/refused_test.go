@@ -57,7 +57,9 @@ func TestConvergeRemovesRefusedKernelEntryWhenLoadFails(t *testing.T) {
 
 // A configured destination is the choice of the user, so the removal of
 // refused entries keeps it, also when it is a loopback address. A refused
-// learned-looking entry next to it goes. A second pass writes nothing.
+// learned-looking entry next to it goes, in one removal: the removal of
+// undesired entries does not remove it again. A second pass writes
+// nothing.
 func TestConvergeKeepsConfiguredLoopbackDestination(t *testing.T) {
 	f := newFixture(t, header+`
 [[policy]]
@@ -68,8 +70,13 @@ only_via = ["en0"]
 	seed(t, f.world, map[policy.Name][]string{"lo": {"127.0.0.1/32", "::/128", "127.0.0.2/32"}})
 	f.observe(t, "lo", "192.0.2.1")
 
-	f.converge(t)
+	rep := f.converge(t)
 
+	// The refused removal, the add, the Load, and the resolver entries of
+	// lo.example and the Firefox canary.
+	if rep.Writes != 5 {
+		t.Errorf("first pass writes = %d, want 5", rep.Writes)
+	}
 	checkTables(t, f.world, tables{"lo": {"127.0.0.0/8", "127.0.0.2/32", "192.0.2.1/32", "::1/128"}})
 	if rep := f.converge(t); rep.Writes != 0 {
 		t.Errorf("second pass writes = %d, want 0", rep.Writes)
@@ -95,4 +102,66 @@ func TestAdoptableSkipsRefusedEntries(t *testing.T) {
 	if !maps.EqualFunc(got, want, slices.Equal) {
 		t.Errorf("Adoptable = %v, want %v", got, want)
 	}
+}
+
+// zeroBook gives a valid learned address and the zero blockable.Addr,
+// as a bug upstream could.
+type zeroBook struct{}
+
+func (zeroBook) Addrs(policy.Name) []blockable.Addr {
+	return append(learned("192.0.2.1"), blockable.Addr{})
+}
+
+// The zero blockable.Addr comes from a bug upstream. Converge refuses it
+// in the learned and in the host addresses before the Backend part
+// writes anything: no refused kernel entry goes, no entry comes, and no
+// ruleset loads.
+func TestConvergeRefusesZeroAddrBeforeAnyBackendWrite(t *testing.T) {
+	tests := []struct {
+		name string
+		set  func(in *reconcile.Inputs)
+	}{
+		{"book", func(in *reconcile.Inputs) { in.Book = zeroBook{} }},
+		{"hosts", func(in *reconcile.Inputs) {
+			in.Hosts = map[policy.Name][]blockable.Addr{"web": zeroBook{}.Addrs("web")}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t, configV1)
+			seed(t, f.world, map[policy.Name][]string{"web": {"127.0.0.1/32"}})
+			in := f.inputs()
+			tt.set(&in)
+
+			rep, err := f.rec.Converge(t.Context(), in)
+
+			if !errors.Is(err, blockable.ErrZero) {
+				t.Fatalf("Converge = %v, want ErrZero", err)
+			}
+			if rep.Installed != "" {
+				t.Errorf("Installed = %q, want empty", rep.Installed)
+			}
+			checkTables(t, f.world, tables{"web": {"127.0.0.1/32"}})
+			if id := f.world.Ruleset().ID(); id != "" {
+				t.Errorf("loaded ruleset = %q, want none", id)
+			}
+		})
+	}
+}
+
+// AddObserved refuses the whole batch when it holds the zero
+// blockable.Addr, and makes no Backend call.
+func TestAddObservedRefusesZeroAddr(t *testing.T) {
+	f := newFixture(t, configV1)
+	before := f.world.Writes()
+
+	err := f.rec.AddObserved(t.Context(), "web", zeroBook{}.Addrs("web"))
+
+	if !errors.Is(err, blockable.ErrZero) {
+		t.Fatalf("AddObserved = %v, want ErrZero", err)
+	}
+	if n := f.world.Writes() - before; n != 0 {
+		t.Errorf("Backend writes = %d, want 0", n)
+	}
+	checkTables(t, f.world, tables{})
 }

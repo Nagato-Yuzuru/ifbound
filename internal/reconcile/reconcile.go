@@ -112,7 +112,9 @@ type memory struct {
 
 // Converge makes the actual state equal to the desired state for in.
 //
-// The Backend part runs in this order, and it stops at its first error:
+// The Backend part runs in this order, and it stops at its first error.
+// Before step 1, it refuses the zero blockable.Addr in Book or Hosts
+// (blockable.ErrZero): the Backend then gets no write.
 //
 //  1. Remove each entry that blockable.New refuses and that is not a
 //     destination of the policy of the table. An earlier version can
@@ -188,8 +190,12 @@ func (r Reconciler) ConvergeResolver(ctx context.Context, in Inputs) (Report, er
 // AddObserved adds the addresses to the table of one policy. It is the
 // fast path for a DNS report: it neither reads the actual state nor
 // recompiles. A nil error means the Backend holds every address in the
-// table.
+// table. It refuses a batch with the zero blockable.Addr
+// (blockable.ErrZero) and then calls no Backend method.
 func (r Reconciler) AddObserved(ctx context.Context, name policy.Name, addrs []blockable.Addr) error {
+	if err := blockable.Check(addrs); err != nil {
+		return fmt.Errorf("adding to table %s: %w", name, err)
+	}
 	if len(addrs) == 0 {
 		return nil
 	}
@@ -218,7 +224,10 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 		return fmt.Errorf("reading backend: %w", err)
 	}
 	rep.Problems = append(rep.Problems, actual.Problems...)
-	want := desiredTables(in)
+	want, err := desiredTables(in)
+	if err != nil {
+		return err
+	}
 	have := make(map[policy.Name]prefixSet, len(actual.Tables))
 	for name, entries := range actual.Tables {
 		have[name] = newPrefixSet(entries)
@@ -481,20 +490,25 @@ func atOrBelow(d, apex policy.Domain) bool {
 func compareDomains(a, b policy.Domain) int { return strings.Compare(a.String(), b.String()) }
 
 // desiredTables has a key for every policy, also when its table is empty:
-// a missing key marks a table to drop.
-func desiredTables(in Inputs) map[policy.Name]prefixSet {
+// a missing key marks a table to drop. It refuses the zero
+// blockable.Addr in the learned and the host addresses.
+func desiredTables(in Inputs) (map[policy.Name]prefixSet, error) {
 	out := make(map[policy.Name]prefixSet, len(in.Policies))
 	for _, p := range in.Policies {
-		s := staticEntries(p)
-		for _, a := range in.Book.Addrs(p.Name) {
-			s[host(a.Addr())] = struct{}{}
+		book, hosts := in.Book.Addrs(p.Name), in.Hosts[p.Name]
+		if err := blockable.Check(book); err != nil {
+			return nil, fmt.Errorf("learned addresses of %s: %w", p.Name, err)
 		}
-		for _, a := range in.Hosts[p.Name] {
+		if err := blockable.Check(hosts); err != nil {
+			return nil, fmt.Errorf("host addresses of %s: %w", p.Name, err)
+		}
+		s := staticEntries(p)
+		for _, a := range slices.Concat(book, hosts) {
 			s[host(a.Addr())] = struct{}{}
 		}
 		out[p.Name] = s
 	}
-	return out
+	return out, nil
 }
 
 // staticEntries are the table entries that the configuration gives.

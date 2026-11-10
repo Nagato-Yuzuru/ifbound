@@ -1,15 +1,24 @@
 // Package blockable holds Addr: an address that a table can hold as a
-// learned or host address. Only New makes an Addr, so each path that
+// learned or host address. New is the only way to make a valid Addr; the
+// zero value is not valid, and each sink refuses it. So each path that
 // gives a learned or host address to a table applies the same rule. The
 // destinations of the configuration do not use Addr: they are the
 // choice of the user.
 package blockable
 
-import "net/netip"
+import (
+	"errors"
+	"net/netip"
+	"slices"
+)
+
+// ErrZero is the error of a sink that gets the zero Addr. The zero Addr
+// comes from a bug: a declared variable or a slot that no New filled.
+var ErrZero = errors.New("blockable: zero Addr")
 
 // Addr is an address that New accepted. It is valid, has no zone, and
-// is not IPv4-mapped. The zero Addr is not valid: only New makes an
-// Addr.
+// is not IPv4-mapped. Go cannot exclude the zero Addr, so a sink that
+// gets an Addr checks Valid and refuses the zero Addr with ErrZero.
 type Addr struct{ ip netip.Addr }
 
 // New returns a as an Addr. An IPv4-mapped IPv6 address becomes IPv4,
@@ -48,6 +57,18 @@ func Filter(addrs []netip.Addr) []Addr {
 		}
 	}
 	return out
+}
+
+// Valid reports whether New made a. It is false only for the zero Addr.
+func (a Addr) Valid() bool { return a.ip.IsValid() }
+
+// Check returns ErrZero when addrs holds the zero Addr. A sink calls it
+// before it writes, so it writes all of addrs or nothing.
+func Check(addrs []Addr) error {
+	if slices.ContainsFunc(addrs, func(a Addr) bool { return !a.Valid() }) {
+		return ErrZero
+	}
+	return nil
 }
 
 // Addr returns the address.

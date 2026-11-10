@@ -74,8 +74,9 @@ type snapshotEntry struct {
 // Save writes the book to path. It removes the temporary files of earlier
 // crashed saves, writes a new temporary file in the same directory, syncs
 // it, renames it over path, and syncs the directory. A crash leaves either
-// the old file or the new one. Save refuses a path that is a symlink and
-// times that Unix nanoseconds cannot hold; it then writes nothing.
+// the old file or the new one. Save refuses a path that is a symlink,
+// times that Unix nanoseconds cannot hold, and the zero blockable.Addr
+// (blockable.ErrZero); it then writes nothing.
 //
 // Only a successful Save moves the saved expiry that Observe compares.
 func (b *AddrBook) Save(path string) error {
@@ -118,7 +119,11 @@ func osRename(oldpath, newpath string) error { return os.Rename(oldpath, newpath
 func (b *AddrBook) encode() ([]byte, error) {
 	f := snapshotFile{Version: snapshotVersion, Entries: []snapshotEntry{}}
 	for _, name := range slices.Sorted(maps.Keys(b.entries)) {
-		for _, a := range b.Addrs(name) {
+		addrs := b.Addrs(name)
+		if err := blockable.Check(addrs); err != nil {
+			return nil, fmt.Errorf("policy %s: %w", name, err)
+		}
+		for _, a := range addrs {
 			r := b.entries[name][a]
 			seen, exp, err := unixNanos(r)
 			if err != nil {

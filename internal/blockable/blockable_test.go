@@ -1,6 +1,7 @@
 package blockable_test
 
 import (
+	"errors"
 	"net/netip"
 	"slices"
 	"testing"
@@ -36,6 +37,9 @@ func TestNewRefusesOnlyHostLocalAndBadAddresses(t *testing.T) {
 		if ok != want {
 			t.Errorf("New(%s) ok = %v, want %v", s, ok, want)
 		}
+		if got.Valid() != ok {
+			t.Errorf("New(%s).Valid() = %v, want %v", s, got.Valid(), ok)
+		}
 		if ok && got.Addr() != a.Unmap() {
 			t.Errorf("New(%s) = %v, want %v", s, got, a.Unmap())
 		}
@@ -45,6 +49,10 @@ func TestNewRefusesOnlyHostLocalAndBadAddresses(t *testing.T) {
 	}
 	if _, ok := blockable.New(netip.Addr{}); ok {
 		t.Error("New(invalid) ok = true, want false")
+	}
+	var zero blockable.Addr
+	if zero.Valid() {
+		t.Error("the zero Addr is valid, want not valid")
 	}
 }
 
@@ -59,5 +67,27 @@ func TestFilterKeepsAcceptedInOrder(t *testing.T) {
 	}
 	if want := []string{"203.0.113.2", "192.0.2.1"}; !slices.Equal(got, want) {
 		t.Errorf("Filter = %v, want %v", got, want)
+	}
+}
+
+// Check refuses a batch that holds the zero Addr anywhere.
+func TestCheckRefusesZeroAddr(t *testing.T) {
+	good := blockable.Filter([]netip.Addr{netip.MustParseAddr("192.0.2.1")})
+	tests := []struct {
+		name  string
+		addrs []blockable.Addr
+		want  error
+	}{
+		{"empty", nil, nil},
+		{"one valid", good, nil},
+		{"zero after a valid", append(slices.Clone(good), blockable.Addr{}), blockable.ErrZero},
+		{"only zero", make([]blockable.Addr, 1), blockable.ErrZero},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := blockable.Check(tt.addrs); !errors.Is(err, tt.want) {
+				t.Errorf("Check = %v, want %v", err, tt.want)
+			}
+		})
 	}
 }

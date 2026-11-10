@@ -15,6 +15,7 @@ package addrbook
 import (
 	"cmp"
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"time"
@@ -92,12 +93,17 @@ func (b *AddrBook) saveSlack() time.Duration {
 // the expiry in the last successful Save is more than the save slack
 // before the new expiry. A failed Save changes nothing, so the retry
 // still reports true. If any input is invalid, Observe changes nothing.
+// The zero blockable.Addr is invalid: the error then wraps
+// blockable.ErrZero.
 func (b *AddrBook) Observe(name policy.Name, addrs []blockable.Addr, ttl time.Duration) (needSave bool, err error) {
 	if name == "" {
 		return false, ErrEmptyPolicy
 	}
 	if ttl < 0 {
 		return false, ErrNegativeTTL
+	}
+	if err := blockable.Check(addrs); err != nil {
+		return false, fmt.Errorf("addrbook: policy %s: %w", name, err)
 	}
 	now := b.now().Round(0) // strip the monotonic reading
 	floor := now.Add(max(ttl, b.retain))

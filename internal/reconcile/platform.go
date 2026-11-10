@@ -214,6 +214,9 @@ type BackendState struct {
 //     removing one that is absent, and dropping a table that is missing
 //     all succeed. A nil error from a write means the kernel holds the
 //     result.
+//   - AddEntries and RemoveEntries refuse a batch with an invalid entry,
+//     for example the zero netip.Prefix. They return an error and change
+//     nothing.
 type Backend interface {
 	// Read returns the actual state. It writes nothing.
 	Read(ctx context.Context) (BackendState, error)
