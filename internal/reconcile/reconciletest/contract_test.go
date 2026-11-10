@@ -15,6 +15,17 @@ func TestBackendContract(t *testing.T) {
 	}
 	reconciletest.RunBackendContract(t, func(*testing.T) reconciletest.ContractTarget {
 		w := reconciletest.NewWorld()
-		return reconciletest.ContractTarget{Backend: w.Backend(), Ruleset: rs, Disable: w.DisableFirewall}
+		return reconciletest.ContractTarget{
+			Backend: w.Backend(),
+			Ruleset: rs,
+			Table:   "web",
+			// The World has no clock: a refused enable models the rate
+			// limit of the real Backend.
+			Disable: func() {
+				w.DisableFirewall()
+				w.SetEnableRefused(true)
+			},
+			Elapse: func() { w.SetEnableRefused(false) },
+		}
 	})
 }

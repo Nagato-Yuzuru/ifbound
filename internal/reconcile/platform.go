@@ -206,7 +206,10 @@ type BackendState struct {
 //     that a rule of the ruleset refers to) is such a change, and Load
 //     removes it.
 //   - While the firewall is disabled, Read and LoadedID report "": no
-//     rule is in effect. Load enables the firewall again.
+//     rule is in effect. Load enables the firewall again. Load can fail
+//     then: the Backend may refuse to enable the firewall, for example
+//     within a rate limit. A Load that fails so leaves the firewall
+//     disabled.
 //   - The write methods are idempotent: adding an entry that is present,
 //     removing one that is absent, and dropping a table that is missing
 //     all succeed. A nil error from a write means the kernel holds the

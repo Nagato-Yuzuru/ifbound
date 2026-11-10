@@ -4,7 +4,8 @@ package daemon_test
 // runs random operations (reports, configuration changes through
 // Reconfigure and Apply, refused and failed applies, interface
 // changes, write and save faults, problems, external flushes and loads,
-// time, crashes, restarts, lost snapshots) against a model written from
+// time, crashes, restarts, lost snapshots, a disabled firewall) against
+// a model written from
 // the spec. It uses only the public API of the daemon and the
 // reconciletest fakes as the platform, and none of the helpers or
 // checkers of the other test files, so it checks them independently.
@@ -364,6 +365,8 @@ func (g *omGen) op(allowCrash bool) omOp {
 		return omOp{Kind: "flushAll"}
 	case r < 83:
 		return omOp{Kind: "externalLoad", Idx: g.rng.IntN(2)}
+	case r < 84:
+		return omOp{Kind: "disableFirewall"}
 	case r < 93:
 		d := []time.Duration{600 * time.Millisecond, 5 * time.Second, 31 * time.Minute, 61 * time.Minute, 2*time.Hour + time.Minute}[g.rng.IntN(5)]
 		return omOp{Kind: "advance", D: d}
@@ -500,9 +503,18 @@ func (r *omRun) view() omView {
 	st, _ := r.world.Backend().Read(context.Background()) //nolint:errcheck // the fake never fails
 	return omView{
 		tables: st.Tables,
-		body:   r.world.Ruleset().Body(),
+		body:   r.loaded().Body(),
 		void:   slices.ContainsFunc(st.Problems, func(p reconcile.Problem) bool { return p.Voids }),
 	}
+}
+
+// loaded returns the ruleset in effect: none while the firewall is
+// disabled. It reads the World, not the Backend that the daemon reads.
+func (r *omRun) loaded() reconcile.Ruleset {
+	if r.world.FirewallDisabled() {
+		return reconcile.Ruleset{}
+	}
+	return r.world.Ruleset()
 }
 
 func omHost(a netip.Addr) netip.Prefix { return netip.PrefixFrom(a, a.BitLen()) }
@@ -634,7 +646,7 @@ func (b *omBackend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 	if rs.ID() != want.ID() {
 		b.r.violate("spec3: Load of a ruleset that is not the one for the current config and interfaces")
 	}
-	if b.r.world.Ruleset().ID() == rs.ID() {
+	if b.r.loaded().ID() == rs.ID() {
 		b.r.violate("spec3: Load of the ruleset that is already loaded")
 	}
 	b.r.mu.Unlock()
@@ -932,7 +944,7 @@ func (r *omRun) statusCheck() {
 
 func (r *omRun) checkAckingStatusLocked(st daemon.Status) {
 	if r.rsDamageSeq < r.readSeq {
-		body := r.world.Ruleset().Body()
+		body := r.loaded().Body()
 		for _, p := range r.pcfg.Policies {
 			if !omRefers(body, p) {
 				r.violate("status: %v but the loaded ruleset lacks %s with its current constraint", st.State, p.Name)
@@ -1230,6 +1242,8 @@ func (r *omRun) exec(o omOp) {
 		r.flush(o)
 	case "externalLoad":
 		r.externalLoad(o.Idx)
+	case "disableFirewall":
+		r.disableFirewall()
 	case "advance":
 		time.Sleep(o.D)
 	case "crash":
@@ -1466,6 +1480,17 @@ func (r *omRun) externalLoad(idx int) {
 	r.mu.Unlock()
 }
 
+// disableFirewall has another tool disable the firewall. Until a
+// convergence reads it, the daemon sees it only at the check of a
+// report, as a ruleset that changed outside.
+func (r *omRun) disableFirewall() {
+	r.world.DisableFirewall()
+	r.mu.Lock()
+	r.rsDamageSeq = r.readSeq
+	r.taintLocked()
+	r.mu.Unlock()
+}
+
 // omRunOps runs one sequence in a fresh bubble and returns the
 // violations, and the index of the step that found the first one.
 func omRunOps(t *testing.T, initial omCfg, ops []omOp) (viol []string, at int) {
@@ -1541,8 +1566,16 @@ func (r *omRun) recoverAndCheck() {
 	r.mu.Lock()
 	r.failAt, r.failFrom, r.saveFail, r.voidOn, r.nonvoidOn = 0, 0, false, false, false
 	r.mu.Unlock()
+	disabled := r.world.FirewallDisabled()
 	time.Sleep(daemon.SelfHealInterval)
 	synctest.Wait()
+	if disabled {
+		// Known behavior: the self-heal whose Load enables the firewall
+		// again still reports the Problem that it read before the Load.
+		// One more self-heal clears it.
+		time.Sleep(daemon.SelfHealInterval)
+		synctest.Wait()
+	}
 	r.statusCheck()
 	if st := r.status(); st.State != daemon.StateReady {
 		r.violate("liveness: state %v (%q) after all faults cleared", st.State, st.Reasons)

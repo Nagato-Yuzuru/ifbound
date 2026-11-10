@@ -746,9 +746,8 @@ func TestVoidingProblemIsNoticedWithinSelfHealInterval(t *testing.T) {
 
 // A disabled firewall has no window: the Backend reports no loaded
 // ruleset, so the next protected report gets no ack. The convergence
-// that the report starts enables the firewall again. That convergence
-// still reports the Problem that it read before its Load, so the acks
-// come back at the next convergence.
+// that the report starts enables the firewall again, and the acks come
+// back at the next convergence.
 func TestDisabledFirewallStopsTheNextAck(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, configV1)
@@ -765,6 +764,13 @@ func TestDisabledFirewallStopsTheNextAck(t *testing.T) {
 
 		if id, err := h.world.Backend().LoadedID(t.Context()); err != nil || id != installed {
 			t.Errorf("LoadedID after the convergence = %q, %v; want the installed ruleset %q", id, err, installed)
+		}
+		// Known behavior, not a promise: the convergence still reports the
+		// Problem that it read before its Load. A change that reads the
+		// Backend again after the Load flips this to ready and must
+		// update this check.
+		if st := h.wantState(daemon.StateUnenforced); !slices.Equal(st.Reasons, []string{reconciletest.DisabledText}) {
+			t.Errorf("reasons after the convergence = %q, want the stale Problem %q", st.Reasons, reconciletest.DisabledText)
 		}
 		heal()
 		h.wantState(daemon.StateReady)

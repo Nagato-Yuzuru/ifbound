@@ -235,9 +235,10 @@ type rigFaults struct {
 	resolver bool // resolver writes fail
 	tampered bool // the ruleset changed outside since the last convergence
 	voids    bool // a problem voids enforcement
+	disabled bool // the firewall was disabled when the event started
 }
 
-func (f rigFaults) healthy() bool { return !f.writes && !f.readOnly && !f.tampered }
+func (f rigFaults) healthy() bool { return !f.writes && !f.readOnly && !f.tampered && !f.disabled }
 
 func (rg *rig) setReadOnly(on bool) {
 	mode := os.FileMode(0o700)
@@ -318,14 +319,16 @@ func (rg *rig) checkObserve(r *rand.Rand) (rechecked bool) {
 		rg.checkUnmatched(err, st.State, tablesBefore, snapBefore)
 	case len(o.Addrs) == 0:
 		// A report without an address writes nothing. Only a ruleset
-		// that changed outside can make it fail, and then with
-		// ErrUnenforced. The ack gets the loaded ruleset check as any
-		// other protected ack.
+		// that changed outside or a disabled firewall can make it fail,
+		// and then with ErrUnenforced. The ack gets the loaded ruleset
+		// check as any other protected ack.
 		if err != nil {
-			if !rg.f.tampered || !errors.Is(err, daemon.ErrUnenforced) {
-				rg.fatalf("matched name without an address in %v, tampered %v: err = %v, want an ack", st.State, rg.f.tampered, err)
+			if !rg.f.tampered && !rg.f.disabled || !errors.Is(err, daemon.ErrUnenforced) {
+				rg.fatalf("matched name without an address in %v, tampered %v, disabled %v: err = %v, want an ack", st.State, rg.f.tampered, rg.f.disabled, err)
 			}
-			rg.stats["matched no-address tampered"]++
+			if rg.f.tampered {
+				rg.stats["matched no-address tampered"]++
+			}
 			return true
 		}
 		rg.checkAck(o, want, start)
@@ -363,9 +366,10 @@ func (rg *rig) checkNoWrites(tablesBefore map[policy.Name][]netip.Prefix, snapBe
 }
 
 // checkAck checks what an ack promises: each address is in the table of
-// each matching policy, the loaded ruleset refers to that table, and the
-// snapshot on disk keeps the address for at least retain minus the save
-// slack.
+// each matching policy, the rules in effect refer to that table (none
+// while the firewall is disabled), and the snapshot on disk keeps the
+// address for at least retain minus the save slack. It reads the World,
+// not the Backend that the daemon reads.
 func (rg *rig) checkAck(o ipc.Observation, want []policy.Name, start time.Time) {
 	rg.t.Helper()
 	tables := rg.world.Tables()
@@ -414,14 +418,24 @@ func (rg *rig) checkResolverEntries(exact bool) {
 }
 
 // checkConvergedState checks the state after a convergence, from the
-// spec: a voiding problem stops the acks; without one and without failed
-// table writes, the daemon acks.
+// spec: a voiding problem or a disabled firewall stops the acks; without
+// one and without failed table writes, the daemon acks.
 func (rg *rig) checkConvergedState(after string) {
 	rg.t.Helper()
 	st := rg.status()
+	disabled := rg.world.FirewallDisabled()
 	switch {
-	case rg.f.voids && st.State != daemon.StateUnenforced:
-		rg.fatalf("a voiding problem, but state %v after %s", st.State, after)
+	case (rg.f.voids || disabled) && st.State != daemon.StateUnenforced:
+		rg.fatalf("a voiding problem (disabled firewall %v), but state %v after %s", disabled, st.State, after)
+	case rg.f.disabled && !disabled && !rg.f.voids && st.State == daemon.StateUnenforced &&
+		slices.Contains(st.Reasons, reconciletest.DisabledText):
+		// Known behavior: the convergence whose Load enables the
+		// firewall again still reports the Problem that it read before
+		// the Load, next to the reasons that do not void enforcement.
+		// The next convergence clears it, and the firewall was disabled
+		// when this event started, so only that one convergence gets
+		// this exception.
+		rg.stats["stale disabled problem"]++
 	case !rg.f.voids && !rg.f.writes && st.State != daemon.StateReady && st.State != daemon.StateDegraded:
 		rg.fatalf("no fault that voids enforcement, but state %v (%q) after %s", st.State, st.Reasons, after)
 	}
@@ -478,6 +492,11 @@ func (rg *rig) resolverEvent(r *rand.Rand) {
 	}
 }
 
+func (rg *rig) disableFirewall() {
+	rg.world.DisableFirewall()
+	rg.logf("external disable of the firewall")
+}
+
 // later lets d pass: the timers that fall in it fire.
 func (rg *rig) later(d time.Duration) {
 	time.Sleep(d)
@@ -488,7 +507,7 @@ func (rg *rig) later(d time.Duration) {
 
 // event runs one random event.
 func (rg *rig) event(r *rand.Rand) {
-	switch op := r.IntN(20); {
+	switch op := r.IntN(21); {
 	case op < 8:
 		if rg.checkObserve(r) {
 			// The daemon converges right after a report that found the
@@ -536,6 +555,8 @@ func (rg *rig) event(r *rand.Rand) {
 		rg.resolverEvent(r)
 	case op == 18:
 		rg.heal()
+	case op == 19:
+		rg.disableFirewall()
 	default:
 		rg.later(20 * time.Minute)
 	}
@@ -553,6 +574,7 @@ func runAckInvariant(t *testing.T, seed uint64, stats map[string]int) {
 	}()
 	for range 80 {
 		rg.event(r)
+		rg.f.disabled = rg.world.FirewallDisabled()
 		rg.checkResolverEntries(false)
 	}
 	// Settle: without faults the daemon reaches ready, and the resolver
@@ -561,8 +583,9 @@ func runAckInvariant(t *testing.T, seed uint64, stats map[string]int) {
 	rg.world.SetProblems(nil, nil)
 	rg.resFail.Store(false)
 	rg.setReadOnly(false)
-	rg.f = rigFaults{}
+	rg.f = rigFaults{disabled: rg.world.FirewallDisabled()}
 	rg.heal()
+	rg.f.disabled = rg.world.FirewallDisabled()
 	rg.heal()
 	if st := rg.status(); st.State != daemon.StateReady {
 		rg.fatalf("after settle: state %v (%q), want ready", st.State, st.Reasons)
@@ -587,7 +610,7 @@ func TestAckInvariantUnderRandomEvents(t *testing.T) {
 	for _, k := range []string{
 		"matched ready ack", "matched degraded ack", "matched ready reject",
 		"matched unenforced reject", "unmatched ready ack", "unmatched unenforced reject",
-		"malformed ready reject", "matched no-address tampered",
+		"malformed ready reject", "matched no-address tampered", "stale disabled problem",
 	} {
 		if stats[k] == 0 {
 			t.Errorf("no %q case in the random runs", k)

@@ -652,14 +652,15 @@ func TestVoidingProblems(t *testing.T) {
 func TestBackendContract(t *testing.T) {
 	reconciletest.RunBackendContract(t, func(t *testing.T) reconciletest.ContractTarget {
 		r := newRig(t)
-		disable := func() {
-			r.k.enabled, r.k.refs = false, nil // another tool ran pfctl -d
-			// The Backend enables pf at most once in EnableInterval. The
-			// contract does not know the limit, so the next Load comes
-			// after it.
-			r.clk.t = r.clk.t.Add(pfbackend.EnableInterval)
+		return reconciletest.ContractTarget{
+			Backend: r.b,
+			Ruleset: compileRS(t, testPolicies),
+			Table:   "bing",
+			// The kernel starts disabled, so the first Load of a case
+			// enables pf, and no clock step comes before a Disable.
+			Disable: func() { r.k.enabled, r.k.refs = false, nil }, // another tool ran pfctl -d
+			Elapse:  func() { r.clk.t = r.clk.t.Add(pfbackend.EnableInterval) },
 		}
-		return reconciletest.ContractTarget{Backend: r.b, Ruleset: compileRS(t, testPolicies), Disable: disable}
 	})
 }
 
