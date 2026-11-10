@@ -3,6 +3,7 @@ package daemon_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -14,8 +15,6 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
-	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
@@ -24,19 +23,19 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
 )
 
+// writeSnapshot writes a JSON snapshot of an earlier version, which the
+// daemon imports at its first start. Each entry was seen now, with a ttl
+// of one minute, and expires after the retain of one hour.
 func writeSnapshot(t *testing.T, path string, entries map[policy.Name]string) {
 	t.Helper()
-	b := addrbook.New(time.Hour, time.Now)
+	now := time.Now()
+	var items []string
 	for name, addr := range entries {
-		a, ok := blockable.New(netip.MustParseAddr(addr))
-		if !ok {
-			t.Fatalf("blockable.New(%s) refused", addr)
-		}
-		if _, err := b.Observe(name, []blockable.Addr{a}, time.Minute); err != nil {
-			t.Fatal(err)
-		}
+		items = append(items, fmt.Sprintf(`{"policy":%q,"addr":%q,"last_seen_unix_nano":%d,"ttl_nano":%d,"expiry_unix_nano":%d}`,
+			name, addr, now.UnixNano(), time.Minute, now.Add(time.Hour).UnixNano()))
 	}
-	if err := b.Save(path); err != nil {
+	doc := `{"version":1,"entries":[` + strings.Join(items, ",") + `]}`
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -275,9 +274,10 @@ func TestStartWithoutSnapshotAdoptsKernelEntries(t *testing.T) {
 			t.Errorf("snapshot web = %v, want the adopted address only (not the IP destination)", got)
 		}
 		// The table of a policy outside the configuration is adopted too,
-		// and it goes away once the installed ruleset no longer refers to it.
-		if got := h.saved("gone"); !slices.Equal(got, []netip.Addr{netip.MustParseAddr("203.0.113.9")}) {
-			t.Errorf("snapshot gone = %v, want the adopted address", got)
+		// and it goes away once the installed ruleset no longer refers to
+		// it. The prune after the install removes it from the book.
+		if got := h.saved("gone"); len(got) != 0 {
+			t.Errorf("book gone = %v, want it pruned after the install", got)
 		}
 		if _, ok := h.world.Tables()["gone"]; ok {
 			t.Error("the table of a policy outside the configuration stays after the install")
@@ -294,20 +294,13 @@ func TestStartWithoutSnapshotAdoptsKernelEntries(t *testing.T) {
 
 func TestAdoptionSaveFailureKeepsStarting(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		world := reconciletest.NewWorld()
-		if err := world.Backend().AddEntries(t.Context(), "web", []netip.Prefix{host("203.0.113.1")}); err != nil {
+		s := newSpec(t, configV1)
+		if err := s.world.Backend().AddEntries(t.Context(), "web", []netip.Prefix{host("203.0.113.1")}); err != nil {
 			t.Fatal(err)
 		}
-		dir := filepath.Join(t.TempDir(), "state")
-		if err := os.Mkdir(dir, 0o500); err != nil { // the snapshot is missing and cannot be written
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { // let TempDir remove it
-			if err := os.Chmod(dir, 0o700); err != nil {
-				t.Error(err)
-			}
-		})
-		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(dir, "s.json"), configV1)
+		var fail atomic.Bool
+		fail.Store(true)
+		h := launchHook(t, s, func(d *daemon.Daemon) { d.SetBookFault(&fail) })
 		defer h.stop()
 
 		st := h.wantState(daemon.StateStarting)
@@ -319,14 +312,12 @@ func TestAdoptionSaveFailureKeepsStarting(t *testing.T) {
 				h.world.Tables(), h.world.Referenced())
 		}
 
-		// A later attempt starts from a fresh book and completes.
-		if err := os.Chmod(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
+		// A later attempt opens the book again and completes.
+		fail.Store(false)
 		heal()
 		h.wantState(daemon.StateReady)
 		if got := h.saved("web"); len(got) != 1 {
-			t.Errorf("snapshot web = %v, want the adopted address", got)
+			t.Errorf("book web = %v, want the adopted address", got)
 		}
 	})
 }
@@ -589,8 +580,10 @@ func TestObserveUnmatchedNameIsAckedAndNotStored(t *testing.T) {
 		if h.world.Writes() != writes {
 			t.Error("an unmatched report wrote to the platform")
 		}
-		if _, err := os.Stat(h.snapshot); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("snapshot stat = %v, want no snapshot", err)
+		for name, addrs := range readBook(t, bookPath(h.snapshot)) {
+			if len(addrs) != 0 {
+				t.Errorf("the book holds %v for %s, want nothing", addrs, name)
+			}
 		}
 	})
 }
@@ -650,36 +643,34 @@ func TestObserveNotAckedWhenTableWriteFails(t *testing.T) {
 		if err := h.observe(obs("www.example.net", "203.0.113.1")); !errors.Is(err, reconciletest.ErrInjected) {
 			t.Fatalf("Observe = %v, want ErrInjected", err)
 		}
-		if _, err := os.Stat(h.snapshot); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("snapshot stat = %v, want no save before the table write", err)
+		// The commit comes after the table write, and an address is in
+		// the book only after its commit.
+		if got := h.saved("web"); len(got) != 0 {
+			t.Errorf("book web = %v, want no save before the table write", got)
 		}
-
-		// The book kept the address, so the self-heal installs it.
 		h.world.SetBeforeWrite(nil)
 		heal()
-		if !h.hasEntry("web", host("203.0.113.1")) {
-			t.Error("self-heal did not install the address of the failed report")
+		if got := h.saved("web"); len(got) != 0 {
+			t.Errorf("book web = %v after a self-heal, want the address of the failed report not kept", got)
 		}
 	})
 }
 
 func TestObserveNotAckedWhenSaveFails(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		dir := filepath.Join(t.TempDir(), "state")
-		if err := os.Mkdir(dir, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		h := start(t, reconciletest.NewWorld(), reconciletest.NewInventory(en0), filepath.Join(dir, "s.json"), configV1)
+		var fail atomic.Bool
+		h := launchHook(t, newSpec(t, configV1), func(d *daemon.Daemon) { d.SetBookFault(&fail) })
 		defer h.stop()
 		h.wantState(daemon.StateReady)
-		if err := os.Remove(dir); err != nil {
-			t.Fatal(err)
-		}
+		fail.Store(true)
 
 		err := h.observe(obs("www.example.net", "203.0.113.1"))
 
-		if err == nil || !strings.Contains(err.Error(), "saving snapshot") {
-			t.Errorf("Observe = %v, want a save error", err)
+		if !errors.Is(err, daemon.ErrInjectedBook) || !strings.Contains(err.Error(), "saving snapshot") {
+			t.Errorf("Observe = %v, want the save error", err)
+		}
+		if got := h.saved("web"); len(got) != 0 {
+			t.Errorf("book web = %v, want nothing after a failed commit", got)
 		}
 	})
 }

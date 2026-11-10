@@ -17,7 +17,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,9 +29,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
+
+	"go.etcd.io/bbolt"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
@@ -440,17 +443,21 @@ type omRun struct {
 	tracked map[omKey]*omEntry
 	pending map[omKey]*omEntry // entries of removed policies, kept for a revert until a prune is due
 
-	readSeq                 int
-	voidOn, nonvoidOn       bool
-	voidSeq, nonvoidSeq     int
-	rsDamageSeq             int
-	seg, phase              int
-	segFailed               bool
-	resolverFailed          []string // domains of the failed resolver Writes in this convergence
-	failAt, failFrom        int
-	saveFail                bool
+	readSeq             int
+	voidOn, nonvoidOn   bool
+	voidSeq, nonvoidSeq int
+	rsDamageSeq         int
+	seg, phase          int
+	segFailed           bool
+	resolverFailed      []string // domains of the failed resolver Writes in this convergence
+	failAt, failFrom    int
+	saveFail            bool
+	// bookFail fails the writes of the open book while saveFail is set:
+	// an open book does not need its directory to write.
+	bookFail                atomic.Bool
 	block, entered, release chan struct{}
 	adoptPending            bool
+	adoptAt                 time.Time // the restart that expects an adoption
 	adoptExpect             []omKey
 	adoptForbid             []omKey
 	violations              []string
@@ -770,7 +777,7 @@ func (r *omRun) start() {
 	r.d = daemon.New(daemon.Config{
 		ConfigPath: r.store,
 		ConfigGID:  -1,
-		Snapshot:   r.snap,
+		AddrStore:  r.snap,
 		// A missing host file: the tests here do not read the host file of the machine.
 		Hosts: &fakeHosts{},
 		Platform: reconcile.Reconciler{
@@ -781,6 +788,7 @@ func (r *omRun) start() {
 		},
 		Lookup: omLookup{r},
 	})
+	r.d.SetBookFault(&r.bookFail)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel, r.done = cancel, make(chan error, 1)
 	go func() { r.done <- r.d.Run(ctx) }()
@@ -832,6 +840,7 @@ func (r *omRun) deleteSnapshotLocked() {
 
 // expectAdoptionLocked updates the model for a start without a snapshot.
 func (r *omRun) expectAdoptionLocked(now time.Time) {
+	r.adoptAt = now
 	clear(r.pending)
 	r.computeAdoption()
 	for k, e := range r.tracked {
@@ -871,30 +880,56 @@ func (r *omRun) computeAdoption() {
 	}
 }
 
-// ---- snapshot reader, written from the file format ----
+// ---- address book reader, written from the file format of addrstore ----
 
 type omSnapEntry struct {
-	Policy string `json:"policy"`
-	Addr   string `json:"addr"`
-	Expiry int64  `json:"expiry_unix_nano"`
+	Policy string
+	Addr   string
+	Expiry int64
 }
 
+// snapEntries reads a copy of the book file: the daemon locks the file
+// while it runs.
 func (r *omRun) snapEntries() []omSnapEntry {
 	data, err := os.ReadFile(r.snap)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		r.violate("reading snapshot: %v", err)
+		r.violate("reading the book: %v", err)
 		return nil
 	}
-	var f struct {
-		Entries []omSnapEntry `json:"entries"`
+	cp := filepath.Join(r.t.TempDir(), "book.db")
+	if err := os.WriteFile(cp, data, 0o600); err != nil {
+		r.t.Fatal(err)
 	}
-	if err := json.Unmarshal(data, &f); err != nil {
-		r.violate("snapshot is not JSON: %v", err)
+	db, err := bbolt.Open(cp, 0o600, &bbolt.Options{ReadOnly: true})
+	if err != nil {
+		r.violate("the book is not a bbolt file: %v", err)
+		return nil
 	}
-	return f.Entries
+	defer db.Close() //nolint:errcheck // a read-only copy
+	var out []omSnapEntry
+	err = db.View(func(tx *bbolt.Tx) error {
+		book := tx.Bucket([]byte("book"))
+		if book == nil {
+			return nil
+		}
+		return book.ForEachBucket(func(name []byte) error {
+			return book.Bucket(name).ForEach(func(k, v []byte) error {
+				var a netip.Addr
+				if err := a.UnmarshalBinary(k); err != nil || len(v) != 24 {
+					return fmt.Errorf("bad entry %x=%x: %v", k, v, err)
+				}
+				out = append(out, omSnapEntry{string(name), a.String(), int64(binary.BigEndian.Uint64(v[16:24]))})
+				return nil
+			})
+		})
+	})
+	if err != nil {
+		r.violate("reading the book: %v", err)
+	}
+	return out
 }
 
 func (r *omRun) snapExpiry(k omKey) (time.Time, bool) {
@@ -977,6 +1012,18 @@ func (r *omRun) checkAdoptionLocked() {
 	omStats["adoption checked"]++
 	r.adoptPending = false
 	for _, k := range r.adoptExpect {
+		if !r.cfg.has(k.P) {
+			// The install that left starting prunes the entries of a
+			// removed policy from the book at once.
+			continue
+		}
+		if !time.Now().Before(r.adoptAt.Add(omRetain)) {
+			// The adoption was at the restart or later. From one retain
+			// after the restart, Expire can have removed the entry from
+			// the book.
+			omStats["adoption checked after a possible expiry"]++
+			continue
+		}
 		if _, ok := r.snapExpiry(k); !ok {
 			r.violate("spec5: left starting without %s/%v in the saved snapshot", k.P, k.A)
 		}
@@ -1384,6 +1431,7 @@ func (r *omRun) setSaveFail(on bool) {
 	r.mu.Lock()
 	r.saveFail = on
 	r.mu.Unlock()
+	r.bookFail.Store(on)
 }
 
 func (r *omRun) setProblems(idx int) {
@@ -1533,7 +1581,7 @@ func newOmRun(t *testing.T, initial omCfg) *omRun {
 	dir := t.TempDir()
 	r := &omRun{
 		t: t, world: reconciletest.NewWorld(), inv: reconciletest.NewInventory(omEn0),
-		dir: dir, snap: filepath.Join(dir, "addrbook.json"), store: filepath.Join(t.TempDir(), "config.toml"),
+		dir: dir, snap: filepath.Join(dir, "addrbook.db"), store: filepath.Join(t.TempDir(), "config.toml"),
 		tracked: map[omKey]*omEntry{}, pending: map[omKey]*omEntry{}, rsDamageSeq: -1,
 	}
 	r.setCfg(initial.clone())
@@ -1567,6 +1615,7 @@ func (r *omRun) recoverAndCheck() {
 	r.mu.Lock()
 	r.failAt, r.failFrom, r.saveFail, r.voidOn, r.nonvoidOn = 0, 0, false, false, false
 	r.mu.Unlock()
+	r.bookFail.Store(false)
 	time.Sleep(daemon.SelfHealInterval)
 	synctest.Wait()
 	r.statusCheck()

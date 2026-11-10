@@ -3,7 +3,6 @@ package daemon_test
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -142,6 +141,7 @@ type rig struct {
 	d        *daemon.Daemon
 	lookup   *rigLookup
 	resFail  atomic.Bool
+	bookFail atomic.Bool
 	stats    map[string]int
 	f        rigFaults
 	trace    []string
@@ -155,6 +155,7 @@ func newRig(t *testing.T, world *reconciletest.World, dir string, cfgText string
 	rg.d = daemon.New(daemon.Config{
 		ConfigPath: storeConfig(t, t.TempDir(), cfgText),
 		ConfigGID:  -1,
+		AddrStore:  bookPath(rg.snap),
 		Snapshot:   rg.snap,
 		// A missing host file: the tests here do not read the host file of the machine.
 		Hosts: &fakeHosts{},
@@ -167,6 +168,7 @@ func newRig(t *testing.T, world *reconciletest.World, dir string, cfgText string
 		Lookup: rg.lookup,
 	})
 	rg.lookup.d = rg.d
+	rg.d.SetBookFault(&rg.bookFail)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- rg.d.Run(ctx) }()
@@ -205,33 +207,15 @@ func rigCfg(t *testing.T, text string) policy.Config {
 	return cfg
 }
 
-// savedExpiry returns the expiry of (p, a) in the snapshot on disk.
+// savedExpiry returns the expiry of (p, a) in the address book on disk.
 func (rg *rig) savedExpiry(p policy.Name, a netip.Addr) (time.Time, bool) {
-	data, err := os.ReadFile(rg.snap)
-	if err != nil {
-		return time.Time{}, false
-	}
-	var f struct {
-		Entries []struct {
-			Policy string `json:"policy"`
-			Addr   string `json:"addr"`
-			Expiry int64  `json:"expiry_unix_nano"`
-		} `json:"entries"`
-	}
-	if err := json.Unmarshal(data, &f); err != nil {
-		rg.t.Fatalf("snapshot on disk does not decode: %v", err)
-	}
-	for _, e := range f.Entries {
-		if e.Policy == string(p) && e.Addr == a.String() {
-			return time.Unix(0, e.Expiry), true
-		}
-	}
-	return time.Time{}, false
+	exp, ok := readBook(rg.t, bookPath(rg.snap))[p][a]
+	return exp, ok
 }
 
 type rigFaults struct {
 	writes   bool // every platform write fails
-	readOnly bool // the snapshot directory is read-only
+	readOnly bool // the book directory is read-only, and book writes fail
 	resolver bool // resolver writes fail
 	tampered bool // the ruleset changed outside since the last convergence
 	voids    bool // a problem voids enforcement
@@ -248,6 +232,9 @@ func (rg *rig) setReadOnly(on bool) {
 	if err := os.Chmod(rg.dir, mode); err != nil {
 		rg.t.Fatal(err)
 	}
+	// An open book does not need its directory to write, so the fault
+	// also fails the book writes.
+	rg.bookFail.Store(on)
 }
 
 func (rg *rig) fatalf(format string, args ...any) {
@@ -291,7 +278,7 @@ func (rg *rig) checkObserve(r *rand.Rand) (rechecked bool) {
 	o := rigObservation(r)
 	st := rg.status()
 	tablesBefore := rg.world.Tables()
-	snapBefore, _ := os.ReadFile(rg.snap) //nolint:errcheck // a missing snapshot reads as empty; the test compares the bytes after
+	snapBefore, _ := os.ReadFile(bookPath(rg.snap)) //nolint:errcheck // a missing book reads as empty; the test compares the bytes after
 	start := time.Now()
 	_, err := rg.d.Observe(context.Background(), o)
 	if waited := time.Since(start); waited != 0 {
@@ -360,7 +347,7 @@ func (rg *rig) checkNoWrites(tablesBefore map[policy.Name][]netip.Prefix, snapBe
 	if after := rg.world.Tables(); !maps.EqualFunc(after, tablesBefore, slices.Equal) {
 		rg.fatalf("the report changed the tables: %v -> %v", tablesBefore, after)
 	}
-	if after, _ := os.ReadFile(rg.snap); !bytes.Equal(after, snapBefore) { //nolint:errcheck // a missing snapshot reads as empty, as before
+	if after, _ := os.ReadFile(bookPath(rg.snap)); !bytes.Equal(after, snapBefore) { //nolint:errcheck // a missing book reads as empty, as before
 		rg.fatalf("the report changed the snapshot")
 	}
 }

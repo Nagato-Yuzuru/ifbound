@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
+	"github.com/Nagato-Yuzuru/ifbound/internal/addrstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
@@ -51,8 +51,14 @@ const (
 
 // loop is the state that only the Run goroutine touches.
 type loop struct {
-	rec      reconcile.Reconciler
-	snapshot string
+	rec reconcile.Reconciler
+	// addrStore is the path of the address book, and snapshot the path
+	// of the JSON snapshot that its first open imports.
+	addrStore string
+	snapshot  string
+	openBook  openBookFunc
+	// facts are the latest facts of the book of runningMode.
+	facts    addrstore.BookFacts
 	store    string // the path of the stored configuration
 	storeGID int
 	storeFn  storeFunc
@@ -93,16 +99,18 @@ type loop struct {
 	failed string
 }
 
-func newLoop(c Config, store storeFunc, pub *atomic.Pointer[Status]) *loop {
+func newLoop(c Config, store storeFunc, openBook openBookFunc, pub *atomic.Pointer[Status]) *loop {
 	l := &loop{
-		rec:      c.Platform,
-		snapshot: c.Snapshot,
-		store:    c.ConfigPath,
-		storeGID: c.ConfigGID,
-		storeFn:  store,
-		log:      c.Logger,
-		pub:      pub,
-		mode:     unconfiguredMode{phase: startingPhase(reasonNotLoaded)},
+		rec:       c.Platform,
+		addrStore: c.AddrStore,
+		snapshot:  c.Snapshot,
+		openBook:  openBook,
+		store:     c.ConfigPath,
+		storeGID:  c.ConfigGID,
+		storeFn:   store,
+		log:       c.Logger,
+		pub:       pub,
+		mode:      unconfiguredMode{phase: startingPhase(reasonNotLoaded)},
 
 		hostsReader:    c.Hosts,
 		accountReader:  c.Accounts,
@@ -191,13 +199,14 @@ func policyNames(cfg policy.Config) []policy.Name {
 	return names
 }
 
-// reconcile is the one path to the desired state. While the snapshot
-// does not load, it converges add-only (see reconcile.Inputs.AddOnly)
-// with an empty book: the ruleset, the IP and CIDR destinations, and the
-// host addresses need no book, but a removal would unblock every learned
-// address. The phase then stays StateStarting with the snapshot error as
-// the first reason, so no report is acknowledged. The first pass that
-// loads the snapshot is a normal convergence.
+// reconcile is the one path to the desired state. While the address
+// book does not open, it converges add-only (see
+// reconcile.Inputs.AddOnly) with no learned address: the ruleset, the IP
+// and CIDR destinations, and the host addresses need no book, but a
+// removal would unblock every learned address. The phase then stays
+// StateStarting with the open error as the first reason, so no report is
+// acknowledged. The first pass that opens the book is a normal
+// convergence.
 //
 // The host file comes first: adoption must know which kernel entries are
 // host addresses. Without a configuration, it does nothing.
@@ -215,9 +224,12 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	var (
 		conf   activeConfig
 		retain time.Duration
-		book   *addrbook.AddrBook
-		hosts  map[policy.Name][]blockable.Addr
-		// loadErr is the error of the snapshot load in loadingMode.
+		book   addrBook
+		// src is the source of the learned addresses for Converge: book,
+		// or no address while the book does not open.
+		src   reconcile.AddrSource
+		hosts map[policy.Name][]blockable.Addr
+		// loadErr is the error of the book open in loadingMode.
 		loadErr error
 	)
 	began := time.Now()
@@ -236,18 +248,20 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 		conf, retain = m.conf, m.retain
 		hosts = l.hostAddrs(ctx, conf)
 		book, loadErr = l.loadBook(ctx, conf, retain)
+		src = book
 		if loadErr != nil {
-			book = addrbook.New(retain, time.Now)
+			src = emptyBook{}
 		}
 	case runningMode:
 		conf, retain, book = m.conf, m.retain, m.book
+		src = book
 		hosts = l.hostAddrs(ctx, conf)
 	default:
 		return errNoConfig
 	}
 	rep, err := l.rec.Converge(ctx, reconcile.Inputs{
 		Policies: conf.cfg.Policies,
-		Book:     book,
+		Book:     src,
 		Hosts:    hosts,
 		Apexes:   conf.apexes,
 		Listen:   conf.cfg.DNS.Listen,
@@ -257,8 +271,9 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	if rep.Installed != "" && loadErr == nil {
 		// No loaded rule refers to a removed policy now, and its table is
 		// gone. Until this point a revert of the configuration must still
-		// find its addresses.
-		book.Prune(policyNames(conf.cfg))
+		// find its addresses. A failed delete keeps them on disk only;
+		// the next Prune after a start removes them again.
+		_, _ = book.Apply(ctx, addrstore.Prune{Keep: policyNames(conf.cfg)}) //nolint:errcheck // see above
 	}
 	l.logStatesEnded(ctx, logattr.StatesCauseNarrowed, rep.Narrowed)
 	if p, ok := core.HostsProblem(l.core); ok {
@@ -345,63 +360,58 @@ func (l *loop) logStatesEnded(ctx context.Context, cause string, policies []poli
 		slog.String(logattr.StatesCause, cause), slog.Any(logattr.PolicyNames, names))
 }
 
-// loadBook builds a book from the snapshot. A snapshot without addresses
-// of the configured policies (most often a missing file) makes it adopt
-// the learned-looking entries of the kernel tables and save them first:
-// a lost snapshot then keeps addresses blocked for one retain period
-// instead of unblocking them.
+// loadBook opens the address book. A book without addresses of the
+// configured policies (most often a new file) makes it adopt the
+// learned-looking entries of the kernel tables and commit them first: a
+// lost book then keeps addresses blocked for one retain period instead
+// of unblocking them.
 //
 // The trigger looks at the configured policies only, so it also adopts
-// when the snapshot holds addresses only of policies that the
-// configuration removed. Adoption reads every table, also the table of a
-// removed policy: its removal may not be installed yet, and a revert must
-// find its addresses. reconcile prunes them after the install. This is broader than "the snapshot is empty", and it fails
-// closed: adoption adds entries that the tables already hold, and each
-// one expires after one retain period. After a good read of the host
-// file, its addresses are not adopted: they leave the tables with their
-// host entries. Before a good read, they are adopted. Entries that expired while the
-// daemon was down leave the book here.
-func (l *loop) loadBook(ctx context.Context, conf activeConfig, retain time.Duration) (*addrbook.AddrBook, error) {
-	book := addrbook.New(retain, time.Now)
-	if err := book.Load(l.snapshot); err != nil {
+// when the book holds addresses only of policies that the configuration
+// removed. Adoption reads every table, also the table of a removed
+// policy: its removal may not be installed yet, and a revert must find
+// its addresses. reconcile prunes them after the install. This is broader
+// than "the book is empty", and it fails closed: adoption adds entries
+// that the tables already hold, and each one expires after one retain
+// period. After a good read of the host file, its addresses are not
+// adopted: they leave the tables with their host entries. Before a good
+// read, they are adopted. Entries that expired while the daemon was down
+// leave the book here. After an error, no book is open.
+func (l *loop) loadBook(ctx context.Context, conf activeConfig, retain time.Duration) (addrBook, error) {
+	book, err := l.openBook(l.addrStore, l.snapshot, retain)
+	if err != nil {
 		return nil, fmt.Errorf("loading snapshot: %w", err)
 	}
 	if !slices.ContainsFunc(policyNames(conf.cfg), func(n policy.Name) bool { return len(book.Addrs(n)) > 0 }) {
 		if err := l.adopt(ctx, book, conf.cfg.Policies); err != nil {
+			_ = book.Close() //nolint:errcheck // the adoption error is the one to report; the next attempt opens the book again
 			return nil, err
 		}
 	}
-	book.Expire()
+	// A failed delete leaves the expired entries on disk only; the next
+	// start removes them again.
+	_, _ = book.Apply(ctx, addrstore.Expire{At: time.Now()}) //nolint:errcheck // see above
 	return book, nil
 }
 
-func (l *loop) adopt(ctx context.Context, book *addrbook.AddrBook, policies []policy.Policy) error {
+func (l *loop) adopt(ctx context.Context, book addrBook, policies []policy.Policy) error {
 	found, err := l.rec.Adoptable(ctx, policies)
 	if err != nil {
 		return fmt.Errorf("adopting kernel entries: %w", err)
 	}
-	if len(found) == 0 {
-		return nil
-	}
 	for name, addrs := range found {
 		if _, read := l.core.HostFile(); read {
-			// The host file is their source of truth, not the snapshot.
+			// The host file is their source of truth, not the book.
 			// reconcile mapped it before it loads the book.
 			hosts := l.mapped.addrs[name] // sorted
-			addrs = slices.DeleteFunc(addrs, func(a blockable.Addr) bool {
+			found[name] = slices.DeleteFunc(addrs, func(a blockable.Addr) bool {
 				_, found := slices.BinarySearchFunc(hosts, a, blockable.Addr.Compare)
 				return found
 			})
 		}
-		if len(addrs) == 0 {
-			continue
-		}
-		// TTL 0: the entry gets a fresh retain period.
-		if _, err := book.Observe(name, addrs, 0); err != nil {
-			return fmt.Errorf("adopting kernel entries: %w", err)
-		}
 	}
-	if err := book.Save(l.snapshot); err != nil {
+	// TTL 0: each entry gets a fresh retain period.
+	if _, err := book.Apply(ctx, addrstore.Adopt{Found: found, At: time.Now()}); err != nil {
 		return fmt.Errorf("saving adopted entries: %w", err)
 	}
 	return nil
@@ -462,16 +472,23 @@ func (l *loop) armExpiry(t *time.Timer) {
 		t.Stop()
 		return
 	}
-	next, ok := m.book.NextExpiry()
-	if !ok {
+	next := l.bookFacts(m.book).NextExpiry
+	if next.IsZero() {
 		t.Stop()
 		return
 	}
 	t.Reset(time.Until(next))
 }
 
+// expire removes the expired entries of the book. A removal is final also
+// when its delete fails, so a failed delete does not make the timer
+// fire again at once; the next start removes the entries from disk.
 func (l *loop) expire(ctx context.Context) {
-	if m, ok := l.mode.(runningMode); ok && len(m.book.Expire()) > 0 {
+	m, ok := l.mode.(runningMode)
+	if !ok {
+		return
+	}
+	if n, _ := m.book.Apply(ctx, addrstore.Expire{At: time.Now()}); n > 0 { //nolint:errcheck // see above
 		_ = l.reconcile(ctx, logattr.TriggerExpiry) //nolint:errcheck // the phase holds the outcome
 	}
 }
@@ -620,32 +637,26 @@ func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) 
 	return ipc.Ack{Protected: true}, nil
 }
 
-// record puts the addresses of o in the book, the tables, and the
-// snapshot of each policy in names, in this order. It skips the
-// addresses that blockable.New refuses, so the snapshot does not keep
-// them either. The same slice goes to the book and to the tables, so a
-// table entry and its book key cannot differ. After a failure, the book
-// keeps the addresses. The next report or convergence completes the
-// work.
-func (l *loop) record(ctx context.Context, book *addrbook.AddrBook, names []policy.Name, o ipc.Observation) error {
+// record puts the addresses of o in the tables and the book of each
+// policy in names, in this order. It skips the addresses that
+// blockable.New refuses, so the book does not keep them either. The same
+// slice goes to the book and to the tables, so a table entry and its
+// book key cannot differ. An address is in the book only after its
+// commit: after a failure, the book does not have the new addresses, and
+// the report is not acknowledged.
+func (l *loop) record(ctx context.Context, book addrBook, names []policy.Name, o ipc.Observation) error {
 	addrs := blockable.Filter(o.Addrs)
-	needSave := false
-	for _, name := range names {
-		ns, err := book.Observe(name, addrs, o.TTL)
-		if err != nil {
-			return fmt.Errorf("recording addresses: %w", err)
-		}
-		needSave = needSave || ns
+	p, err := book.Touch(names, addrs, o.TTL, time.Now())
+	if err != nil {
+		return fmt.Errorf("recording addresses: %w", err)
 	}
 	for _, name := range names {
 		if err := l.rec.AddObserved(ctx, name, addrs); err != nil {
 			return err
 		}
 	}
-	if needSave {
-		if err := book.Save(l.snapshot); err != nil {
-			return fmt.Errorf("saving snapshot: %w", err)
-		}
+	if err := book.Commit(ctx, p); err != nil {
+		return fmt.Errorf("saving snapshot: %w", err)
 	}
 	return nil
 }
@@ -686,8 +697,9 @@ func (l *loop) status() Status {
 		withConf(m.conf, m.retain)
 	case runningMode:
 		withConf(m.conf, m.retain)
+		counts := l.bookFacts(m.book).Counts
 		for _, pol := range m.conf.cfg.Policies {
-			st.Addrs += m.book.Len(pol.Name)
+			st.Addrs += counts[pol.Name]
 		}
 	default:
 	}

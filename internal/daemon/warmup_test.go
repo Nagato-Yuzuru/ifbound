@@ -187,6 +187,7 @@ func startWarm(t *testing.T, world *reconciletest.World, snapshot, cfgText strin
 	d := daemon.New(daemon.Config{
 		ConfigPath: storeConfig(t, t.TempDir(), cfgText),
 		ConfigGID:  -1,
+		AddrStore:  bookPath(snapshot),
 		Snapshot:   snapshot,
 		// A missing host file: the tests here do not read the host file of the machine.
 		Hosts: &fakeHosts{},
@@ -900,14 +901,14 @@ func TestWarmUpWritesNothingAndItsReportsTakeTheNormalPath(t *testing.T) {
 			defer h.stop()
 			h.wantState(daemon.StateReady)
 			writes := world.Writes()
-			snap := readOrEmpty(t, h.snapshot)
+			snap := readOrEmpty(t, bookPath(h.snapshot))
 			close(hold.release)
 			synctest.Wait()
 			h.wantCounts(once(seqNames("w", 6)...))
 			if got := world.Writes(); got != writes {
 				t.Errorf("platform writes = %d after the warm-up, want %d", got, writes)
 			}
-			if after := readOrEmpty(t, h.snapshot); after != snap {
+			if after := readOrEmpty(t, bookPath(h.snapshot)); after != snap {
 				t.Error("the snapshot changed during a warm-up without reports")
 			}
 		})

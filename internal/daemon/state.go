@@ -3,7 +3,6 @@ package daemon
 import (
 	"time"
 
-	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
@@ -168,7 +167,7 @@ type runningMode struct {
 	conf activeConfig
 	// retain is the retain of book.
 	retain time.Duration
-	book   *addrbook.AddrBook
+	book   addrBook
 	phase  phase
 }
 

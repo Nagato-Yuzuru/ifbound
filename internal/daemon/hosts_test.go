@@ -387,7 +387,7 @@ func TestAdoptionSkipsHostAddresses(t *testing.T) {
 		h.writeHosts("10.1.1.1 example.com\n")
 		heal()
 		h.stop()
-		if err := os.Remove(h.snapshot); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := os.Remove(bookPath(h.snapshot)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			t.Fatal(err)
 		}
 

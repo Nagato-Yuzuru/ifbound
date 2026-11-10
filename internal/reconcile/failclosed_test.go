@@ -65,7 +65,7 @@ func transitions() []transition {
 			f.now = f.now.Add(40 * time.Minute)
 			f.observe(t, "web", "203.0.113.2", "203.0.113.3")
 			f.now = f.now.Add(21 * time.Minute)
-			f.book.Expire() // 203.0.113.1 and 3fff::1 expire
+			f.book.expire() // 203.0.113.1 and 3fff::1 expire
 			f.reconfigure(t, configV2)
 			f.observe(t, "mail", "192.0.2.25")
 		},

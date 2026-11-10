@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
@@ -69,7 +68,7 @@ type fixture struct {
 	world *reconciletest.World
 	inv   *reconciletest.Inventory
 	rec   reconcile.Reconciler
-	book  *addrbook.AddrBook
+	book  *testBook
 	hosts map[policy.Name][]blockable.Addr
 	now   time.Time
 	cfg   policy.Config
@@ -89,8 +88,52 @@ func newFixture(t *testing.T, cfgText string) *fixture {
 		Resolver:  f.world.Resolver(),
 		Inventory: f.inv,
 	}
-	f.book = addrbook.New(f.cfg.AddrBook.Retain, func() time.Time { return f.now })
+	f.book = &testBook{retain: f.cfg.AddrBook.Retain, now: func() time.Time { return f.now }, expiry: map[policy.Name]map[blockable.Addr]time.Time{}}
 	return f
+}
+
+// testBook is the address book of the tests, with the expiry rule of
+// addrstore: an answer keeps an address until the later of its old
+// expiry and now + max(ttl, retain).
+type testBook struct {
+	retain time.Duration
+	now    func() time.Time
+	expiry map[policy.Name]map[blockable.Addr]time.Time
+}
+
+func (b *testBook) Addrs(name policy.Name) []blockable.Addr {
+	return slices.SortedFunc(maps.Keys(b.expiry[name]), blockable.Addr.Compare)
+}
+
+func (b *testBook) observe(name policy.Name, addrs []blockable.Addr, ttl time.Duration) {
+	if b.expiry[name] == nil {
+		b.expiry[name] = map[blockable.Addr]time.Time{}
+	}
+	for _, a := range addrs {
+		if exp := b.now().Add(max(ttl, b.retain)); exp.After(b.expiry[name][a]) {
+			b.expiry[name][a] = exp
+		}
+	}
+}
+
+// expire removes the addresses whose expiry is before now, and returns
+// them in ascending order.
+func (b *testBook) expire() []blockable.Addr {
+	var out []blockable.Addr
+	for _, byAddr := range b.expiry {
+		for a, exp := range byAddr {
+			if b.now().After(exp) {
+				out = append(out, a)
+				delete(byAddr, a)
+			}
+		}
+	}
+	slices.SortFunc(out, blockable.Addr.Compare)
+	return out
+}
+
+func (b *testBook) prune(keep []policy.Name) {
+	maps.DeleteFunc(b.expiry, func(name policy.Name, _ map[blockable.Addr]time.Time) bool { return !slices.Contains(keep, name) })
 }
 
 func (f *fixture) inputs() reconcile.Inputs {
@@ -114,9 +157,7 @@ func (f *fixture) converge(t *testing.T) reconcile.Report {
 
 func (f *fixture) observe(t *testing.T, name policy.Name, addrs ...string) {
 	t.Helper()
-	if _, err := f.book.Observe(name, learned(addrs...), time.Minute); err != nil {
-		t.Fatalf("Observe: %v", err)
-	}
+	f.book.observe(name, learned(addrs...), time.Minute)
 }
 
 func (f *fixture) reconfigure(t *testing.T, cfgText string) {
@@ -126,7 +167,7 @@ func (f *fixture) reconfigure(t *testing.T, cfgText string) {
 	for i, p := range f.cfg.Policies {
 		names[i] = p.Name
 	}
-	f.book.Prune(names)
+	f.book.prune(names)
 }
 
 func (f *fixture) compiled(t *testing.T, ifaces ...reconcile.Interface) string {
@@ -313,7 +354,7 @@ func TestConvergeExpiryRemovesAddress(t *testing.T) {
 	f.converge(t)
 
 	f.now = f.now.Add(21 * time.Minute) // 61 minutes after the first answer
-	if got := f.book.Expire(); len(got) != 1 || got[0].Addr != netip.MustParseAddr("203.0.113.1") {
+	if got := f.book.expire(); len(got) != 1 || got[0].Addr() != netip.MustParseAddr("203.0.113.1") {
 		t.Fatalf("Expire = %v, want only 203.0.113.1", got)
 	}
 	rep := f.converge(t)
@@ -339,7 +380,7 @@ func TestConvergeAddOnlyRemovesNothing(t *testing.T) {
 	seed(t, f.world, map[policy.Name][]string{"web": {"127.0.0.1/32"}, "ads": {"::1/128"}})
 	f.reconfigure(t, configV2)
 	f.now = f.now.Add(2 * time.Hour)
-	f.book.Expire()
+	f.book.expire()
 	f.hosts = map[policy.Name][]blockable.Addr{"web": learned("10.1.1.1")}
 	in := f.inputs()
 	in.AddOnly = true
@@ -615,7 +656,7 @@ func TestConvergeInstallsDespiteResolverFailure(t *testing.T) {
 func TestConvergeNotInstalledWhenRemovalFails(t *testing.T) {
 	f := installV1(t)
 	f.now = f.now.Add(2 * time.Hour)
-	f.book.Expire()
+	f.book.expire()
 	f.world.SetBeforeWrite(func(int) error { return reconciletest.ErrInjected })
 
 	rep, err := f.rec.Converge(t.Context(), f.inputs())
