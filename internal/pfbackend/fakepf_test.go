@@ -62,8 +62,8 @@ type fakePF struct {
 func newFakePF() *fakePF {
 	return &fakePF{
 		anchors: map[string][]string{
-			"com.apple/200.AirDrop":             {`anchor "com.apple/200.AirDrop/*" all`},
-			"com.apple/250.ApplicationFirewall": {`anchor "com.apple/250.ApplicationFirewall/*" all`},
+			"com.apple/200.AirDrop":             {`anchor "*" all`},
+			"com.apple/250.ApplicationFirewall": {`anchor "*" all`},
 		},
 		main:   []string{`scrub-anchor "com.apple/*" all fragment reassemble`, `anchor "com.apple/*" all`},
 		nat:    map[string][]string{"": {`nat-anchor "com.apple/*" all`, `rdr-anchor "com.apple/*" all`}},
@@ -362,7 +362,7 @@ func (f *fakePF) load(path string, stdin []byte) {
 	}
 	f.anchors[path] = rules
 	for _, rule := range rules {
-		if name, _, ok := anchorRule(rule); ok {
+		if name, _, ok := anchorRule(ruleWords(rule)); ok {
 			if _, ok := f.anchors[path+"/"+name]; !ok {
 				f.anchors[path+"/"+name] = nil
 			}

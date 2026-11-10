@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Nagato-Yuzuru/ifbound/pf"
 )
@@ -120,12 +121,13 @@ func labelRule(label string) string {
 //
 // The ID is "" when there is not exactly one valid sentinel rule. Foreign
 // is true when a rule is not one that the ruleset of ifbound writes at
-// the top level: a block rule or an anchor rule. A block rule that
-// another tool adds only blocks more, so it does not change the ID.
+// the top level: a block rule, or an anchor rule that calls an anchor
+// directly below (see subAnchorCall). A block rule that another tool adds
+// only blocks more, so it does not change the ID.
 func parseRules(rules []pf.Rule) (id string, tokens []token, foreign bool) {
 	var ids []string
 	for _, r := range rules {
-		if r.AnchorCall == "" && r.Action != pf.ActionDrop {
+		if r.AnchorCall != "" && !subAnchorCall(r.AnchorCall) || r.AnchorCall == "" && r.Action != pf.ActionDrop {
 			foreign = true
 		}
 		if id, ok := labelID(r.Label); ok {
@@ -139,6 +141,15 @@ func parseRules(rules []pf.Rule) (id string, tokens []token, foreign bool) {
 		return "", tokens, foreign
 	}
 	return ids[0], tokens, foreign
+}
+
+// subAnchorCall reports whether an anchor call in the ifbound anchor, as
+// pf_anchor_copyout gives it, calls one anchor directly below. readAnchor
+// checks that these anchors hold no rule. Another call can go out of the
+// ifbound anchor, or be a wildcard call ("*"), so pf can evaluate a rule
+// that Read does not check.
+func subAnchorCall(call string) bool {
+	return call != "*" && !strings.Contains(call, "/")
 }
 
 // labelID returns the ruleset ID in the label of a sentinel rule. A
@@ -243,26 +254,61 @@ func parseSkipped(out []byte) []string {
 	return names
 }
 
-// passQuick reports whether a rule that pfctl printed passes a packet
-// and ends the evaluation.
-func passQuick(rule string) bool {
-	f := strings.Fields(rule)
-	return len(f) > 0 && f[0] == "pass" && slices.Contains(f, "quick")
+// ruleWords splits a rule that pfctl printed into words. A word that
+// starts with a quote runs to the next quote that no backslash escapes,
+// and keeps its quotes. So a word in a quoted string, such as the text of
+// a label, is not a keyword of the rule.
+func ruleWords(rule string) []string {
+	var words []string
+	for rest := strings.TrimSpace(rule); rest != ""; {
+		end := strings.IndexFunc(rest, unicode.IsSpace)
+		if rest[0] == '"' {
+			end = quoteEnd(rest)
+		}
+		if end < 0 {
+			end = len(rest)
+		}
+		words = append(words, rest[:end])
+		rest = strings.TrimLeftFunc(rest[end:], unicode.IsSpace)
+	}
+	return words
 }
 
-// anchorRule returns the anchor call of a printed anchor rule, as pf
-// keeps it (pf_anchor_copyout), and whether the rule is quick. ok is
-// false when pfctl prints no anchor name.
-func anchorRule(rule string) (call string, quick, ok bool) {
-	rest, ok := strings.CutPrefix(strings.TrimSpace(rule), `anchor "`)
-	if !ok {
+// quoteEnd returns the index after the quote that closes the quoted
+// string at the start of s, or len(s) when no quote closes it.
+func quoteEnd(s string) int {
+	for i := 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '"':
+			return i + 1
+		}
+	}
+	return len(s)
+}
+
+// passQuick reports whether a rule with the words that ruleWords gives
+// passes a packet and ends the evaluation.
+func passQuick(words []string) bool {
+	return len(words) > 0 && words[0] == "pass" && slices.Contains(words, "quick")
+}
+
+// anchorRule returns the anchor call of an anchor rule with the words
+// that ruleWords gives, as pf keeps it (pf_anchor_copyout), and whether
+// the rule is quick. ok is false when pfctl prints no anchor name.
+func anchorRule(words []string) (call string, quick, ok bool) {
+	if len(words) < 2 || words[0] != "anchor" {
 		return "", false, false
 	}
-	call, rest, ok = strings.Cut(rest, `"`)
+	call, ok = strings.CutPrefix(words[1], `"`)
+	if ok {
+		call, ok = strings.CutSuffix(call, `"`)
+	}
 	if !ok || call == "" {
 		return "", false, false
 	}
-	return call, slices.Contains(strings.Fields(rest), "quick"), true
+	return call, slices.Contains(words[2:], "quick"), true
 }
 
 // callTarget returns the anchor that an anchor call in the anchor from
@@ -288,13 +334,17 @@ func callTarget(from, call string) (path string, wildcard bool) {
 		}
 		path += call
 	}
-	return strings.CutSuffix(path, "/*")
+	// pf_anchor_copyout prints a wildcard call of an anchor above as
+	// "..//*", so the path can end with "/" here.
+	path, wildcard = strings.CutSuffix(path, "/*")
+	return strings.TrimSuffix(path, "/"), wildcard
 }
 
-// routes reports whether a rule that pfctl printed routes packets to an
-// interface.
-func routes(rule string) bool {
-	return slices.ContainsFunc(strings.Fields(rule), func(w string) bool {
+// routes reports whether a rule with the words that ruleWords gives
+// routes packets to an interface: it has a route option (route-to,
+// reply-to, dup-to, fastroute).
+func routes(words []string) bool {
+	return slices.ContainsFunc(words, func(w string) bool {
 		return w == "route-to" || w == "reply-to" || w == "dup-to" || w == "fastroute"
 	})
 }

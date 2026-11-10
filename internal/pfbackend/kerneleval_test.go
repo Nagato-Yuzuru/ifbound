@@ -1,9 +1,9 @@
 package pfbackend_test
 
-// This file holds the evaluation of an outbound packet by the kernel
-// model, as pf_test and pf_route in XNU pf.c do it. It reads the rule
-// lines that the model keeps, and it refuses each word that it does not
-// know, so a rule that it cannot evaluate fails the test.
+// This file holds the evaluation of a packet by the kernel model, as
+// pf_test and pf_route in XNU pf.c do it. It reads the rule lines that
+// the model keeps, and it refuses each word that it does not know, so a
+// rule that it cannot evaluate fails the test.
 
 import (
 	"errors"
@@ -20,14 +20,16 @@ import (
 // pf_anchor_stack). pf skips an anchor rule when the stack is full.
 const anchorStack = 64
 
-// maxRoutes is the number of times pf routes one packet again (pf.c,
-// pf_route: pftag_routed). pf drops the packet after that.
+// maxRoutes is the largest count of earlier routes of a packet that
+// pf_route accepts. pf.c:9242: "if (pd->pf_mtag->pftag_routed++ > 3)"
+// drops the packet, so pf routes one packet four times.
 const maxRoutes = 3
 
-// packet is an outbound packet to an address in the table dst. tag is
-// the pf tag of the packet.
+// packet is a packet in the direction dir ("in" or "out") on the
+// interface iface, to an address in the table dst ("" for no table). tag
+// is the pf tag of the packet.
 type packet struct {
-	dst, iface, tag string
+	dir, dst, iface, tag string
 }
 
 // modelRule is a filter rule line, as the evaluation reads it.
@@ -46,7 +48,7 @@ type modelRule struct {
 }
 
 func parseModelRule(line string) (modelRule, error) {
-	w := &words{f: strings.Fields(strings.ReplaceAll(line, "return-icmp(port-unr, port-unr)", "return-icmp"))}
+	w := &words{f: splitWords(strings.ReplaceAll(line, "return-icmp(port-unr, port-unr)", "return-icmp"))}
 	var r modelRule
 	switch r.action = w.next(); r.action {
 	case "pass":
@@ -104,6 +106,27 @@ func (r *modelRule) option(w *words) error {
 	return nil
 }
 
+// splitWords splits a rule line at spaces outside quotes.
+func splitWords(line string) []string {
+	var f []string
+	var w strings.Builder
+	quoted := false
+	for _, c := range line + " " {
+		switch {
+		case c == ' ' && !quoted:
+			if w.Len() > 0 {
+				f = append(f, w.String())
+				w.Reset()
+			}
+			continue
+		case c == '"':
+			quoted = !quoted
+		}
+		w.WriteRune(c)
+	}
+	return f
+}
+
 // words reads the words of a rule line in order.
 type words struct {
 	f []string
@@ -151,9 +174,9 @@ func (w *words) pool() string {
 
 func unquote(s string) string { return strings.Trim(s, `"`) }
 
-// matches reports whether the rule matches an outbound packet.
+// matches reports whether the rule matches the packet.
 func (r modelRule) matches(p packet) bool {
-	return r.dir != "in" &&
+	return (r.dir == "" || r.dir == p.dir) &&
 		(r.on == nil || slices.Contains(r.on, p.iface)) &&
 		(r.to == "" || r.to == p.dst) &&
 		(r.tagged == "" || (p.tag == r.tagged) != r.notTagged)
@@ -171,44 +194,9 @@ func (k *kernel) filterRules(path string) []string {
 	})
 }
 
-// callTargets returns the rulesets that an anchor call in the ruleset
-// from evaluates (pf_anchor_setup), and whether the call is a wildcard
-// call. A wildcard call evaluates the anchors directly below its path, in
-// byte order of the names (pf_step_into_anchor).
-func (k *kernel) callTargets(from, call string) ([]string, bool) {
-	var path string
-	if abs, ok := strings.CutPrefix(call, "/"); ok {
-		path = abs
-	} else {
-		path = from
-		for {
-			rest, ok := strings.CutPrefix(call, "../")
-			if !ok {
-				break
-			}
-			call = rest
-			i := strings.LastIndex(path, "/")
-			path = path[:max(i, 0)]
-		}
-		if path != "" {
-			path += "/"
-		}
-		path += call
-	}
-	base, wildcard := strings.CutSuffix(path, "/*")
-	if !wildcard {
-		return []string{path}, false
-	}
-	var targets []string
-	for _, c := range pfbackend.Children(slices.Collect(maps.Keys(k.rules)), base) {
-		targets = append(targets, base+"/"+c)
-	}
-	return targets, true
-}
-
 // eval evaluates the rules of a ruleset for the packet, as pf_test_rule
 // does. last is the last rule that matched. match is the match flag of
-// pf. eval reports whether a quick rule ended the evaluation.
+// pf_test_rule. eval reports whether a quick rule ended the evaluation.
 func (k *kernel) eval(path string, p *packet, last **modelRule, match *bool, depth int) (bool, error) {
 	for _, line := range k.filterRules(path) {
 		r, err := parseModelRule(line)
@@ -234,28 +222,51 @@ func (k *kernel) eval(path string, p *packet, last **modelRule, match *bool, dep
 	return false, nil
 }
 
-// call evaluates the anchors that an anchor rule calls, as
-// pf_step_into_anchor and pf_step_out_of_anchor do. The call clears the
-// match flag. After a wildcard call evaluated an anchor, the flag moves to
-// the anchor rule. When a rule matched in the call, a quick anchor rule
-// ends the evaluation.
+// call evaluates the anchors that an anchor rule in the ruleset path
+// calls, as pf_step_into_anchor and pf_step_out_of_anchor (pf.c:3117,
+// 3154) do:
+//
+//   - The call clears the match flag of pf_test_rule and the match flag
+//     of the called anchor, also when the anchor stack is full and pf
+//     skips the rule.
+//   - A wildcard call evaluates the anchors directly below the called
+//     anchor, in byte order of the names. After each one, when its own
+//     match flag or the flag of pf_test_rule is set, the flag of the called
+//     anchor is set and the flag of pf_test_rule is cleared. Nothing
+//     clears the flag of an anchor below: it can hold the flag of an
+//     earlier packet.
+//   - At the end, when the flag of the called anchor or of pf_test_rule
+//     is set, a quick anchor rule ends the evaluation.
+//
+// When a quick rule ends the evaluation in the call, pf can still set
+// the flags of the calls around it on its way out. The model stops at
+// once and does not set them.
 func (k *kernel) call(path string, r modelRule, p *packet, last **modelRule, match *bool, depth int) (bool, error) {
+	c, ok := setup(path, r.call)
+	if !ok {
+		return false, fmt.Errorf("kernel model: cannot set up the call %q in %q", r.call, path)
+	}
+	k.anchorMatch[c.path], *match = false, false
 	if depth >= anchorStack {
 		return false, nil
 	}
-	*match = false
-	targets, wildcard := k.callTargets(path, r.call)
-	anchorMatch := false
+	targets := []string{c.path}
+	if c.wildcard {
+		targets = nil
+		for _, name := range pfbackend.Children(slices.Collect(maps.Keys(k.rules)), c.path) {
+			targets = append(targets, c.path+"/"+name)
+		}
+	}
 	for _, t := range targets {
 		stop, err := k.eval(t, p, last, match, depth+1)
 		if err != nil || stop {
 			return stop, err
 		}
-		if wildcard && *match {
-			anchorMatch, *match = true, false
+		if c.wildcard && (k.anchorMatch[t] || *match) {
+			k.anchorMatch[c.path], *match = true, false
 		}
 	}
-	return (anchorMatch || *match) && r.quick, nil
+	return (k.anchorMatch[c.path] || *match) && r.quick, nil
 }
 
 // send gives an outbound packet to the table dst to pf on the interface
@@ -263,11 +274,12 @@ func (k *kernel) call(path string, r modelRule, p *packet, last **modelRule, mat
 // A route-to rule sends the packet out on another interface, and dup-to
 // sends a copy there; pf evaluates the rules again on that interface,
 // and the packet keeps its tag (pf_route). A reply-to rule routes only
-// the packets of the other direction.
+// the packets of the other direction. pf_route counts the routes before
+// it looks at the kind of route or the interface.
 func (k *kernel) send(dst, iface string) ([]string, error) {
-	p := packet{dst: dst, iface: iface}
+	p := packet{dir: "out", dst: dst, iface: iface}
 	var out []string
-	for routes := 0; ; routes++ {
+	for routed := 0; ; routed++ {
 		var last *modelRule
 		var match bool
 		if _, err := k.eval("", &p, &last, &match, 0); err != nil {
@@ -276,13 +288,25 @@ func (k *kernel) send(dst, iface string) ([]string, error) {
 		switch {
 		case last != nil && last.action == "block":
 			return out, nil
-		case last == nil || last.routeIf == "" || last.route == "reply-to" || last.routeIf == p.iface:
+		case last == nil || last.route == "":
 			return append(out, p.iface), nil
-		case routes == maxRoutes:
+		case routed > maxRoutes:
 			return out, nil
+		case last.route == "reply-to" || last.routeIf == p.iface:
+			return append(out, p.iface), nil
 		case last.route == "dup-to":
 			out = append(out, p.iface)
 		}
 		p.iface = last.routeIf
 	}
+}
+
+// receive gives an inbound packet on the interface iface to pf. Only the
+// match flags of the anchors keep its effect.
+func (k *kernel) receive(iface string) error {
+	p := packet{dir: "in", iface: iface}
+	var last *modelRule
+	var match bool
+	_, err := k.eval("", &p, &last, &match, 0)
+	return err
 }

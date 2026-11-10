@@ -92,6 +92,9 @@ func TestTopLevelForeignRuleIsAChange(t *testing.T) {
 		same bool
 	}{
 		{"pass rule", "pass out quick all no state", false},
+		// The ruleset of ifbound calls only the sub-anchors directly below
+		// the anchor. A call out of it can reach a rule that passes.
+		{"anchor rule that calls out of the anchor", `anchor "/vpn" quick all`, false},
 		{"near miss: block rule, which only blocks more", "block drop out quick to 192.0.2.77", true},
 	}
 	for _, tt := range tests {
@@ -223,10 +226,15 @@ func TestRestrictedAnchorReferenceVoids(t *testing.T) {
 // escapes reports whether the kernel model lets a protected packet leave
 // on an interface that its policy does not allow: a packet to the table
 // bing (only_via utun4) on en0, or a packet to the table doh (only_via
-// empty) on any interface.
+// empty) on any interface. An inbound packet comes first on each
+// interface: pf keeps the match flag of each anchor across packets, so
+// an earlier packet can change how pf decides a later one.
 func escapes(t *testing.T, k *kernel) bool {
 	t.Helper()
 	for _, from := range []string{"en0", "utun4"} {
+		if err := k.receive(from); err != nil {
+			t.Fatal(err)
+		}
 		bing, err := k.send("bing", from)
 		if err != nil {
 			t.Fatal(err)
@@ -276,6 +284,28 @@ func TestRulesAroundTheAnchorVoid(t *testing.T) {
 			k.rules["com.apple/000.aaa"] = []string{`anchor "../zzz" all`}
 			k.rules["com.apple/zzz"] = []string{passQuick}
 		}, true, `"pass out quick all no state" in the anchor com.apple/zzz`},
+		// pfctl prints this call as "..//*" (pf_anchor_copyout).
+		{"wildcard call of the parent from an earlier com.apple anchor", func(k *kernel) {
+			k.rules["com.apple/000.aaa"] = []string{`anchor "x" all`}
+			k.rules["com.apple/000.aaa/x"] = []string{`anchor "../*" all`}
+			k.rules["com.apple/000.aaa/y"] = []string{passQuick}
+		}, true, `"pass out quick all no state" in the anchor com.apple/000.aaa/y`},
+		// The inbound packet matches the block rule, so the wildcard call
+		// "*" sets the match flag of x/c. The protected packet matches no
+		// rule in x/c, but the quick wildcard call "x/*" reads the old flag
+		// of x/c and ends the evaluation, and pf passes the packet.
+		{"quick wildcard anchor and a match flag of an earlier packet", func(k *kernel) {
+			k.mainRules = slices.Insert(k.mainRules, 0, `anchor "x/*" quick all`)
+			k.rules["x/c"] = []string{`anchor "*" in all`}
+			k.rules["x/c/d"] = []string{"block drop in all"}
+		}, true, `"anchor \"x/*\" quick all" in the main pf ruleset`},
+		// The nested wildcard call sets the match flag of x/c, and the quick
+		// wildcard call "x/*" reads it.
+		{"quick wildcard anchor and a pass rule below a nested wildcard call", func(k *kernel) {
+			k.mainRules = slices.Insert(k.mainRules, 0, `anchor "x/*" quick all`)
+			k.rules["x/c"] = []string{`anchor "*" all`}
+			k.rules["x/c/d"] = []string{pass}
+		}, true, `"anchor \"x/*\" quick all" in the main pf ruleset`},
 		{"call inside the subtree of an earlier com.apple anchor", func(k *kernel) {
 			k.rules["com.apple/000.aaa"] = []string{`anchor "inner" all`}
 			k.rules["com.apple/000.aaa/inner"] = []string{passQuick}
@@ -318,6 +348,12 @@ func TestRulesAroundTheAnchorVoid(t *testing.T) {
 			k.rules["com.apple/000.aaa"] = nil
 			k.rules["com.apple/000.aaa/x"] = []string{passQuick}
 		}, false, ""},
+		{"near miss: the word quick in a label before the ifbound anchor", func(k *kernel) {
+			k.rules["com.apple/000.aaa"] = []string{`pass out on lo0 all no state label "keep quick dns"`}
+		}, false, ""},
+		{"near miss: the word route-to in a label", func(k *kernel) {
+			k.rules["com.apple/300.vpn"] = []string{`pass out on lo0 all no state label "no route-to here"`}
+		}, false, ""},
 		{"near miss: an anchor that calls itself", func(k *kernel) {
 			k.rules["com.apple/000.aaa"] = []string{`anchor "/com.apple/000.aaa" all`}
 		}, false, ""},
@@ -342,6 +378,25 @@ func TestRulesAroundTheAnchorVoid(t *testing.T) {
 				t.Errorf("voiding Problems = %+v, want one with %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// Read follows an anchor call as pfctl prints it, which is the text that
+// pf_anchor_copyout gives and not the loaded text. Each call goes to the
+// anchor that pf_anchor_setup chose when the rule was loaded.
+func TestCallTargetReadsTheCopyoutForm(t *testing.T) {
+	for _, from := range []string{"", "x", "com.apple/000.aaa", "a/b/c"} {
+		for _, name := range []string{"y", "y/*", "y/z/*", "*", "../y", "../y/*", "../*", "../../*", "../../y", "/abs", "/abs/*", "/a/b/*"} {
+			c, ok := setup(from, name)
+			if !ok {
+				continue
+			}
+			printed := c.copyout(from)
+			path, wildcard := pfbackend.CallTarget(from, printed)
+			if path != c.path || wildcard != c.wildcard {
+				t.Errorf("in %q, the call %q prints as %q and reads as (%q, wildcard %v), want (%q, wildcard %v)", from, name, printed, path, wildcard, c.path, c.wildcard)
+			}
+		}
 	}
 }
 

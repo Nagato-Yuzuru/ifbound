@@ -28,7 +28,7 @@ const anchorStack = 64
 //     it only for the packets that it matches);
 //   - a filter rule decides packets before the ifbound rules: a rule that
 //     passes packets quick, or a quick anchor rule that calls an anchor
-//     with a pass rule;
+//     with a pass rule or a wildcard call, or that is a wildcard call;
 //   - a filter rule routes packets to an interface (route-to, reply-to,
 //     dup-to, fastroute), before or after the ifbound anchor;
 //   - a NAT rule passes the packets that it translates ("nat pass",
@@ -86,36 +86,19 @@ func (b *Backend) problems(ctx context.Context, enabled bool, tables, negated ma
 // ruleProblems checks the filter rules that pf can evaluate. It follows
 // the anchor calls in the order in which pf evaluates them: the rules of
 // the main ruleset, and in each anchor rule the anchors that it calls.
-// The rules before the anchor rule that refers to the anchors below
-// com.apple come before the ifbound anchor, and in that anchor rule the
-// anchors whose name comes before the name of the ifbound anchor in byte
-// order. The rest comes after it.
 func (b *Backend) ruleProblems(ctx context.Context) ([]reconcile.Problem, error) {
 	out, err := b.pfctl(ctx, nil, "-sr")
 	if err != nil {
 		return nil, err
 	}
 	rules := lines(out.Stdout)
-	ref := slices.IndexFunc(rules, refersToApple)
-	if ref < 0 {
+	if !slices.ContainsFunc(rules, refersToApple) {
 		return []reconcile.Problem{voids(`the main pf ruleset has no rule anchor "com.apple/*" for all packets, so pf does not evaluate the ifbound anchor`)}, nil
 	}
-	w := walk{b: b, held: make(map[string]bool)}
-	for i, r := range rules {
-		if i != ref {
-			if _, err := w.rule(ctx, "", r, i < ref, 0); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		apple, err := w.below(appleAnchor)
-		if err != nil {
+	w := walk{b: b, before: true, canPass: make(map[string]bool)}
+	for _, r := range rules {
+		if _, err := w.rule(ctx, "", r, 0); err != nil {
 			return nil, err
-		}
-		for _, a := range apple {
-			if _, err := w.ruleset(ctx, a, a < Anchor, 1); err != nil {
-				return nil, err
-			}
 		}
 	}
 	return w.ps, nil
@@ -125,10 +108,14 @@ func (b *Backend) ruleProblems(ctx context.Context) ([]reconcile.Problem, error)
 // prints. It reports these rules:
 //
 //   - before the ifbound anchor, a rule that passes packets quick;
-//   - before the ifbound anchor, a quick anchor rule that calls an anchor
-//     with a pass rule. When a rule in the anchors that it calls matches,
-//     pf ends the evaluation (pf.c: pf_step_out_of_anchor gives the quick
-//     flag of the anchor rule);
+//   - before the ifbound anchor, a quick anchor rule that can end the
+//     evaluation: an anchor that it calls holds a pass rule, or the rule
+//     or an anchor that it calls makes a wildcard call. pf ends the
+//     evaluation at the quick anchor rule when the match flag of the
+//     called anchor is set (pf.c: pf_step_out_of_anchor). A wildcard
+//     call sets that flag from the flag of each anchor below, and pf
+//     keeps the flag of an anchor across packets. So an earlier packet
+//     can end the evaluation, also when no rule matches this packet;
 //   - at each position, a rule that routes packets (route-to, reply-to,
 //     dup-to, fastroute). pf evaluates a routed packet again on the new
 //     interface, and the packet keeps the tag that the ifbound rules gave
@@ -136,108 +123,139 @@ func (b *Backend) ruleProblems(ctx context.Context) ([]reconcile.Problem, error)
 //     rule that routes inbound packets only, which is the safe direction.
 //
 // The walk reads each anchor one time. It does not go into the ifbound
-// anchor: Read checks its rules through the ruleset ID.
+// anchor: Read checks its rules through the ruleset ID, and parseRules
+// does not accept a call out of the ifbound anchor.
 type walk struct {
 	b  *Backend
 	ps []reconcile.Problem
-	// held maps each anchor that the walk read to whether it, or an
-	// anchor that it calls, holds a pass rule. An anchor that the walk
-	// reads at the moment holds one: a call back into it is a loop, and
-	// the safe answer is yes.
-	held map[string]bool
+	// before is true until the walk comes to the position of the ifbound
+	// anchor: in the first rule of the main ruleset that refers to the
+	// anchors below com.apple for all packets, the first anchor whose path
+	// is the path of the ifbound anchor or comes after it in byte order.
+	// The walk reads the rules in the order in which pf evaluates them, so
+	// a rule that it reads while before is true comes before the ifbound
+	// rules.
+	before bool
+	// canPass maps each anchor that the walk read to whether a quick
+	// anchor rule that calls it can end the evaluation (see walk). An
+	// anchor that the walk reads at the moment can: a call back into it
+	// is a loop, and the safe answer is yes.
+	canPass map[string]bool
 }
 
 // rule checks one rule of the ruleset at path, at the given depth of the
 // anchor stack. It reports whether the rule is a pass rule, or an anchor
-// rule that calls an anchor with a pass rule.
-func (w *walk) rule(ctx context.Context, path, rule string, before bool, depth int) (bool, error) {
+// rule that can end the evaluation when it is quick.
+func (w *walk) rule(ctx context.Context, path, rule string, depth int) (bool, error) {
+	before := w.before
 	where := "the main pf ruleset"
 	if path != "" {
 		where = "the anchor " + path
 	}
-	if routes(rule) {
+	words := ruleWords(rule)
+	if routes(words) {
 		w.ps = append(w.ps, voids(fmt.Sprintf("the rule %q in %s routes packets to an interface; pf evaluates them again there and they keep their tags, so they can go around the ifbound rules", rule, where)))
 	}
-	if before && passQuick(rule) {
+	if before && passQuick(words) {
 		w.ps = append(w.ps, voids(fmt.Sprintf("the rule %q in %s comes before the ifbound anchor and passes packets quick", rule, where)))
 	}
-	f := strings.Fields(rule)
-	if len(f) == 0 || f[0] != "anchor" {
-		return len(f) > 0 && f[0] == "pass", nil
+	if len(words) == 0 || words[0] != "anchor" {
+		return len(words) > 0 && words[0] == "pass", nil
 	}
-	call, quick, ok := anchorRule(rule)
-	if !ok {
-		w.ps = append(w.ps, voids(fmt.Sprintf("cannot follow the anchor rule %q in %s: pfctl does not print the name of the anchor", rule, where)))
+	canPass, problem, err := w.call(ctx, path, rule, words, depth)
+	if err != nil {
+		return false, err
+	}
+	if problem != "" {
+		w.ps = append(w.ps, voids(fmt.Sprintf("cannot follow the anchor rule %q in %s: %s", rule, where, problem)))
 		return true, nil
+	}
+	if _, quick, _ := anchorRule(words); before && quick && canPass {
+		w.ps = append(w.ps, voids(fmt.Sprintf("the rule %q in %s comes before the ifbound anchor; it is a quick anchor rule, and a pass rule or a wildcard call in its calls can end the evaluation and pass packets", rule, where)))
+	}
+	return canPass, nil
+}
+
+// call checks the anchors that an anchor rule of the ruleset at path
+// calls; words are the words of the rule. It reports whether the rule can
+// end the evaluation when it is quick, or why the walk cannot follow the
+// call.
+func (w *walk) call(ctx context.Context, path, rule string, words []string, depth int) (canPass bool, problem string, err error) {
+	call, _, ok := anchorRule(words)
+	if !ok {
+		return false, "pfctl does not print the name of the anchor", nil
 	}
 	if depth >= anchorStack {
-		w.ps = append(w.ps, voids(fmt.Sprintf("cannot follow the anchor rule %q in %s: the anchor calls are deeper than %d", rule, where, anchorStack)))
-		return true, nil
+		return false, fmt.Sprintf("the anchor calls are deeper than %d", anchorStack), nil
 	}
 	target, wildcard := callTarget(path, call)
 	targets := []string{target}
 	if wildcard {
-		var err error
-		if targets, err = w.below(target); err != nil {
-			return false, err
+		targets, err = w.below(target)
+		if errors.Is(err, pf.ErrNotFound) {
+			return false, "the anchor " + target + " does not exist", nil
 		}
-	}
-	held := false
-	for _, t := range targets {
-		h, err := w.ruleset(ctx, t, before, depth+1)
 		if err != nil {
-			return false, err
+			return false, "", err
 		}
-		held = held || h
 	}
-	if before && quick && held {
-		w.ps = append(w.ps, voids(fmt.Sprintf("the rule %q in %s comes before the ifbound anchor; it is a quick anchor rule, so a pass rule in the anchors that it calls passes packets quick", rule, where)))
+	apple := w.before && path == "" && refersToApple(rule)
+	canPass = wildcard
+	for _, t := range targets {
+		if apple && t >= Anchor {
+			w.before = false
+		}
+		p, err := w.ruleset(ctx, t, depth+1)
+		if err != nil {
+			return false, "", err
+		}
+		canPass = canPass || p
 	}
-	return held, nil
+	if apple {
+		w.before = false
+	}
+	return canPass, "", nil
 }
 
-// ruleset checks the rules of the anchor at path. It reports whether the
-// anchor, or an anchor that it calls, holds a pass rule.
-func (w *walk) ruleset(ctx context.Context, path string, before bool, depth int) (bool, error) {
+// ruleset checks the rules of the anchor at path. It reports whether a
+// quick anchor rule that calls the anchor can end the evaluation.
+func (w *walk) ruleset(ctx context.Context, path string, depth int) (bool, error) {
 	if path == Anchor || strings.HasPrefix(path, Anchor+"/") {
 		return false, nil
 	}
-	if held, ok := w.held[path]; ok {
-		return held, nil
+	if canPass, ok := w.canPass[path]; ok {
+		return canPass, nil
 	}
-	w.held[path] = true
+	w.canPass[path] = true
 	out, err := w.b.pfctl(ctx, nil, "-a", path, "-sr")
 	if err != nil {
 		return false, err
 	}
 	if complained(out.Stderr) {
 		where := "which comes before the ifbound anchor"
-		if !before {
+		if !w.before {
 			where = "so Read cannot look for route rules in it"
 		}
 		w.ps = append(w.ps, voids(fmt.Sprintf("cannot read the rules of the anchor %s, %s: %s", path, where, stderrText(out.Stderr))))
 		return true, nil
 	}
-	held := false
+	canPass := false
 	for _, r := range lines(out.Stdout) {
-		h, err := w.rule(ctx, path, r, before, depth)
+		p, err := w.rule(ctx, path, r, depth)
 		if err != nil {
 			return false, err
 		}
-		held = held || h
+		canPass = canPass || p
 	}
-	w.held[path] = held
-	return held, nil
+	w.canPass[path] = canPass
+	return canPass, nil
 }
 
 // below returns the paths of the anchors directly below the anchor at
-// path, in the order in which a wildcard call evaluates them. An anchor
-// that does not exist has none.
+// path, in the order in which a wildcard call evaluates them. The error
+// wraps pf.ErrNotFound when the anchor does not exist.
 func (w *walk) below(path string) ([]string, error) {
 	names, err := w.b.dev.Anchors(path)
-	if errors.Is(err, pf.ErrNotFound) {
-		return nil, nil
-	}
 	if err != nil {
 		return nil, fmt.Errorf("listing the anchors below %s: %w", path, err)
 	}
