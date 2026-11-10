@@ -48,7 +48,16 @@
 //
 // A route rule of another tool that keeps state is out of reach of these
 // rules: pf passes the routed packet on that state and evaluates no rule
-// for it. The Backend reports such a rule.
+// for it. But the packet passed these rules on its first interface, so a
+// route to an interface that each policy allows cannot leak it. The
+// Backend reads the interface lists of these rules back: the tag anchor
+// rule of only_via lists the allowed interfaces, and the first block rule
+// of only_via and the rule of deny_via list the denied ones. It reports a
+// route rule with state when the rule routes to an interface that a
+// policy does not allow, or when the Backend cannot tell the interface
+// (fastroute). An only_via policy does not allow an interface that is in
+// no list. A change of the form of these rules must keep the Backend able
+// to read the lists.
 //
 // A policy with a scope gets one block rule for its users and one for its
 // groups, with numeric IDs from the account snapshot. pfctl takes no ID

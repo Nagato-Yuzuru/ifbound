@@ -578,6 +578,10 @@ func (k *kernel) flushCmd(p pfctlArgs) (pfbackend.Output, error) {
 func (k *kernel) showCmd(p pfctlArgs) (pfbackend.Output, error) {
 	switch p.show {
 	case "r", "rules":
+		// pf_find_ruleset finds no ruleset, and DIOCGETRULES fails.
+		if p.anchor != "" && !k.exists(p.anchor) {
+			return failure("DIOCGETRULES: Invalid argument")
+		}
 		return stdout(joinLines(k.printed(p.anchor))), nil
 	case "n", "nat":
 		if p.anchor == "" {

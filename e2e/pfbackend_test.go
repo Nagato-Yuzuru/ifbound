@@ -326,6 +326,18 @@ func TestPfBackendRouteRules(t *testing.T) {
 		}
 		requireLeftThrough(t, u, dst.Addr())
 	})
+	// The floating state passes the routed packet on the utun without the
+	// rules. The policy allows the utun, so Read reports no Problem.
+	t.Run("route-to the allowed utun with state", func(t *testing.T) {
+		loadAnchor(t, other, "pass out quick route-to ("+u.Name+" "+dst.Addr().String()+")"+to+" keep state\n")
+		if ps := voiding(t); len(ps) != 0 {
+			t.Errorf("voiding Problems = %v, want none", ps)
+		}
+		if err := udpExchange(t, dst); !errors.Is(err, errNoAnswer) {
+			t.Fatalf("UDP to %s: %v, want no answer (not blocked)", dst, err)
+		}
+		requireLeftThrough(t, u, dst.Addr())
+	})
 	// pf_route evaluates the packet again on the uplink, with the tag
 	// that it got on the utun. The ifbound rules block it there.
 	t.Run("route-to the uplink without state", func(t *testing.T) {

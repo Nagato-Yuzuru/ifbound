@@ -109,6 +109,7 @@ func (r *modelRule) option(w *words) error {
 		r.tag = unquote(w.next())
 	case "label", "flags":
 		w.next()
+	case "round-robin":
 	case "keep", "no":
 		if w.next() != "state" {
 			return fmt.Errorf("cannot evaluate %q", o)
@@ -180,14 +181,22 @@ func (w *words) list() []string {
 	return l
 }
 
-// pool reads the pool of a route option, "(en0 192.0.2.1)" or "en0", and
-// returns its interface.
+// pool reads the pool of a route option, "(en0 192.0.2.1)", "en0", or a
+// list in braces such as "{ (en0 192.0.2.1), (utun4 10.64.0.1) }", and
+// returns the interface of its first member. pf routes the first
+// connection to the first member (round-robin).
 func (w *words) pool() string {
-	first := w.next()
-	for last := first; strings.HasPrefix(first, "(") && !strings.HasSuffix(last, ")") && !w.done(); {
-		last = w.next()
+	braces := w.peek() == "{"
+	if braces {
+		w.next()
 	}
-	return strings.Trim(first, "()")
+	first := w.next()
+	for depth := strings.Count(first, "(") - strings.Count(first, ")"); !w.done() && (depth > 0 || braces); {
+		last := w.next()
+		depth += strings.Count(last, "(") - strings.Count(last, ")")
+		braces = braces && last != "}"
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(first, "("), ",")
 }
 
 func unquote(s string) string { return strings.Trim(s, `"`) }

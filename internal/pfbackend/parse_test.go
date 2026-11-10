@@ -244,6 +244,69 @@ func TestPassQuick(t *testing.T) {
 	}
 }
 
+// ifboundRules are the rules of the ifbound anchor in the form that
+// pfctl prints (print_rule): one rule per interface and per user, and
+// names without quotes. bing allows utun4 and utun5, doh allows no
+// interface, and deny denies en1.
+var ifboundRules = []string{
+	"block return-icmp(port-unr, port-unr) out quick on en0 from any to <bing>",
+	"block return-icmp(port-unr, port-unr) out quick on en1 from any to <bing>",
+	`anchor "tag.bing" out on utun4 from any to <bing> tag ifbound.bing`,
+	`anchor "tag.bing" out on utun5 from any to <bing> tag ifbound.bing`,
+	"block return-icmp(port-unr, port-unr) out quick on ! lo0 from any to <bing> ! tagged ifbound.bing",
+	"block return-icmp(port-unr, port-unr) out quick on en1 from any to <deny> user = 501",
+	"block return-icmp(port-unr, port-unr) out quick on en1 from any to <deny> group = 20",
+	"block return-icmp(port-unr, port-unr) out quick on ! lo0 from any to <doh>",
+	`block drop out quick all tagged ifbound-id label "ifbound-ruleset:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"`,
+	`block drop out quick all tagged ifbound-id label "ifbound-token:13772037947654164677.1793350000.412"`,
+}
+
+func TestUnsafeRoute(t *testing.T) {
+	denyOnly := []string{
+		`block return-icmp(port-unr, port-unr) out quick on { "en1" "en2" } to <"deny">`,
+		`block return-icmp(port-unr, port-unr) out quick on ! "lo0" to <"doh">`,
+	}
+	tests := []struct {
+		name   string
+		rules  []string // the rules of the ifbound anchor
+		route  string
+		unsafe bool
+	}{
+		{"route-to an interface that each policy allows", ifboundRules, "pass out quick route-to (utun4 10.64.0.1) inet all flags S/SA keep state", false},
+		{"route-to an interface without an address", ifboundRules, "pass out route-to utun5 all", false},
+		{"dup-to an allowed interface", ifboundRules, "pass out dup-to (utun4 2001:db8::1) all", false},
+		{"route-to a pool of allowed interfaces", ifboundRules, "pass out route-to { (utun4 10.64.0.1), (utun5 10.64.0.2) } round-robin all", false},
+		{"route-to a pool of allowed interfaces without addresses", ifboundRules, "pass out route-to { utun4, utun5 } round-robin all", false},
+		{"route-to a table on an allowed interface", ifboundRules, "pass out route-to (utun4 <gateways>) round-robin all", false},
+		{"route-to an allowed interface with a denied name in a label", ifboundRules, `pass out route-to (utun4 10.64.0.1) all label "route-to en0"`, false},
+		{"route-to an interface that only_via denies", ifboundRules, "pass out route-to (en0 192.0.2.1) all", true},
+		{"route-to an interface that deny_via denies", ifboundRules, "pass out route-to (en1 192.0.2.1) all", true},
+		{"route-to an interface that no ifbound rule names", ifboundRules, "pass out route-to (utun9 10.64.0.1) all", true},
+		{"route-to lo0, which only_via does not allow", ifboundRules, "pass out route-to lo0 all", true},
+		{"route-to a pool with a denied member", ifboundRules, "pass out route-to { (utun4 10.64.0.1), (en0 192.0.2.1) } round-robin all", true},
+		{"route-to a table without an interface", ifboundRules, "pass out route-to <gateways> all", true},
+		{"route-to a pool without its end", ifboundRules, "pass out route-to { (utun4 10.64.0.1), (utun5 10.64.0.2)", true},
+		{"route-to without a pool", ifboundRules, "pass out route-to", true},
+		{"fastroute", ifboundRules, "pass out fastroute all", true},
+		{"only deny_via: an interface that no policy denies", denyOnly, "pass out route-to (utun9 10.64.0.1) all", false},
+		{"only deny_via: a denied interface", denyOnly, "pass out route-to (en2 192.0.2.1) all", true},
+		{"only deny_via: fastroute", denyOnly, "pass out fastroute all", true},
+		{"no policy limits an interface: fastroute", ifboundRules[7:], "pass out fastroute all", false},
+		{"no ifbound rule: route-to a pool that cannot be read", nil, "pass out route-to <gateways> all", false},
+		{"a pass rule in the ifbound anchor", append([]string{"pass out all"}, ifboundRules...), "pass out route-to utun4 all", true},
+		{"a negated anchor rule in the ifbound anchor", append([]string{`anchor "tag.bing" out on ! en0 from any to <bing> tag ifbound.bing`}, ifboundRules...), "pass out route-to utun4 all", true},
+		{"an anchor rule without a tag in the ifbound anchor", append([]string{`anchor "tag.bing" out on utun4 from any to <bing>`}, ifboundRules...), "pass out route-to utun4 all", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			why := parseIfaceLists(tt.rules).unsafeRoute(ruleWords(tt.route))
+			if got := why != ""; got != tt.unsafe {
+				t.Errorf("unsafeRoute(%q) = %q, want unsafe %v", tt.route, why, tt.unsafe)
+			}
+		})
+	}
+}
+
 func prefixes(ss ...string) []netip.Prefix {
 	out := make([]netip.Prefix, len(ss))
 	for i, s := range ss {
