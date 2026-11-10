@@ -90,18 +90,30 @@ func (u *UTUN) SetAddr(t testing.TB, local, peer netip.Addr) {
 // without the utun header. It fails when no packet arrives before timeout.
 func (u *UTUN) ReadPacket(t testing.TB, timeout time.Duration) []byte {
 	t.Helper()
-	if err := u.file.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		t.Fatalf("set read deadline on %s: %v", u.Name, err)
+	pkt, err := u.NextPacket(time.Now().Add(timeout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pkt
+}
+
+// NextPacket returns the next IP packet that left through the interface,
+// without the utun header. When no packet arrives before deadline, the
+// error wraps os.ErrDeadlineExceeded. A test uses it to show that no
+// packet left.
+func (u *UTUN) NextPacket(deadline time.Time) ([]byte, error) {
+	if err := u.file.SetReadDeadline(deadline); err != nil {
+		return nil, fmt.Errorf("set read deadline on %s: %w", u.Name, err)
 	}
 	buf := make([]byte, 64*1024)
 	n, err := u.file.Read(buf)
 	if err != nil {
-		t.Fatalf("read packet from %s: %v", u.Name, err)
+		return nil, fmt.Errorf("read packet from %s: %w", u.Name, err)
 	}
 	if n < utunHeaderLen {
-		t.Fatalf("read packet from %s: %v (%d bytes)", u.Name, errShortPacket, n)
+		return nil, fmt.Errorf("read packet from %s: %w (%d bytes)", u.Name, errShortPacket, n)
 	}
-	return buf[utunHeaderLen:n]
+	return buf[utunHeaderLen:n], nil
 }
 
 // FethPair is two connected fake Ethernet interfaces. A packet sent out

@@ -180,13 +180,23 @@ func onlyVia(t *testing.T, dst netip.Addr, iface string) []policy.Policy {
 func requireLeftThrough(t *testing.T, u *testnet.UTUN, dst netip.Addr) {
 	t.Helper()
 	pkt := u.ReadPacket(t, 5*time.Second)
-	const ipv4DstOffset = 16
-	if len(pkt) < ipv4DstOffset+4 {
+	got, ok := ipv4Dst(pkt)
+	if !ok {
 		t.Fatalf("packet too short for IPv4: %d bytes", len(pkt))
 	}
-	if got, _ := netip.AddrFromSlice(pkt[ipv4DstOffset : ipv4DstOffset+4]); got != dst {
+	if got != dst {
 		t.Fatalf("packet on %s goes to %s, want %s", u.Name, got, dst)
 	}
+}
+
+// ipv4Dst returns the destination address of an IPv4 packet. It reports
+// false when the packet is too short to hold one.
+func ipv4Dst(pkt []byte) (netip.Addr, bool) {
+	const ipv4DstOffset = 16
+	if len(pkt) < ipv4DstOffset+4 {
+		return netip.Addr{}, false
+	}
+	return netip.AddrFrom4([4]byte(pkt[ipv4DstOffset : ipv4DstOffset+4])), true
 }
 
 // exchange sends one datagram on conn and waits 2 s for an answer or an
