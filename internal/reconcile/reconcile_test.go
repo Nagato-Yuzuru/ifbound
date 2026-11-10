@@ -479,6 +479,59 @@ func TestConvergeNotInstalledWhenTheReadAfterTheLoadFails(t *testing.T) {
 	}
 }
 
+// A table write can also repair a Backend Problem: AddEntries deletes a
+// negated entry inside a prefix that it adds. The Report then gets the
+// Backend Problems of a read after that write, also without a Load.
+func TestConvergeReportsProblemsAfterATableWrite(t *testing.T) {
+	f := installV1(t)
+	id := f.world.Ruleset().ID()
+	f.world.AddNegated("web", netip.MustParsePrefix("198.51.100.9/32"))
+	before, err := f.world.Backend().Read(t.Context())
+	if err != nil || len(before.Problems) != 1 || !before.Problems[0].Voids {
+		t.Fatalf("Read before the convergence = %+v, %v; want one voiding Problem", before.Problems, err)
+	}
+
+	rep := f.converge(t)
+
+	if got := f.world.Ruleset().ID(); got != id {
+		t.Fatalf("the convergence loaded the ruleset %q; the test needs a pass without a Load", got)
+	}
+	if len(rep.Problems) != 0 || rep.Installed != id {
+		t.Errorf("problems = %+v, installed = %q; want no Problem and %q", rep.Problems, rep.Installed, id)
+	}
+	checkTables(t, f.world, tablesV1)
+}
+
+// The read after the writes must find the ruleset of the pass loaded.
+// When another tool loads a ruleset during the pass, the pass installs
+// nothing, also when it loaded the ruleset itself.
+func TestConvergeNotInstalledWhenTheRulesetChangesDuringThePass(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		before func(w *reconciletest.World)
+	}{
+		{"after the load", func(w *reconciletest.World) { w.ExternalLoad([]byte("old rules\n")) }},
+		{"after a table write", func(w *reconciletest.World) { w.FlushTable("web") }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := installV1(t)
+			tt.before(f.world)
+			first := f.world.Writes() + 1
+			f.world.SetAfterWrite(func() {
+				if f.world.Writes() == first {
+					f.world.ExternalLoad([]byte("foreign rules\n"))
+				}
+			})
+
+			rep, err := f.rec.Converge(t.Context(), f.inputs())
+
+			if err == nil || rep.Installed != "" {
+				t.Errorf("err %v, installed %q; want an error and nothing installed", err, rep.Installed)
+			}
+		})
+	}
+}
+
 // noteCompiler wraps the fake Compiler. It reports one problem for each
 // user in its accounts, so a test sees which accounts reached Compile.
 type noteCompiler struct{ reconciletest.Compiler }
