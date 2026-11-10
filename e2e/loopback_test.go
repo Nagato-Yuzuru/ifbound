@@ -75,13 +75,20 @@ func TestLoopbackAnswerDoesNotBlockLocalService(t *testing.T) {
 		Inventory: reconciletest.NewInventory(),
 	}
 
-	if err := udpExchange(t, echo); err != nil {
-		t.Fatalf("UDP to %s before the load: %v, want an answer", echo, err)
-	}
 	load(t, b, compilePolicies(t, loPolicy))
+	// The answer shows that the echo works and that the rule with an
+	// empty table passes lo0. Thus no answer below comes from the entry.
+	if err := udpExchange(t, echo); err != nil {
+		t.Fatalf("UDP to %s with an empty table: %v, want an answer", echo, err)
+	}
 	addEntries(t, b, "e2e-lo", "127.0.0.1/32")
-	if err := udpExchange(t, echo); !errors.Is(err, syscall.ECONNREFUSED) {
-		t.Fatalf("UDP to %s with 127.0.0.1 in the table: %v, want ECONNREFUSED (does pf skip lo0?)", echo, err)
+	// A blocked exchange gets no answer. On the macOS runners the ICMP
+	// reject from pf on lo0 does not get to the client socket, so the
+	// block shows as the end of the 2 s wait in udpExchange: the kernel
+	// drops the packet and gives no event for the drop. Where the reject
+	// does arrive, ECONNREFUSED shows the same block.
+	if err := udpExchange(t, echo); !errors.Is(err, errNoAnswer) && !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("UDP to %s with 127.0.0.1 in the table: %v, want no answer or ECONNREFUSED (does pf skip lo0?)", echo, err)
 	}
 
 	local := []netip.Addr{
