@@ -15,7 +15,18 @@ import (
 
 // The configurations name their interfaces, so the pf ruleset stays the
 // same when these interfaces appear or go away. Only the end of the
-// states can then make the change hold for an existing connection.
+// states can then make the change hold for an existing connection. The
+// pf ruleset of only_via also lists each current interface that the
+// policy does not allow, so it changes when such an interface appears or
+// goes away: the Load then ends the states.
+
+// vpnConfig allows one policy on one named interface.
+const vpnConfig = header + `
+[[policy]]
+name = "vpn"
+to = ["192.0.2.10", "192.0.2.11"]
+only_via = ["utun4"]
+`
 
 // onlyConfig allows each policy on one named interface.
 const onlyConfig = header + `
@@ -106,12 +117,8 @@ func TestConvergeEndsStatesWhenInterfaceChangeNarrows(t *testing.T) {
 		want          []netip.Prefix
 		narrowed      []policy.Name
 	}{
-		// The states of vpn on utun4 can continue on en0. lan denies
-		// no interface now.
-		{"allowed interface goes away", onlyConfig, []reconcile.Interface{en0, utun4}, []reconcile.Interface{en0}, prefixes("192.0.2.10/32", "192.0.2.11/32"), []policy.Name{"vpn"}},
-		// The states of lan on en0 can move to utun4. vpn denies only
-		// en0, as before.
-		{"denied interface appears", onlyConfig, []reconcile.Interface{en0}, []reconcile.Interface{en0, utun4}, prefixes("198.51.100.7/32"), []policy.Name{"lan"}},
+		// The states of vpn on utun4 can continue on en0.
+		{"allowed interface goes away", vpnConfig, []reconcile.Interface{en0, utun4}, []reconcile.Interface{en0}, prefixes("192.0.2.10/32", "192.0.2.11/32"), []policy.Name{"vpn"}},
 		// The states of novpn on en0 can move to utun7. wifi allows
 		// utun7.
 		{"deny_via class gets a listed interface", denyConfig, []reconcile.Interface{en0}, []reconcile.Interface{en0, utun7}, prefixes("203.0.113.5/32"), []policy.Name{"novpn"}},
@@ -193,7 +200,7 @@ only_via = ["@tunnel"]
 // TestConvergeEndsStatesAgainAfterFailure checks that a failed end of the
 // states keeps the old verdict, so the next pass ends them.
 func TestConvergeEndsStatesAgainAfterFailure(t *testing.T) {
-	f := newStatesFixture(t, onlyConfig, en0, utun4)
+	f := newStatesFixture(t, vpnConfig, en0, utun4)
 	first := f.world.Writes() + 1
 	f.world.SetBeforeWrite(func(n int) error {
 		if n == first {
@@ -258,7 +265,7 @@ func TestConvergeCopyStartsAgain(t *testing.T) {
 // to a narrowed policy ends its states once: the add ends them, and the
 // end of the old states does not repeat it.
 func TestConvergeEndsNewEntryOnce(t *testing.T) {
-	f := newStatesFixture(t, onlyConfig, en0, utun4)
+	f := newStatesFixture(t, vpnConfig, en0, utun4)
 	f.in.Hosts = map[policy.Name][]blockable.Addr{"vpn": learned("192.0.2.99")}
 	got := f.change(t, en0)
 	slices.SortFunc(got, netip.Prefix.Compare)
@@ -337,11 +344,11 @@ func TestConvergeAddOnlyEndsStatesToEveryKeptEntry(t *testing.T) {
 		before, after []reconcile.Interface
 		want          []netip.Prefix
 	}{
-		// After a restart, vpn denies en0 and lan denies utun4.
+		// After a restart, vpn denies en0.
 		{"new Reconciler", true, false, []reconcile.Interface{en0, utun4}, []reconcile.Interface{en0, utun4},
-			prefixes("192.0.2.10/32", "192.0.2.11/32", "192.0.2.99/32", "198.51.100.7/32")},
+			prefixes("192.0.2.10/32", "192.0.2.11/32", "192.0.2.99/32")},
 		{"new Reconciler, add-only pass first", true, true, []reconcile.Interface{en0, utun4}, []reconcile.Interface{en0, utun4},
-			prefixes("192.0.2.10/32", "192.0.2.11/32", "192.0.2.99/32", "198.51.100.7/32")},
+			prefixes("192.0.2.10/32", "192.0.2.11/32", "192.0.2.99/32")},
 		// The states of vpn on utun4 can continue on en0.
 		{"allowed interface goes away", false, false, []reconcile.Interface{en0, utun4}, []reconcile.Interface{en0},
 			prefixes("192.0.2.10/32", "192.0.2.11/32", "192.0.2.99/32")},
@@ -350,7 +357,7 @@ func TestConvergeAddOnlyEndsStatesToEveryKeptEntry(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := newStatesFixture(t, onlyConfig, tt.before...)
+			f := newStatesFixture(t, vpnConfig, tt.before...)
 			f.in.Book = book
 			f.converge(t)
 			if tt.fresh {

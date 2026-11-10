@@ -60,10 +60,11 @@ scope    = { users = ["_buildbot"] }
 const rfcExampleRules = `table <"bing"> persist
 table <"build-bot"> persist
 table <"doh-servers"> persist
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" } to <"bing">
 anchor "tag.bing" out on { "utun4" "utun5" } to <"bing"> tag "ifbound.bing"
-block return-icmp(port-unr, port-unr) out quick to <"bing"> ! tagged "ifbound.bing"
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"bing"> ! tagged "ifbound.bing"
 block return-icmp(port-unr, port-unr) out quick on { "en0" "en1" } to <"build-bot"> user { 299 }
-block return-icmp(port-unr, port-unr) out quick to <"doh-servers">
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"doh-servers">
 `
 
 // goldenCase is one compile input and its expected ruleset text and
@@ -82,8 +83,9 @@ var goldenCases = []goldenCase{
 		config: "[[policy]]\nname = \"bing\"\nto = [\"*.bing.com\"]\nonly_via = [\"@tunnel\", \"en7\"]\n",
 		ifaces: hostIfaces,
 		want: `table <"bing"> persist
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" } to <"bing">
 anchor "tag.bing" out on { "en7" "utun4" "utun5" } to <"bing"> tag "ifbound.bing"
-block return-icmp(port-unr, port-unr) out quick to <"bing"> ! tagged "ifbound.bing"
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"bing"> ! tagged "ifbound.bing"
 `,
 	},
 	{
@@ -91,7 +93,16 @@ block return-icmp(port-unr, port-unr) out quick to <"bing"> ! tagged "ifbound.bi
 		config: "[[policy]]\nname = \"doh\"\nto = [\"1.1.1.1\"]\nonly_via = []\n",
 		ifaces: hostIfaces,
 		want: `table <"doh"> persist
-block return-icmp(port-unr, port-unr) out quick to <"doh">
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"doh">
+`,
+	},
+	{
+		name:   "only_via allows each current interface but lo0: no block rule with a list",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"en0\"]\n",
+		ifaces: noTunnels,
+		want: `table <"p"> persist
+anchor "tag.p" out on { "en0" } to <"p"> tag "ifbound.p"
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p"
 `,
 	},
 	{
@@ -107,8 +118,9 @@ block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" } t
 		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"utun*\", \"en?\", \"utun4\"]\n",
 		ifaces: hostIfaces,
 		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" } to <"p">
 anchor "tag.p" out on { "en0" "en1" "utun4" "utun5" } to <"p"> tag "ifbound.p"
-block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p"
 `,
 	},
 	{
@@ -124,8 +136,9 @@ block return-icmp(port-unr, port-unr) out quick on { "en0" "en1" } to <"build-bo
 		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"@tunnel\"]\nscope = { groups = [\"staff\"] }\n",
 		ifaces: hostIfaces,
 		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" } to <"p"> group { 20 }
 anchor "tag.p" out on { "utun4" "utun5" } to <"p"> tag "ifbound.p"
-block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p" group { 20 }
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p" group { 20 }
 `,
 	},
 	{
@@ -133,8 +146,8 @@ block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p" gr
 		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = []\nscope = { users = [\"daemon\"], groups = [\"wheel\", \"staff\"] }\n",
 		ifaces: hostIfaces,
 		want: `table <"p"> persist
-block return-icmp(port-unr, port-unr) out quick to <"p"> user { 1 }
-block return-icmp(port-unr, port-unr) out quick to <"p"> group { 0 20 }
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> user { 1 }
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> group { 0 20 }
 `,
 	},
 	{
@@ -154,9 +167,11 @@ block return-icmp(port-unr, port-unr) out quick on { "en0" } to <"q"> user { 0 }
 		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"@tunnel\"]\nscope = { users = [\"nobody\"], groups = [\"staff\", \"nobody\"] }\n",
 		ifaces: hostIfaces,
 		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" } to <"p"> user { > 2147483646 }
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" } to <"p"> group { 20 > 2147483646 }
 anchor "tag.p" out on { "utun4" "utun5" } to <"p"> tag "ifbound.p"
-block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p" user { > 2147483646 }
-block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p" group { 20 > 2147483646 }
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p" user { > 2147483646 }
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p" group { 20 > 2147483646 }
 `,
 	},
 	{
@@ -172,7 +187,7 @@ block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p" gr
 		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"@tunnel\", \"utun*\"]\n",
 		ifaces: noTunnels,
 		want: `table <"p"> persist
-block return-icmp(port-unr, port-unr) out quick to <"p">
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p">
 `,
 	},
 	{
@@ -187,7 +202,7 @@ block return-icmp(port-unr, port-unr) out quick to <"p">
 		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"@hardware\"]\n",
 		ifaces: nil,
 		want: `table <"p"> persist
-block return-icmp(port-unr, port-unr) out quick to <"p">
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p">
 `,
 	},
 	{
@@ -195,8 +210,9 @@ block return-icmp(port-unr, port-unr) out quick to <"p">
 		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"@tunnel\"]\n",
 		ifaces: append(slices.Clone(hostIfaces), reconcile.Interface{Name: `en9" all`, Class: policy.ClassHardware}),
 		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" } to <"p">
 anchor "tag.p" out on { "utun4" "utun5" } to <"p"> tag "ifbound.p"
-block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p"
 `,
 	},
 	{
@@ -204,8 +220,9 @@ block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
 		config: "[[policy]]\nname = \"any\"\nto = [\"a.com\"]\nonly_via = [\"all\"]\n",
 		ifaces: hostIfaces,
 		want: `table <"any"> persist
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" "utun4" "utun5" } to <"any">
 anchor "tag.any" out on { "all" } to <"any"> tag "ifbound.any"
-block return-icmp(port-unr, port-unr) out quick to <"any"> ! tagged "ifbound.any"
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"any"> ! tagged "ifbound.any"
 `,
 	},
 	{
@@ -235,8 +252,9 @@ block return-icmp(port-unr, port-unr) out quick on { "ppp0" "utun4" "utun5" } to
 		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"@tunnel\"]\n",
 		ifaces: pppHost,
 		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" "ppp0" } to <"p">
 anchor "tag.p" out on { "utun4" "utun5" } to <"p"> tag "ifbound.p"
-block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p"
 `,
 	},
 	{
@@ -244,8 +262,9 @@ block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
 		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\nonly_via = [\"@hardware\"]\n",
 		ifaces: pppHost,
 		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "ppp0" "utun4" "utun5" } to <"p">
 anchor "tag.p" out on { "en0" "en1" } to <"p"> tag "ifbound.p"
-block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p"
 `,
 	},
 	{
@@ -254,10 +273,12 @@ block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
 		ifaces: pppHost,
 		want: `table <"p"> persist
 table <"q"> persist
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" } to <"p">
 anchor "tag.p" out on { "ppp0" "utun4" "utun5" } to <"p"> tag "ifbound.p"
-block return-icmp(port-unr, port-unr) out quick to <"p"> ! tagged "ifbound.p"
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p"
+block return-icmp(port-unr, port-unr) out quick on { "bridge100" "en0" "en1" "utun4" "utun5" } to <"q">
 anchor "tag.q" out on { "ppp0" } to <"q"> tag "ifbound.q"
-block return-icmp(port-unr, port-unr) out quick to <"q"> ! tagged "ifbound.q"
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"q"> ! tagged "ifbound.q"
 `,
 	},
 	{
@@ -379,7 +400,7 @@ func TestCompileNameLimits(t *testing.T) {
 	longest := strings.Repeat("n", maxTableName)
 	got := compileText(t, []policy.Policy{{Name: policy.Name(longest), Constraint: only}}, nil)
 	want := `table <"` + longest + `"> persist
-block return-icmp(port-unr, port-unr) out quick to <"` + longest + `">
+block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"` + longest + `">
 `
 	if got != want {
 		t.Errorf("31-byte name\n got:\n%s\nwant:\n%s", got, want)

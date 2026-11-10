@@ -29,8 +29,8 @@ const anchorStack = 64
 //   - a filter rule decides packets before the ifbound rules: a rule that
 //     passes packets quick, or a quick anchor rule that calls an anchor
 //     with a pass rule or a wildcard call, or that is a wildcard call;
-//   - a filter rule routes packets to an interface (route-to, reply-to,
-//     dup-to, fastroute), before or after the ifbound anchor;
+//   - a filter rule routes packets to an interface (route-to, dup-to,
+//     fastroute) and keeps state, before or after the ifbound anchor;
 //   - a NAT rule passes the packets that it translates ("nat pass",
 //     "binat pass"), so pf evaluates no filter rule for them;
 //   - "set skip" covers an interface other than a loopback interface, so
@@ -116,11 +116,15 @@ func (b *Backend) ruleProblems(ctx context.Context) ([]reconcile.Problem, error)
 //     call sets that flag from the flag of each anchor below, and pf
 //     keeps the flag of an anchor across packets. So an earlier packet
 //     can end the evaluation, also when no rule matches this packet;
-//   - at each position, a rule that routes packets (route-to, reply-to,
-//     dup-to, fastroute). pf evaluates a routed packet again on the new
-//     interface, and the packet keeps the tag that the ifbound rules gave
-//     it on the first interface (pf.c: pf_route). This also reports a
-//     rule that routes inbound packets only, which is the safe direction.
+//   - at each position, a rule that routes packets (route-to, dup-to,
+//     fastroute) and keeps state. pf creates the state before it routes
+//     the packet, and on the new interface the floating state passes the
+//     packet without the rules (pf.c: pf_test_rule, pf_route,
+//     pf_find_state). Without state, pf evaluates the rules again on the
+//     new interface, and the ifbound rules block the packet there. This
+//     also reports a rule that routes inbound packets only, or that routes
+//     to an interface that each policy allows, which is the safe
+//     direction.
 //
 // The walk reads each anchor one time. It does not go into the ifbound
 // anchor: Read checks its rules through the ruleset ID, and parseRules
@@ -153,8 +157,8 @@ func (w *walk) rule(ctx context.Context, path, rule string, depth int) (bool, er
 		where = "the anchor " + path
 	}
 	words := ruleWords(rule)
-	if routes(words) {
-		w.ps = append(w.ps, voids(fmt.Sprintf("the rule %q in %s routes packets to an interface; pf evaluates them again there and they keep their tags, so they can go around the ifbound rules", rule, where)))
+	if routesWithState(words) {
+		w.ps = append(w.ps, voids(fmt.Sprintf("the rule %q in %s routes packets to an interface and keeps state; pf passes a routed packet on that state and evaluates no ifbound rule for it", rule, where)))
 	}
 	if before && passQuick(words) {
 		w.ps = append(w.ps, voids(fmt.Sprintf("the rule %q in %s comes before the ifbound anchor and passes packets quick", rule, where)))

@@ -62,6 +62,9 @@ type kernel struct {
 	states []netip.Addr
 	// ifaces are the lines of "pfctl -sI -v".
 	ifaces []string
+	// uplink is the interface of the route that the routing table gives
+	// for each destination, where fastroute sends a packet.
+	uplink string
 
 	// fail makes a call fail when it returns true.
 	fail func(args []string) bool
@@ -93,6 +96,7 @@ func newKernel() *kernel {
 		now:         time.Now,
 		pid:         4242,
 		ifaces:      []string{"ALL", "en0", "lo0", "utun4"},
+		uplink:      "en0",
 	}
 }
 

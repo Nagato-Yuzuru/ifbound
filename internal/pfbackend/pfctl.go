@@ -340,13 +340,23 @@ func callTarget(from, call string) (path string, wildcard bool) {
 	return strings.TrimSuffix(path, "/"), wildcard
 }
 
-// routes reports whether a rule with the words that ruleWords gives
-// routes packets to an interface: it has a route option (route-to,
-// reply-to, dup-to, fastroute).
-func routes(words []string) bool {
-	return slices.ContainsFunc(words, func(w string) bool {
-		return w == "route-to" || w == "reply-to" || w == "dup-to" || w == "fastroute"
+// routesWithState reports whether a rule with the words that ruleWords
+// gives routes packets to an interface (route-to, dup-to, fastroute) and
+// keeps state: pfctl prints "no state" for a rule without state.
+// reply-to is not in the list: pf routes with it only the packets of the
+// other direction than the rule, and for an outbound packet that is the
+// state of an inbound connection, which passes the packet on each
+// interface also without the route.
+func routesWithState(words []string) bool {
+	routes := slices.ContainsFunc(words, func(w string) bool {
+		return w == "route-to" || w == "dup-to" || w == "fastroute"
 	})
+	for i := 1; routes && i < len(words); i++ {
+		if words[i-1] == "no" && words[i] == "state" {
+			return false
+		}
+	}
+	return routes
 }
 
 // natPass reports whether a NAT rule that pfctl printed passes the

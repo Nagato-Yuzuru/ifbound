@@ -1,6 +1,7 @@
 package pfrules_test
 
 import (
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"regexp"
@@ -16,16 +17,17 @@ import (
 // The pools of TestSelectedMatchesRuleText. They differ from the pools
 // of property_test.go on purpose.
 var (
-	selIfacePool    = []string{"en0", "en1", "en5", "utun0", "utun4", "utun12", "ppp0", "bridge0", "gif0"}
+	selIfacePool    = []string{"en0", "en1", "en5", "utun0", "utun4", "utun12", "ppp0", "bridge0", "gif0", "lo0"}
 	selSelectorPool = []string{"en0", "en1", "utun4", "ppp0", "utun*", "en?", "*0", "ppp*", "[eu]*", "@tunnel", "@hardware"}
 	// anchorLine is the rule of only_via that lists the allowed
 	// interfaces.
 	anchorLine = regexp.MustCompile(`^anchor "tag\.([^"]+)" out on \{ ([^}]*) \} to <"([^"]+)"> tag `)
-	// denyLine is a block rule of deny_via that lists the denied
-	// interfaces.
+	// denyLine is a block rule that lists the denied interfaces: of
+	// deny_via, or the first rule of only_via.
 	denyLine = regexp.MustCompile(`^block return-icmp\([^)]*\) out quick on \{ ([^}]*) \} to <"([^"]+)">`)
-	// blockAll is a block rule of only_via.
-	blockAll = regexp.MustCompile(`^block return-icmp\([^)]*\) out quick to <"([^"]+)">`)
+	// blockAll is the block rule of only_via for each interface except
+	// lo0.
+	blockAll = regexp.MustCompile(`^block return-icmp\([^)]*\) out quick on ! lo0 to <"([^"]+)">`)
 )
 
 // listNames returns the names in a pf list body, sorted and once each.
@@ -82,26 +84,39 @@ func randomSelConfig(r *rand.Rand) string {
 	return b.String()
 }
 
-// ruleLists returns, for each table, the interfaces that the rules list,
-// and the tables that a block rule without "on" refers to.
-func ruleLists(body []byte) (map[string][]string, map[string]bool, error) {
-	listed := map[string][]string{}
+// lists holds, for each table, the interfaces that the anchor rules
+// list, the interfaces that the block rules list, and whether a block
+// rule on each interface except lo0 refers to the table.
+type lists struct {
+	tagged, denied map[string][]string
+	blocksAll      map[string]bool
+}
+
+// ruleLists reads the lists of the rules in body.
+func ruleLists(body []byte) (lists, error) {
+	tagged := map[string][]string{}
+	denied := map[string][]string{}
 	blocksAll := map[string]bool{}
 	for line := range strings.SplitSeq(string(body), "\n") {
 		if m := anchorLine.FindStringSubmatch(line); m != nil {
 			if m[1] != m[3] {
-				return nil, nil, fmt.Errorf("the anchor rule of %s refers to table %s", m[1], m[3])
+				return lists{}, fmt.Errorf("the anchor rule of %s refers to table %s", m[1], m[3])
 			}
-			listed[m[1]] = append(listed[m[1]], listNames(m[2])...)
+			tagged[m[1]] = append(tagged[m[1]], listNames(m[2])...)
 		}
 		if m := denyLine.FindStringSubmatch(line); m != nil {
-			listed[m[2]] = append(listed[m[2]], listNames(m[1])...)
+			denied[m[2]] = append(denied[m[2]], listNames(m[1])...)
 		}
 		if m := blockAll.FindStringSubmatch(line); m != nil {
 			blocksAll[m[1]] = true
 		}
 	}
-	return listed, blocksAll, nil
+	return lists{tagged, denied, blocksAll}, nil
+}
+
+// sortedOnce returns the names sorted and once each.
+func sortedOnce(names []string) []string {
+	return slices.Compact(slices.Sorted(slices.Values(names)))
 }
 
 // compileRandom compiles a random configuration on random interfaces,
@@ -127,32 +142,66 @@ func compileRandom(t *testing.T, seed uint64) (policy.Config, []reconcile.Interf
 }
 
 // TestSelectedMatchesRuleText reads the interface lists from the compiled
-// pf text and compares them with Ruleset.Selected. It uses no code of the
-// Compiler and not the model of property_test.go.
+// pf text and compares them with Ruleset.Selected: the anchor rule lists
+// the selection of only_via, and the block rule lists the selection of
+// deny_via. The block rule of only_via lists each other interface of the
+// inventory, also one with an uncertain class, except lo0. It uses no
+// code of the Compiler and not the model of property_test.go.
 func TestSelectedMatchesRuleText(t *testing.T) {
 	for seed := range uint64(3000) {
 		cfg, ifaces, rs := compileRandom(t, seed)
-		listed, blocksAll, err := ruleLists(rs.Body())
+		l, err := ruleLists(rs.Body())
 		if err != nil {
 			t.Fatalf("seed %d: %v", seed, err)
 		}
 		for _, p := range cfg.Policies {
-			name := string(p.Name)
-			sel, ok := rs.Selected(p.Name)
-			if !ok {
-				t.Fatalf("seed %d: no selection for %s", seed, name)
-			}
-			slices.Sort(sel)
-			want := slices.Sorted(slices.Values(listed[name]))
-			want = slices.Compact(want)
-			if !slices.Equal(sel, want) {
-				t.Fatalf("seed %d: policy %s: Selected = %v, the rules list %v\nifaces %v\n%s", seed, name, sel, want, ifaces, rs.Body())
-			}
-			// Without a block rule, the list of only_via above would not
-			// be the whole verdict.
-			if _, only := p.Constraint.(policy.OnlyVia); only && !blocksAll[name] {
-				t.Fatalf("seed %d: only_via policy %s has no block rule", seed, name)
+			if err := l.check(p, rs, ifaces); err != nil {
+				t.Fatalf("seed %d: policy %s: %v\nifaces %v\n%s", seed, p.Name, err, ifaces, rs.Body())
 			}
 		}
 	}
+}
+
+// check compares the lists of the policy p with the selection in rs.
+func (l lists) check(p policy.Policy, rs reconcile.Ruleset, ifaces []reconcile.Interface) error {
+	name := string(p.Name)
+	sel, ok := rs.Selected(p.Name)
+	if !ok {
+		return errors.New("no selection")
+	}
+	slices.Sort(sel)
+	_, only := p.Constraint.(policy.OnlyVia)
+	want := sortedOnce(l.denied[name])
+	if only {
+		want = sortedOnce(l.tagged[name])
+	}
+	if !slices.Equal(sel, want) {
+		return fmt.Errorf("Selected = %v, the rules list %v", sel, want)
+	}
+	if !only {
+		return nil
+	}
+	// Without a block rule, the list of only_via above would not be the
+	// whole verdict.
+	if !l.blocksAll[name] {
+		return errors.New("only_via without a block rule")
+	}
+	if got, want := sortedOnce(l.denied[name]), deniedByOnlyVia(sel, ifaces); !slices.Equal(got, want) {
+		return fmt.Errorf("the block rule lists %v, want %v", got, want)
+	}
+	return nil
+}
+
+// deniedByOnlyVia returns the interfaces that the block rule of an
+// only_via policy with the selection sel lists: each interface of ifaces
+// that sel does not hold, except lo0. With no allowed interface, the
+// block rule on each interface except lo0 is the only rule.
+func deniedByOnlyVia(sel []string, ifaces []reconcile.Interface) []string {
+	var out []string
+	for _, i := range ifaces {
+		if len(sel) > 0 && i.Name != "lo0" && !slices.Contains(sel, i.Name) {
+			out = append(out, i.Name)
+		}
+	}
+	return sortedOnce(out)
 }

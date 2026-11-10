@@ -290,6 +290,90 @@ func TestPfBackendBlocksOnPhysicalInterface(t *testing.T) {
 	}
 }
 
+// TestPfBackendRouteRules checks route rules of another tool in an anchor
+// that pf evaluates after the ifbound anchor. The policy allows only a
+// test utun, and the inventory of the compile also holds the uplink (the
+// interface of the default route). The destination is the peer of the
+// utun, so each packet starts on the utun, where the ifbound anchor tags
+// it.
+func TestPfBackendRouteRules(t *testing.T) {
+	b, _ := newPfBackend(t)
+	u := testnet.NewUTUN(t)
+	// 198.18.0.0/15 is for benchmark tests (RFC 2544): no real host
+	// answers.
+	u.SetAddr(t, netip.MustParseAddr("198.18.24.1"), netip.MustParseAddr("198.18.24.2"))
+	dst := netip.MustParseAddrPort("198.18.24.2:9")
+	uplink, gateway := defaultRoute(t)
+	config := "[[policy]]\nname = \"e2e-route\"\nto = [\"" + dst.Addr().String() + "\"]\nonly_via = [\"" + u.Name + "\"]\n"
+	load(t, b, compilePolicies(t, config,
+		reconcile.Interface{Name: u.Name, Class: policy.ClassTunnel},
+		reconcile.Interface{Name: uplink, Class: policy.ClassHardware}))
+	addEntries(t, b, "e2e-route", dst.Addr().String()+"/32")
+	const other = "com.apple/900.ifbound-e2e"
+	voiding := func(t *testing.T) []reconcile.Problem {
+		t.Helper()
+		return slices.DeleteFunc(readState(t, b).Problems, func(p reconcile.Problem) bool { return !p.Voids })
+	}
+	to := " inet proto udp to " + dst.Addr().String()
+
+	t.Run("route-to the allowed utun, as a VPN client does", func(t *testing.T) {
+		loadAnchor(t, other, "pass out quick route-to ("+u.Name+" "+dst.Addr().String()+")"+to+" no state\n")
+		if ps := voiding(t); len(ps) != 0 {
+			t.Errorf("voiding Problems = %v, want none", ps)
+		}
+		if err := udpExchange(t, dst); !errors.Is(err, errNoAnswer) {
+			t.Fatalf("UDP to %s: %v, want no answer (not blocked)", dst, err)
+		}
+		requireLeftThrough(t, u, dst.Addr())
+	})
+	// pf_route evaluates the packet again on the uplink, with the tag
+	// that it got on the utun. The ifbound rules block it there.
+	t.Run("route-to the uplink without state", func(t *testing.T) {
+		loadAnchor(t, other, "pass out route-to ("+uplink+" "+gateway+")"+to+" no state\n")
+		if ps := voiding(t); len(ps) != 0 {
+			t.Errorf("voiding Problems = %v, want none", ps)
+		}
+		if err := udpExchange(t, dst); !errors.Is(err, syscall.ECONNREFUSED) {
+			t.Errorf("UDP to %s routed to %s: %v, want ECONNREFUSED", dst, uplink, err)
+		}
+	})
+	// pf creates the state before it routes the packet. On the uplink the
+	// floating state passes the packet without the rules, so Read reports
+	// the rule.
+	t.Run("route-to the uplink with state", func(t *testing.T) {
+		loadAnchor(t, other, "pass out route-to ("+uplink+" "+gateway+")"+to+" keep state\n")
+		if ps := voiding(t); !slices.ContainsFunc(ps, func(p reconcile.Problem) bool { return strings.Contains(p.Text, "keeps state") }) {
+			t.Errorf("voiding Problems = %v, want one for the route rule with state", ps)
+		}
+		if err := udpExchange(t, dst); !errors.Is(err, errNoAnswer) {
+			t.Errorf("UDP to %s routed to %s: %v, want no answer (the state passes it)", dst, uplink, err)
+		}
+	})
+}
+
+// defaultRoute returns the interface and the gateway of the default
+// route.
+func defaultRoute(t *testing.T) (iface, gateway string) {
+	t.Helper()
+	out, err := exec.CommandContext(t.Context(), "route", "-n", "get", "default").CombinedOutput()
+	if err != nil {
+		t.Fatalf("route -n get default: %v: %s", err, out)
+	}
+	for line := range strings.Lines(string(out)) {
+		key, value, _ := strings.Cut(strings.TrimSpace(line), ": ")
+		switch key {
+		case "interface":
+			iface = value
+		case "gateway":
+			gateway = value
+		}
+	}
+	if iface == "" || gateway == "" {
+		t.Fatalf("no default route with a gateway:\n%s", out)
+	}
+	return iface, gateway
+}
+
 var errNoAnswer = errors.New("no answer before the deadline")
 
 // udpExchange sends one datagram on a connected UDP socket and waits 2 s

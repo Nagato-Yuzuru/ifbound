@@ -251,11 +251,11 @@ func escapes(t *testing.T, k *kernel) bool {
 }
 
 // A rule of another tool that decides a packet before the ifbound rules,
-// or that routes a packet to another interface, voids the ifbound rules.
-// pf finds the rules through the anchor calls: absolute, relative, and
-// wildcard calls, and also calls out of the subtree of an anchor. The
-// kernel model evaluates each case, so each case shows that pf passes a
-// protected packet, or that it does not.
+// or that routes a packet to another interface and keeps state, voids the
+// ifbound rules. pf finds the rules through the anchor calls: absolute,
+// relative, and wildcard calls, and also calls out of the subtree of an
+// anchor. The kernel model evaluates each case, so each case shows that
+// pf passes a protected packet, or that it does not.
 func TestRulesAroundTheAnchorVoid(t *testing.T) {
 	const passQuick, pass = "pass out quick all no state", "pass out all no state"
 	tests := []struct {
@@ -320,14 +320,45 @@ func TestRulesAroundTheAnchorVoid(t *testing.T) {
 			k.mainRules = append(k.mainRules, `anchor "late" all`)
 			k.rules["late"] = []string{"pass out dup-to (en0 192.0.2.1) all"}
 		}, true, `"pass out dup-to (en0 192.0.2.1) all" in the anchor late`},
-		// A route rule voids also when the model shows no way around the
-		// ifbound rules: the check stays on the safe side.
+		{"fastroute in a later com.apple anchor", func(k *kernel) {
+			k.rules["com.apple/300.vpn"] = []string{"pass out fastroute all"}
+		}, true, `"pass out fastroute all" in the anchor com.apple/300.vpn`},
+		// A route rule with state voids also when the model shows no way
+		// around the ifbound rules: the check stays on the safe side.
 		{"route-to for inbound packets only", func(k *kernel) {
 			k.rules["com.apple/300.vpn"] = []string{"pass in route-to (en0 192.0.2.1) all"}
 		}, false, `"pass in route-to (en0 192.0.2.1) all" in the anchor com.apple/300.vpn`},
-		{"reply-to", func(k *kernel) {
+		{"route-to to the allowed utun, as a VPN client does", func(k *kernel) {
+			k.rules["com.apple/300.vpn"] = []string{"pass out quick route-to (utun4 10.64.0.1) all"}
+		}, false, `"pass out quick route-to (utun4 10.64.0.1) all" in the anchor com.apple/300.vpn`},
+		// Without state, pf evaluates the routed packet again on the new
+		// interface, and the ifbound rules block it there.
+		{"route-to without state in a later com.apple anchor", func(k *kernel) {
+			k.rules["com.apple/300.vpn"] = []string{"pass out route-to (en0 192.0.2.1) all no state"}
+		}, false, ""},
+		{"route-to without state in the main ruleset after the com.apple anchor", func(k *kernel) {
+			k.mainRules = append(k.mainRules, "pass out route-to (en0 192.0.2.1) all no state")
+		}, false, ""},
+		{"dup-to without state in an anchor that the main ruleset calls after the com.apple anchor", func(k *kernel) {
+			k.mainRules = append(k.mainRules, `anchor "late" all`)
+			k.rules["late"] = []string{"pass out dup-to (en0 192.0.2.1) all no state"}
+		}, false, ""},
+		{"fastroute without state in a later com.apple anchor", func(k *kernel) {
+			k.rules["com.apple/300.vpn"] = []string{"pass out fastroute all no state"}
+		}, false, ""},
+		{"route-to without state to the allowed utun, as a VPN client does", func(k *kernel) {
+			k.rules["com.apple/300.vpn"] = []string{"pass out quick route-to (utun4 10.64.0.1) all no state"}
+		}, false, ""},
+		// pf routes with reply-to only the packets of the other direction.
+		// An outbound packet comes to an inbound reply-to rule only on the
+		// state of an inbound connection, which passes it on each
+		// interface also without the route.
+		{"reply-to of an outbound rule", func(k *kernel) {
 			k.rules["com.apple/300.vpn"] = []string{"pass out reply-to (en0 192.0.2.1) all"}
-		}, false, `"pass out reply-to (en0 192.0.2.1) all" in the anchor com.apple/300.vpn`},
+		}, false, ""},
+		{"reply-to of an inbound rule", func(k *kernel) {
+			k.rules["com.apple/300.vpn"] = []string{"pass in reply-to (en0 192.0.2.1) all"}
+		}, false, ""},
 		{"near miss: anchor without quick before the com.apple anchor", func(k *kernel) {
 			k.mainRules = slices.Insert(k.mainRules, 0, `anchor "vpn" all`)
 			k.rules["vpn"] = []string{pass}
@@ -376,6 +407,59 @@ func TestRulesAroundTheAnchorVoid(t *testing.T) {
 			found := slices.ContainsFunc(got, func(p reconcile.Problem) bool { return strings.Contains(p.Text, tt.want) })
 			if tt.want == "" && len(got) != 0 || tt.want != "" && !found {
 				t.Errorf("voiding Problems = %+v, want one with %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// The rules that pfrules compiles hold in the kernel model also when a
+// rule of another tool routes a tagged packet to another interface, or
+// sets the tag of a policy before the ifbound anchor. No ifbound rule
+// blocks lo0, also for a destination in 127.0.0.0/8. utun9 is an
+// interface that appeared after the compile.
+func TestCompiledRulesHoldInTheKernelModel(t *testing.T) {
+	const local = "[[policy]]\nname = \"local\"\nto = [\"127.0.0.0/8\"]\nonly_via = [\"@tunnel\"]\n"
+	later := func(rule string) func(k *kernel) {
+		return func(k *kernel) { k.rules["com.apple/300.vpn"] = []string{rule} }
+	}
+	forge := func(k *kernel) { k.rules["com.apple/000.aaa"] = []string{"pass out all tag ifbound.bing no state"} }
+	tests := []struct {
+		name       string
+		change     func(k *kernel)
+		dst, iface string
+		want       []string // the interfaces that the packet leaves on
+	}{
+		{"allowed interface", nil, "bing", "utun4", []string{"utun4"}},
+		{"denied interface", nil, "bing", "en0", nil},
+		{"route-to from the allowed utun to en0", later("pass out route-to (en0 192.0.2.1) all no state"), "bing", "utun4", nil},
+		{"dup-to from the allowed utun to en0", later("pass out dup-to (en0 192.0.2.1) all no state"), "bing", "utun4", []string{"utun4"}},
+		{"fastroute from the allowed utun to the uplink en0", later("pass out fastroute all no state"), "bing", "utun4", nil},
+		{"reply-to of an outbound rule routes no outbound packet", later("pass out reply-to (en0 192.0.2.1) all no state"), "bing", "utun4", []string{"utun4"}},
+		{"route-to to the allowed utun", later("pass out quick route-to (utun4 10.64.0.1) all no state"), "bing", "utun4", []string{"utun4"}},
+		{"tag of the policy from a rule before the anchor, on en0", forge, "bing", "en0", nil},
+		{"tag of the policy from a rule before the anchor, on lo0", forge, "bing", "lo0", []string{"lo0"}},
+		{"loopback destination on lo0", nil, "local", "lo0", []string{"lo0"}},
+		{"loopback destination on en0", nil, "local", "en0", nil},
+		{"empty only_via on lo0", nil, "doh", "lo0", []string{"lo0"}},
+		{"empty only_via on the allowed utun", nil, "doh", "utun4", nil},
+		{"new interface", nil, "bing", "utun9", nil},
+		// The documented gaps. Read reports a route rule with state.
+		{"gap: route-to with state passes on the state", later("pass out route-to (en0 192.0.2.1) all"), "bing", "utun4", []string{"en0"}},
+		{"gap: tag of the policy on a new interface, until the next compile", forge, "bing", "utun9", []string{"utun9"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := newRig(t)
+			mustLoad(t, r, compileRS(t, testPolicies+local))
+			if tt.change != nil {
+				tt.change(r.k)
+			}
+			got, err := r.k.send(tt.dst, tt.iface)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("a packet to %s on %s leaves on %v, want %v", tt.dst, tt.iface, got, tt.want)
 			}
 		})
 	}
