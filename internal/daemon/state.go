@@ -22,8 +22,10 @@ type State uint8
 
 // The lifecycle states. The zero State is StateStarting.
 const (
-	// StateStarting: the snapshot is not loaded. The daemon writes
-	// nothing to the platform and acknowledges no report.
+	// StateStarting: the snapshot is not loaded. The daemon acknowledges
+	// no report. With a configuration, it loads the ruleset and adds the
+	// entries that need no snapshot, but it removes no table entry that
+	// blockable.New accepts.
 	StateStarting State = iota
 	// StateReady: the ruleset for the current configuration and
 	// interfaces is installed, and nothing reports a problem.
@@ -149,8 +151,9 @@ type mode interface{ isMode() }
 type unconfiguredMode struct{ phase waitPhase }
 
 // loadingMode: the daemon has a configuration, but no load of the
-// snapshot succeeded yet. It does not converge: an empty book would
-// remove every learned address.
+// snapshot succeeded yet. It converges add-only: without the book, a
+// removal could unblock an acknowledged address. Its phase does not
+// acknowledge reports.
 type loadingMode struct {
 	conf activeConfig
 	// retain is the retain of the book to load. The first configuration

@@ -315,3 +315,63 @@ deny_via = ["en1"]
 		})
 	}
 }
+
+// bookOf is an AddrSource with fixed addresses.
+type bookOf map[policy.Name][]blockable.Addr
+
+func (b bookOf) Addrs(name policy.Name) []blockable.Addr { return b[name] }
+
+// TestConvergeAddOnlyEndsStatesToEveryKeptEntry checks that an add-only
+// pass that ends the states of a narrowed policy ends them to every entry
+// that its table keeps. The book of that pass is empty, so an entry that
+// the pass does not desire can be an acknowledged address. The next pass
+// with the book finds no narrowing, so it does not end these states. The
+// entries whose states end in the two passes together are the same as
+// without the add-only pass.
+func TestConvergeAddOnlyEndsStatesToEveryKeptEntry(t *testing.T) {
+	book := bookOf{"vpn": learned("192.0.2.99")}
+	tests := []struct {
+		name          string
+		fresh         bool
+		addOnly       bool
+		before, after []reconcile.Interface
+		want          []netip.Prefix
+	}{
+		// After a restart, vpn denies en0 and lan denies utun4.
+		{"new Reconciler", true, false, []reconcile.Interface{en0, utun4}, []reconcile.Interface{en0, utun4},
+			prefixes("192.0.2.10/32", "192.0.2.11/32", "192.0.2.99/32", "198.51.100.7/32")},
+		{"new Reconciler, add-only pass first", true, true, []reconcile.Interface{en0, utun4}, []reconcile.Interface{en0, utun4},
+			prefixes("192.0.2.10/32", "192.0.2.11/32", "192.0.2.99/32", "198.51.100.7/32")},
+		// The states of vpn on utun4 can continue on en0.
+		{"allowed interface goes away", false, false, []reconcile.Interface{en0, utun4}, []reconcile.Interface{en0},
+			prefixes("192.0.2.10/32", "192.0.2.11/32", "192.0.2.99/32")},
+		{"allowed interface goes away, add-only pass first", false, true, []reconcile.Interface{en0, utun4}, []reconcile.Interface{en0},
+			prefixes("192.0.2.10/32", "192.0.2.11/32", "192.0.2.99/32")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newStatesFixture(t, onlyConfig, tt.before...)
+			f.in.Book = book
+			f.converge(t)
+			if tt.fresh {
+				f.rec = reconcile.Reconciler{Compiler: pfrules.Compiler{}, Backend: f.world.Backend(), Resolver: f.world.Resolver(), Inventory: f.inv}
+			}
+			mark, id := len(f.world.EndedStates()), f.world.Ruleset().ID()
+			f.inv.Set(tt.after...)
+			if tt.addOnly {
+				f.in = reconcile.Inputs{Policies: f.in.Policies, Book: noAddrs{}, AddOnly: true}
+				f.converge(t)
+				f.in.Book, f.in.AddOnly = book, false
+			}
+			f.converge(t)
+			if f.world.Ruleset().ID() != id {
+				t.Fatalf("the ruleset changed; the test needs a change that keeps it")
+			}
+			got := f.world.EndedStates()[mark:]
+			slices.SortFunc(got, netip.Prefix.Compare)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("ended states = %v, want %v, each once", got, tt.want)
+			}
+		})
+	}
+}

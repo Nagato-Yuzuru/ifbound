@@ -427,17 +427,13 @@ func (rg *rig) checkConvergedState(after string) {
 	switch {
 	case (rg.f.voids || disabled) && st.State != daemon.StateUnenforced:
 		rg.fatalf("a voiding problem (disabled firewall %v), but state %v after %s", disabled, st.State, after)
-	case rg.f.disabled && !disabled && !rg.f.voids && st.State == daemon.StateUnenforced &&
-		slices.Contains(st.Reasons, reconciletest.DisabledText):
-		// Known behavior: the convergence whose Load enables the
-		// firewall again still reports the Problem that it read before
-		// the Load, next to the reasons that do not void enforcement.
-		// The next convergence clears it, and the firewall was disabled
-		// when this event started, so only that one convergence gets
-		// this exception.
-		rg.stats["stale disabled problem"]++
 	case !rg.f.voids && !rg.f.writes && st.State != daemon.StateReady && st.State != daemon.StateDegraded:
 		rg.fatalf("no fault that voids enforcement, but state %v (%q) after %s", st.State, st.Reasons, after)
+	}
+	// The convergence that enabled the firewall again must not report the
+	// Problem of the disabled firewall that it read before its Load.
+	if rg.f.disabled && !disabled && (st.State == daemon.StateReady || st.State == daemon.StateDegraded) {
+		rg.stats["re-enabled acks at once"]++
 	}
 }
 
@@ -610,7 +606,7 @@ func TestAckInvariantUnderRandomEvents(t *testing.T) {
 	for _, k := range []string{
 		"matched ready ack", "matched degraded ack", "matched ready reject",
 		"matched unenforced reject", "unmatched ready ack", "unmatched unenforced reject",
-		"malformed ready reject", "matched no-address tampered", "stale disabled problem",
+		"malformed ready reject", "matched no-address tampered", "re-enabled acks at once",
 	} {
 		if stats[k] == 0 {
 			t.Errorf("no %q case in the random runs", k)

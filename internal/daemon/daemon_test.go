@@ -82,34 +82,126 @@ func TestStartPrunesRemovedPoliciesAfterInstall(t *testing.T) {
 	})
 }
 
-func TestSnapshotLoadErrorKeepsStartingUntilRepaired(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		snapshot := filepath.Join(t.TempDir(), "addrbook.json")
-		if err := os.WriteFile(snapshot, []byte("not json"), 0o600); err != nil {
+// unloadableWithKernelEntries is newUnloadableSpec on a World whose
+// tables hold learned addresses and no ruleset is loaded, as after a
+// reboot of a host where the tables outlive the anchor. The host file
+// maps www.example.net to 10.1.1.1.
+func unloadableWithKernelEntries(t *testing.T) harnessSpec {
+	t.Helper()
+	s := newUnloadableSpec(t, configV1)
+	for name, entries := range kernelEntries {
+		if err := s.be.AddEntries(t.Context(), name, entries); err != nil {
 			t.Fatal(err)
 		}
-		h := start(t, reconciletest.NewWorld(), reconciletest.NewInventory(en0), snapshot, configV1)
+	}
+	s.hosts = &fakeHosts{}
+	s.hosts.set(true, "10.1.1.1 www.example.net\n", nil)
+	return s
+}
+
+// kernelEntries are the learned addresses in the kernel tables of
+// unloadableWithKernelEntries. The configuration has no policy gone.
+var kernelEntries = map[policy.Name][]netip.Prefix{
+	"web":  {host("203.0.113.1")},
+	"ads":  {host("3fff::1")},
+	"gone": {host("203.0.113.9")},
+}
+
+// A snapshot that does not load keeps the daemon in StateStarting, with
+// the snapshot error as the reason, and no report is acked. The daemon
+// still enforces what it knows without the book: the ruleset is loaded,
+// and the IP and CIDR destinations and the host addresses are in their
+// tables. It removes no table entry and drops no table: an entry that
+// the book does not have can be an acked address.
+func TestSnapshotLoadErrorLoadsTheRulesetAndRemovesNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s := unloadableWithKernelEntries(t)
+		h := launch(t, s)
 		defer h.stop()
 
-		st := h.wantState(daemon.StateStarting)
-		if len(st.Reasons) != 1 || !strings.Contains(st.Reasons[0], "loading snapshot") {
-			t.Errorf("reasons = %q, want the snapshot error", st.Reasons)
-		}
-		if err := h.observe(obs("www.example.net", "203.0.113.1")); !errors.Is(err, daemon.ErrNotReady) {
-			t.Errorf("Observe = %v, want ErrNotReady", err)
-		}
+		wantAddOnly(h)
 		heal()
-		h.wantState(daemon.StateStarting)
-		if n := h.world.Writes(); n != 0 {
-			t.Errorf("%d writes without a snapshot, want none: an empty book would unblock addresses", n)
+		wantAddOnly(h)
+		if got := readFile(t, s.snapshot); string(got) != "not json" {
+			t.Errorf("snapshot = %q, want the refused file unchanged", got)
 		}
-
-		if err := os.Remove(snapshot); err != nil {
-			t.Fatal(err)
-		}
-		heal()
-		h.wantState(daemon.StateReady)
 	})
+}
+
+// wantAddOnly checks a daemon of unloadableWithKernelEntries after an
+// add-only convergence.
+func wantAddOnly(h *harness) {
+	h.t.Helper()
+	st := h.wantState(daemon.StateStarting)
+	if len(st.Reasons) == 0 || !strings.Contains(st.Reasons[0], "loading snapshot") {
+		h.t.Errorf("reasons = %q, want the snapshot error first", st.Reasons)
+	}
+	if !h.references("web") || !h.references("ads") {
+		h.t.Errorf("loaded ruleset refers to %v, want web and ads", h.world.Referenced())
+	}
+	h.wantEntries(map[policy.Name][]netip.Prefix{
+		"web": {host("192.0.2.10"), netip.MustParsePrefix("198.51.100.0/24"), host("10.1.1.1")},
+		"ads": {netip.MustParsePrefix("2001:db8::/32")},
+	})
+	h.wantEntries(kernelEntries)
+	if err := h.observe(obs("www.example.net", "203.0.113.2")); !errors.Is(err, daemon.ErrNotReady) {
+		h.t.Errorf("Observe = %v, want ErrNotReady", err)
+	}
+}
+
+// wantEntries checks that each table holds the entries of want, and
+// possibly more.
+func (h *harness) wantEntries(want map[policy.Name][]netip.Prefix) {
+	h.t.Helper()
+	for name, entries := range want {
+		for _, e := range entries {
+			if !h.hasEntry(name, e) {
+				h.t.Errorf("table %s = %v, want %v in it", name, h.world.Tables()[name], e)
+			}
+		}
+	}
+}
+
+// When the snapshot loads again, the next pass is a normal convergence:
+// the daemon acks, and an entry that neither the book nor the
+// configuration has leaves its table.
+func TestRepairedSnapshotEndsTheAddOnlyConvergence(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		trigger func(h *harness)
+	}{
+		{"self-heal", func(*harness) { heal() }},
+		{"apply", func(h *harness) {
+			if _, err := h.d.Apply(h.t.Context(), []byte(configV1)); err != nil {
+				h.t.Fatalf("Apply: %v", err)
+			}
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				s := unloadableWithKernelEntries(t)
+				h := launch(t, s)
+				defer h.stop()
+				h.wantState(daemon.StateStarting)
+
+				writeSnapshot(t, s.snapshot, map[policy.Name]string{"web": "203.0.113.1"})
+				tt.trigger(h)
+				h.wantState(daemon.StateReady)
+				if err := h.observe(obs("www.example.net", "203.0.113.2")); err != nil {
+					t.Errorf("Observe = %v, want an ack", err)
+				}
+				if !h.hasEntry("web", host("203.0.113.1")) || !h.hasEntry("web", host("10.1.1.1")) {
+					t.Errorf("web table = %v, want the book and host addresses", h.world.Tables()["web"])
+				}
+				if h.hasEntry("ads", host("3fff::1")) {
+					t.Error("ads keeps 3fff::1, which the loaded book does not have")
+				}
+				if _, ok := h.world.Tables()["gone"]; ok {
+					t.Error("the table of a policy outside the configuration stays")
+				}
+			})
+		})
+	}
 }
 
 // The first configuration fixes the retain, also when a second one comes
@@ -222,8 +314,9 @@ func TestAdoptionSaveFailureKeepsStarting(t *testing.T) {
 		if len(st.Reasons) != 1 || !strings.Contains(st.Reasons[0], "saving adopted entries") {
 			t.Errorf("reasons = %q, want the save error", st.Reasons)
 		}
-		if n := h.world.Writes(); n != 1 {
-			t.Errorf("%d writes, want only the setup write", n)
+		if !h.hasEntry("web", host("203.0.113.1")) || !h.references("web") {
+			t.Errorf("tables = %v, referenced = %v, want the kernel address kept and the ruleset loaded",
+				h.world.Tables(), h.world.Referenced())
 		}
 
 		// A later attempt starts from a fresh book and completes.
@@ -752,7 +845,7 @@ func TestVoidingProblemIsNoticedWithinSelfHealInterval(t *testing.T) {
 // A disabled firewall has no window: the Backend reports no loaded
 // ruleset, so the next protected report gets no ack. The convergence
 // that the report starts enables the firewall again, and the acks come
-// back at the next convergence.
+// back with it, with no self-heal in between.
 func TestDisabledFirewallStopsTheNextAck(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, configV1)
@@ -770,17 +863,9 @@ func TestDisabledFirewallStopsTheNextAck(t *testing.T) {
 		if id, err := h.world.Backend().LoadedID(t.Context()); err != nil || id != installed {
 			t.Errorf("LoadedID after the convergence = %q, %v; want the installed ruleset %q", id, err, installed)
 		}
-		// Known behavior, not a promise: the convergence still reports the
-		// Problem that it read before its Load. A change that reads the
-		// Backend again after the Load flips this to ready and must
-		// update this check.
-		if st := h.wantState(daemon.StateUnenforced); !slices.Equal(st.Reasons, []string{reconciletest.DisabledText}) {
-			t.Errorf("reasons after the convergence = %q, want the stale Problem %q", st.Reasons, reconciletest.DisabledText)
-		}
-		heal()
 		h.wantState(daemon.StateReady)
 		if err := h.observe(obs("www.example.net", "203.0.113.2")); err != nil {
-			t.Errorf("Observe after the next convergence = %v, want ack", err)
+			t.Errorf("Observe after the enabling convergence = %v, want ack", err)
 		}
 		for _, a := range []string{"203.0.113.1", "203.0.113.2"} {
 			if !h.hasEntry("web", host(a)) {

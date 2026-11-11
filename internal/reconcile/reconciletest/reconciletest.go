@@ -34,9 +34,11 @@ const DisabledText = "the firewall is disabled"
 // World is the fake kernel and resolver state. It is safe for concurrent
 // use: the daemon goroutine writes while the test goroutine reads.
 type World struct {
-	mu       sync.Mutex
-	ruleset  reconcile.Ruleset
-	tables   map[policy.Name]map[netip.Prefix]struct{}
+	mu      sync.Mutex
+	ruleset reconcile.Ruleset
+	tables  map[policy.Name]map[netip.Prefix]struct{}
+	// negated are the negated entries of each table (see AddNegated).
+	negated  map[policy.Name][]netip.Prefix
 	resolver map[policy.Domain]netip.AddrPort
 	// applied are the resolver entries that the fake system uses now.
 	applied  map[policy.Domain]netip.AddrPort
@@ -56,6 +58,7 @@ type World struct {
 func NewWorld() *World {
 	return &World{
 		tables:   make(map[policy.Name]map[netip.Prefix]struct{}),
+		negated:  make(map[policy.Name][]netip.Prefix),
 		resolver: make(map[policy.Domain]netip.AddrPort),
 		applied:  make(map[policy.Domain]netip.AddrPort),
 	}
@@ -237,6 +240,7 @@ func (w *World) FlushTable(name policy.Name) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	clear(w.tables[name])
+	delete(w.negated, name)
 }
 
 // FlushAll removes the ruleset and every table, as an external
@@ -246,6 +250,26 @@ func (w *World) FlushAll() {
 	defer w.mu.Unlock()
 	w.ruleset = reconcile.Ruleset{}
 	clear(w.tables)
+	clear(w.negated)
+}
+
+// AddNegated adds the negated entry !n to a table, as an external pfctl
+// call would. It is not a write: no hook runs. Tables does not show it.
+// As in pf, a negated entry inside an entry of its table exempts its
+// addresses from that entry. Read then reports a Problem that voids the
+// enforcement, and it leaves that entry out of Tables. AddEntries deletes
+// each negated entry inside a prefix that it adds, so a table write can
+// repair this Problem without a Load.
+func (w *World) AddNegated(table policy.Name, n netip.Prefix) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.negated[table] = append(w.negated[table], n)
+}
+
+// inside reports whether the prefix n is inside the prefix p and longer,
+// so that pf matches n first for the addresses of n.
+func inside(n, p netip.Prefix) bool {
+	return p.Bits() < n.Bits() && p.Contains(n.Addr())
 }
 
 // ExternalLoad loads a ruleset with the given body, as another tool that
@@ -316,7 +340,9 @@ type Backend struct{ w *World }
 var _ reconcile.Backend = (*Backend)(nil)
 
 // Read implements reconcile.Backend. While the firewall is disabled, the
-// ruleset ID is "" and a Problem voids the enforcement.
+// ruleset ID is "" and a Problem voids the enforcement. A negated entry
+// inside an entry of its table also gives a Problem that voids the
+// enforcement, and Tables does not have that entry (see AddNegated).
 func (b *Backend) Read(context.Context) (reconcile.BackendState, error) {
 	b.w.mu.Lock()
 	defer b.w.mu.Unlock()
@@ -324,9 +350,23 @@ func (b *Backend) Read(context.Context) (reconcile.BackendState, error) {
 	if b.w.disabled {
 		problems = append(problems, reconcile.Problem{Text: DisabledText, Voids: true})
 	}
+	tables := b.w.tablesLocked()
+	for _, name := range slices.Sorted(maps.Keys(b.w.negated)) {
+		entries, neg := tables[name], b.w.negated[name]
+		for _, n := range neg {
+			if slices.ContainsFunc(entries, func(e netip.Prefix) bool { return inside(n, e) }) {
+				problems = append(problems, reconcile.Problem{Text: fmt.Sprintf("the table %s holds the negated entry !%s", name, n), Voids: true})
+			}
+		}
+		if entries != nil {
+			tables[name] = slices.DeleteFunc(entries, func(e netip.Prefix) bool {
+				return slices.ContainsFunc(neg, func(n netip.Prefix) bool { return inside(n, e) })
+			})
+		}
+	}
 	return reconcile.BackendState{
 		Ruleset:  b.w.loadedIDLocked(),
-		Tables:   b.w.tablesLocked(),
+		Tables:   tables,
 		Problems: problems,
 	}, nil
 }
@@ -382,7 +422,8 @@ func checkEntries(entries []netip.Prefix) error {
 }
 
 // AddEntries implements reconcile.Backend. It refuses a batch with an
-// invalid entry and then changes nothing.
+// invalid entry and then changes nothing. It deletes each negated entry
+// inside a prefix that it adds, as the pf Backend does.
 func (b *Backend) AddEntries(_ context.Context, table policy.Name, entries []netip.Prefix) error {
 	return b.w.write(func() error {
 		if err := checkEntries(entries); err != nil {
@@ -396,6 +437,9 @@ func (b *Backend) AddEntries(_ context.Context, table policy.Name, entries []net
 		for _, e := range entries {
 			t[e] = struct{}{}
 		}
+		b.w.negated[table] = slices.DeleteFunc(b.w.negated[table], func(n netip.Prefix) bool {
+			return slices.ContainsFunc(entries, func(e netip.Prefix) bool { return inside(n, e) })
+		})
 		b.w.ended = append(b.w.ended, entries...)
 		return nil
 	})
@@ -419,6 +463,7 @@ func (b *Backend) RemoveEntries(_ context.Context, table policy.Name, entries []
 func (b *Backend) DropTable(_ context.Context, table policy.Name) error {
 	return b.w.write(func() error {
 		delete(b.w.tables, table)
+		delete(b.w.negated, table)
 		return nil
 	})
 }

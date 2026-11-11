@@ -223,7 +223,8 @@ func TestRestrictedAnchorReferenceVoids(t *testing.T) {
 // A negated entry voids only when it exempts addresses from an entry of
 // its table. Read then leaves that entry out of Tables, so the Reconciler
 // adds it again, and AddEntries deletes each negated entry inside a
-// prefix that it adds. One convergence repairs each change.
+// prefix that it adds. One convergence repairs each change, and its
+// Report has no voiding Problem.
 func TestNegatedEntries(t *testing.T) {
 	held := netip.MustParsePrefix("203.0.113.0/24")
 	tests := []struct {
@@ -258,7 +259,16 @@ func TestNegatedEntries(t *testing.T) {
 				t.Errorf("Read.Tables[bing] = %v holds %v, which a negated entry voids", before.Tables["bing"], held)
 			}
 
-			converge(t, r)
+			id := mustID(t, r)
+			rep := converge(t, r)
+			if got := mustID(t, r); got != id {
+				t.Fatalf("the repair loaded the ruleset %q; the test needs a repair without a Load", got)
+			}
+			// The repair writes the table and loads nothing. The Report
+			// gets the Problems of a read after that write.
+			if rep.Installed != id || hasVoiding(rep.Problems) {
+				t.Errorf("Report: installed %q, Problems %+v; want %q and no voiding Problem", rep.Installed, rep.Problems, id)
+			}
 			checkHeld(t, r, held)
 		})
 	}

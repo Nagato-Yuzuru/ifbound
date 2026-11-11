@@ -34,6 +34,10 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
+// errRulesetChanged is the error of a Backend part whose read after its
+// writes finds another ruleset loaded than the one of the pass.
+var errRulesetChanged = errors.New("another ruleset is loaded")
+
 // AddrSource gives the learned addresses of a policy.
 // *addrbook.AddrBook implements it.
 type AddrSource interface {
@@ -59,6 +63,17 @@ type Inputs struct {
 	// Accounts, the Compiler knows no account and drops every scope, so
 	// each scoped policy applies to all traffic.
 	Accounts Accounts
+	// AddOnly makes the Backend part skip step 4 of Converge: it removes
+	// no undesired entry and drops no table. Use it when Book can be
+	// incomplete, for example when the snapshot does not load: a table
+	// entry that Book does not have can then be an acknowledged address.
+	// The tables then hold the desired entries and possibly more. Step 1
+	// still runs: its removal opens no path off the host. An end of the
+	// states of a narrowed policy without a Load ends the states to every
+	// entry that its table keeps, not only to the desired entries: the
+	// next pass finds no narrowing, so it does not end them. The
+	// SysResolver part does not change.
+	AddOnly bool
 }
 
 // Report describes one convergence.
@@ -76,8 +91,27 @@ type Report struct {
 	// is loaded, and every table it refers to holds its desired entries.
 	Installed string
 	// Problems lists the external problems that the Compiler, the Backend,
-	// and the SysResolver reported, in that order.
+	// and the SysResolver reported, in that order. When the Backend part
+	// wrote, the Backend problems come from a read after its last write
+	// (see Converge step 5).
 	Problems []Problem
+	// Resolver tells what the SysResolver part saw and did.
+	Resolver ResolverReport
+}
+
+// ResolverReport describes the SysResolver part of one convergence. The
+// zero ResolverReport means that the read of the part failed.
+type ResolverReport struct {
+	// Digest is a SHA-256 digest of the state that the read of the part
+	// gave: its entries, its Problems, and its shadowed domains. The
+	// encoding is canonical, so equal states give equal digests, also in
+	// another order. The read comes before the writes of the part. Digest
+	// is "" when the read failed.
+	Digest string
+	// Shadowed is ResolverState.Shadowed of that read.
+	Shadowed []policy.Domain
+	// Wrote is true when the part wrote or removed at least one entry.
+	Wrote bool
 }
 
 // Reconciler converges the platform state. All fields are required. The
@@ -127,6 +161,13 @@ type memory struct {
 //     on more interfaces (see below).
 //  4. Remove the entries that are no longer desired, then drop the tables
 //     of removed policies. The loaded ruleset no longer refers to them.
+//     With Inputs.AddOnly, this step does not run.
+//  5. If a step before wrote to the Backend, read the Backend again. A
+//     write can repair a Problem: a Load enables a disabled firewall, and
+//     AddEntries can delete an entry that exempts addresses. The Report
+//     gets the Backend Problems of this read. If this read finds another
+//     ruleset loaded, the part fails. Without a write, the Report gets
+//     the Backend Problems of the read before step 1.
 //
 // pf states are floating: a connection that started on an allowed
 // interface can continue on an interface that the policy denies now. The
@@ -223,6 +264,7 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 	if err != nil {
 		return fmt.Errorf("reading backend: %w", err)
 	}
+	backendProblems, writes := len(rep.Problems), rep.Writes
 	rep.Problems = append(rep.Problems, actual.Problems...)
 	want, err := desiredTables(in)
 	if err != nil {
@@ -242,6 +284,11 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 		r.mem = &memory{owner: r}
 	}
 	cur := verdicts(in.Policies, ifaces, rs)
+	// kept is what each table keeps of have after step 4.
+	kept := want
+	if in.AddOnly {
+		kept = have
+	}
 	if actual.Ruleset != rs.ID() {
 		if err := r.Backend.Load(ctx, rs); err != nil {
 			return fmt.Errorf("loading ruleset: %w", err)
@@ -249,13 +296,36 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 		rep.Writes++
 		rep.Narrowed = r.mem.narrowed(in.Policies, cur)
 		r.mem.enforced = cur
-	} else if err := r.endNarrowed(ctx, in.Policies, cur, want, have, rep); err != nil {
+	} else if err := r.endNarrowed(ctx, in.Policies, cur, kept, have, rep); err != nil {
 		return err
 	}
-	if err := r.removeUndesired(ctx, in.Policies, want, have, rep); err != nil {
-		return err
+	if !in.AddOnly {
+		if err := r.removeUndesired(ctx, in.Policies, want, have, rep); err != nil {
+			return err
+		}
+	}
+	if rep.Writes != writes {
+		if err := r.readAgain(ctx, rs.ID(), backendProblems, rep); err != nil {
+			return err
+		}
 	}
 	rep.Installed = rs.ID()
+	return nil
+}
+
+// readAgain is step 5 of Converge. The Backend Problems of the first
+// read start at rep.Problems[from], and the Problems of this read replace
+// them: the writes can have repaired a Problem. id is the ID of the
+// ruleset of the pass.
+func (r Reconciler) readAgain(ctx context.Context, id string, from int, rep *Report) error {
+	after, err := r.Backend.Read(ctx)
+	if err != nil {
+		return fmt.Errorf("reading backend after the writes: %w", err)
+	}
+	rep.Problems = append(rep.Problems[:from], after.Problems...)
+	if after.Ruleset != id {
+		return fmt.Errorf("reading backend after the writes: %w: %q, want %q", errRulesetChanged, after.Ruleset, id)
+	}
 	return nil
 }
 
@@ -351,18 +421,19 @@ func (m *memory) narrowed(policies []policy.Policy, cur map[policy.Name]verdict)
 }
 
 // endNarrowed ends the states of each policy whose verdict cur narrows,
-// and records cur. The entries that addMissing added in this pass are
-// not in have: AddEntries ended their states already. On an error, the
-// narrowed policies that are not done keep their old verdict, so the
-// next pass tries again.
-func (r *Reconciler) endNarrowed(ctx context.Context, policies []policy.Policy, cur map[policy.Name]verdict, want, have map[policy.Name]prefixSet, rep *Report) error {
+// and records cur. It ends the states to the entries of have that kept
+// also has: the entries that the table holds after this pass. The
+// entries that addMissing added in this pass are not in have: AddEntries
+// ended their states already. On an error, the narrowed policies that
+// are not done keep their old verdict, so the next pass tries again.
+func (r *Reconciler) endNarrowed(ctx context.Context, policies []policy.Policy, cur map[policy.Name]verdict, kept, have map[policy.Name]prefixSet, rep *Report) error {
 	next := make(map[policy.Name]verdict, len(cur))
 	for _, p := range policies {
 		next[p.Name] = cur[p.Name]
 	}
 	narrowed := r.mem.narrowed(policies, cur)
 	for i, name := range narrowed {
-		if held := want[name].and(have[name]); len(held) > 0 {
+		if held := kept[name].and(have[name]); len(held) > 0 {
 			if err := r.Backend.AddEntries(ctx, name, held); err != nil {
 				for _, n := range narrowed[i:] {
 					next[n] = r.mem.enforced[n]
@@ -412,6 +483,8 @@ func (r Reconciler) convergeResolver(ctx context.Context, in Inputs, rep *Report
 		return fmt.Errorf("reading resolver entries: %w", err)
 	}
 	rep.Problems = append(rep.Problems, actual.Problems...)
+	rep.Resolver.Digest = actual.digest()
+	rep.Resolver.Shadowed = slices.Clone(actual.Shadowed)
 	have := make(map[policy.Domain]netip.AddrPort, len(actual.Entries))
 	for _, e := range actual.Entries {
 		have[e.Domain] = e.Server
@@ -431,6 +504,7 @@ func (r Reconciler) convergeResolver(ctx context.Context, in Inputs, rep *Report
 			continue
 		}
 		rep.Writes++
+		rep.Resolver.Wrote = true
 	}
 	var old []policy.Domain
 	for d := range have {
@@ -448,6 +522,7 @@ func (r Reconciler) convergeResolver(ctx context.Context, in Inputs, rep *Report
 			continue
 		}
 		rep.Writes++
+		rep.Resolver.Wrote = true
 	}
 	return errors.Join(errs...)
 }

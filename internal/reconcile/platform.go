@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"net/netip"
 	"slices"
+	"strconv"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
@@ -254,6 +256,35 @@ type ResolverState struct {
 	// only a probe below its domain can show where those names go. Each
 	// one also has a Problem.
 	Shadowed []policy.Domain
+}
+
+// digest is ResolverReport.Digest of s. Each part of s becomes a sorted
+// list of strings. Each list and each string has a length prefix, so two
+// different states cannot give the same bytes.
+func (s ResolverState) digest() string {
+	entries := make([]string, len(s.Entries))
+	for i, e := range s.Entries {
+		entries[i] = e.Domain.String() + " " + e.Server.String()
+	}
+	problems := make([]string, len(s.Problems))
+	for i, p := range s.Problems {
+		problems[i] = strconv.FormatBool(p.Voids) + " " + p.Text
+	}
+	shadowed := make([]string, len(s.Shadowed))
+	for i, d := range s.Shadowed {
+		shadowed[i] = d.String()
+	}
+	var b []byte
+	for _, list := range [][]string{entries, problems, shadowed} {
+		slices.Sort(list)
+		b = binary.AppendUvarint(b, uint64(len(list)))
+		for _, v := range list {
+			b = binary.AppendUvarint(b, uint64(len(v)))
+			b = append(b, v...)
+		}
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // SysResolver manages the system resolver entries of ifbound. It never

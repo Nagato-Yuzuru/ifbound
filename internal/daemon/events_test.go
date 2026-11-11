@@ -157,6 +157,40 @@ func TestConvergenceEvent(t *testing.T) {
 	})
 }
 
+// While the snapshot does not load, each add-only pass writes a
+// convergence event with the snapshot error. Its error.type is snapshot
+// when the convergence succeeded, and platform when it failed: only a
+// platform failure needs a fix of the platform.
+func TestAddOnlyConvergenceEventErrorType(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := launch(t, newUnloadableSpec(t, configV1))
+		defer h.stop()
+		h.wantState(daemon.StateStarting)
+
+		ok := h.last("convergence")
+		wantAttrs(t, ok, map[string]any{
+			logattr.ErrorType:        logattr.ErrorTypeSnapshot,
+			logattr.EnforcementState: logattr.StateStarting,
+		})
+		if msg := ok.attrs[logattr.ExceptionMessage].String(); !strings.Contains(msg, "loading snapshot") {
+			t.Errorf("%s = %q, want the snapshot error", logattr.ExceptionMessage, msg)
+		}
+
+		h.world.FlushAll()
+		h.failWrites()
+		heal()
+		failed := h.last("convergence")
+		wantAttrs(t, failed, map[string]any{
+			logattr.ErrorType:        logattr.ErrorTypePlatform,
+			logattr.EnforcementState: logattr.StateStarting,
+		})
+		msg := failed.attrs[logattr.ExceptionMessage].String()
+		if !strings.Contains(msg, "loading snapshot") || !strings.Contains(msg, reconciletest.ErrInjected.Error()) {
+			t.Errorf("%s = %q, want the snapshot error and the injected error", logattr.ExceptionMessage, msg)
+		}
+	})
+}
+
 // A convergence that ends pf states writes one event with the cause and
 // the policies, besides its convergence event.
 func TestStatesEndedEvent(t *testing.T) {
