@@ -82,7 +82,12 @@ func (l Layout) InputConfig() string { return filepath.Join(l.ConfigDir, "config
 // StoredConfig is the applied configuration. Only ifboundd writes it.
 func (l Layout) StoredConfig() string { return filepath.Join(l.StateDir, "config.toml") }
 
-// Snapshot is the address book snapshot.
+// AddrBook is the address book directory (see addrstore). Only ifboundd
+// writes it.
+func (l Layout) AddrBook() string { return filepath.Join(l.StateDir, "addrbook") }
+
+// Snapshot is the JSON snapshot of the address book that earlier
+// versions wrote. ifboundd imports it into AddrBook and removes it.
 func (l Layout) Snapshot() string { return filepath.Join(l.StateDir, "addrbook.json") }
 
 // ReportSocket is the socket where ifbound-dns reports DNS answers to

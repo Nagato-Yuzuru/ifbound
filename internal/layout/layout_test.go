@@ -13,6 +13,7 @@ func TestDefaultPaths(t *testing.T) {
 	tests := []struct{ got, want string }{
 		{l.InputConfig(), "/etc/ifbound/config.toml"},
 		{l.StoredConfig(), "/var/db/ifbound/config.toml"},
+		{l.AddrBook(), "/var/db/ifbound/addrbook"},
 		{l.Snapshot(), "/var/db/ifbound/addrbook.json"},
 		{l.ReportSocket(), "/var/run/ifbound/report.sock"},
 		{l.ControlSocket(), "/var/run/ifbound/control.sock"},
