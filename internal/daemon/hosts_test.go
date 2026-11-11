@@ -333,24 +333,6 @@ func TestUnrepresentableHostLines(t *testing.T) {
 	})
 }
 
-// Traffic to a loopback or unspecified address does not leave the host,
-// so a host entry with one blocks nothing. A block of it would stop
-// local services, ifbound-dns too.
-func TestHostLoopbackAddressesAreNotBlocked(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		h := newHarness(t, configV1)
-		defer h.stop()
-		h.writeHosts("127.0.0.1 local.example.net\n::1 local.example.net\n0.0.0.0 zero.example.net\n:: zero.example.net\n")
-		heal()
-
-		for _, addr := range []string{"127.0.0.1", "::1", "0.0.0.0", "::"} {
-			if h.hasEntry("web", host(addr)) {
-				t.Errorf("web table has %s", addr)
-			}
-		}
-	})
-}
-
 // mDNSResponder follows a CNAME chain across lines: example.com is an
 // alias of f.test, and f.test is an alias of g.test.
 func TestHostAliasChain(t *testing.T) {

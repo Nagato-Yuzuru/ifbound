@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfbackend"
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfrules"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
@@ -442,7 +443,7 @@ func TestPfBackendTopLevelRuleIsAChange(t *testing.T) {
 
 type noAddrs struct{}
 
-func (noAddrs) Addrs(policy.Name) []netip.Addr { return nil }
+func (noAddrs) Addrs(policy.Name) []blockable.Addr { return nil }
 
 // TestPfBackendRepairsNegatedEntryInsideAPrefix checks that one
 // convergence of the real Reconciler deletes a negated entry that another

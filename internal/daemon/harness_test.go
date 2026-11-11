@@ -297,7 +297,11 @@ func (h *harness) saved(name policy.Name) []netip.Addr {
 	if err := b.Load(h.snapshot); err != nil {
 		h.t.Fatalf("load snapshot: %v", err)
 	}
-	return b.Addrs(name)
+	var out []netip.Addr
+	for _, a := range b.Addrs(name) {
+		out = append(out, a.Addr())
+	}
+	return out
 }
 
 // failWrites makes every write fail until h.world.SetBeforeWrite(nil).

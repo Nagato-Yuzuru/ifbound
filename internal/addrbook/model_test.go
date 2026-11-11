@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
@@ -144,12 +145,13 @@ func (w *oWorld) move() {
 
 func (w *oWorld) observe() {
 	name := pick(w.rng, []policy.Name{"p", "q"})
-	var addrs []netip.Addr
+	var picked []netip.Addr
 	for _, a := range oPool {
 		if w.rng.IntN(2) == 0 {
-			addrs = append(addrs, a)
+			picked = append(picked, a)
 		}
 	}
+	addrs := blockable.Filter(picked)
 	ttl := pick(w.rng, []time.Duration{0, time.Second, 30 * time.Minute, 3 * time.Hour, 8 * 24 * time.Hour})
 	got, err := w.book.Observe(name, addrs, ttl)
 	w.logf("observe %s %v ttl=%v -> %v %v", name, addrs, ttl, got, err)
@@ -159,7 +161,7 @@ func (w *oWorld) observe() {
 	want := false
 	var keys []oKey
 	for _, a := range addrs {
-		k := oKey{name, a.Unmap()}
+		k := oKey{name, a.Addr()}
 		newExp := w.now.Add(max(ttl, w.retain))
 		saved := time.Time{}
 		if m, ok := w.mem[k]; ok {
@@ -187,11 +189,14 @@ func (w *oWorld) observe() {
 
 func (w *oWorld) observeBad() {
 	before := w.snapshotMem()
-	bad := pick(w.rng, []netip.Addr{{}, netip.MustParseAddr("fe80::1%en0")})
-	_, err := w.book.Observe("p", []netip.Addr{oPool[0], bad}, 0)
-	w.logf("observe bad %v -> %v", bad, err)
+	bad := pick(w.rng, []struct {
+		name policy.Name
+		ttl  time.Duration
+	}{{"", 0}, {"p", -time.Second}})
+	_, err := w.book.Observe(bad.name, blockable.Filter(oPool[:1]), bad.ttl)
+	w.logf("observe bad %+v -> %v", bad, err)
 	if err == nil {
-		w.fail("observe of a bad address succeeded")
+		w.fail("observe of bad input succeeded")
 	}
 	if after := w.snapshotMem(); !slices.Equal(before, after) {
 		w.fail("refused observe changed the book: %v -> %v", before, after)
@@ -337,7 +342,7 @@ func (w *oWorld) crash() {
 		}
 		b.Expire()
 		w.stats.checks++
-		if !slices.Contains(b.Addrs(k.p), k.a) {
+		if !slices.ContainsFunc(b.Addrs(k.p), func(a blockable.Addr) bool { return a.Addr() == k.a }) {
 			w.fail("LEAK: %s %v is gone after Load+Expire at %v, its keep-until", k.p, k.a, at)
 		}
 	}

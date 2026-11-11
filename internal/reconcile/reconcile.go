@@ -12,6 +12,11 @@
 // blocks stays in its table until it expires or its policy leaves the
 // loaded ruleset. A host address stays while Inputs.Hosts has it. See Reconciler.Converge.
 //
+// A learned or host address is a blockable.Addr, so no table holds one
+// that blockable.New refuses. Converge removes such an entry that an
+// earlier version put in a table. The destinations of the configuration
+// are not blockable.Addr values: the rule does not apply to them.
+//
 // This package defines the platform interfaces. The platform packages
 // implement them; the reconciletest package has fakes.
 package reconcile
@@ -20,17 +25,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"slices"
 	"strings"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
 // AddrSource gives the learned addresses of a policy.
 // *addrbook.AddrBook implements it.
 type AddrSource interface {
-	Addrs(name policy.Name) []netip.Addr
+	Addrs(name policy.Name) []blockable.Addr
 }
 
 // Inputs is everything that the desired state depends on, apart from the
@@ -40,9 +47,8 @@ type Inputs struct {
 	// Book gives the learned addresses of each policy.
 	Book AddrSource
 	// Hosts gives the addresses of each policy that the host file maps to
-	// a protected name. A nil map has none. Each address has no zone and
-	// is not IPv4-mapped, as in Book.
-	Hosts map[policy.Name][]netip.Addr
+	// a protected name. A nil map has none.
+	Hosts map[policy.Name][]blockable.Addr
 	// Apexes are the domains that get a resolver entry: the apex list of
 	// the Matcher for Policies. The canary domain of Firefox also gets an
 	// entry, but only when another entry exists. See Reconciler.Converge.
@@ -106,14 +112,20 @@ type memory struct {
 
 // Converge makes the actual state equal to the desired state for in.
 //
-// The Backend part runs in this order, and it stops at its first error:
+// The Backend part runs in this order, and it stops at its first error.
+// Before step 1, it refuses the zero blockable.Addr in Book or Hosts
+// (blockable.ErrZero): the Backend then gets no write.
 //
-//  1. Add the missing table entries. A new policy gets a full table
+//  1. Remove each entry that blockable.New refuses and that is not a
+//     destination of the policy of the table. An earlier version can
+//     have put it there. This step runs first, so a Load that fails does
+//     not keep it. The removal opens no path off the host.
+//  2. Add the missing table entries. A new policy gets a full table
 //     before any rule refers to it.
-//  2. Load the compiled ruleset if its ID differs from the loaded one.
+//  3. Load the compiled ruleset if its ID differs from the loaded one.
 //     Else, end the states of each policy that the new interfaces block
 //     on more interfaces (see below).
-//  3. Remove the entries that are no longer desired, then drop the tables
+//  4. Remove the entries that are no longer desired, then drop the tables
 //     of removed policies. The loaded ruleset no longer refers to them.
 //
 // pf states are floating: a connection that started on an allowed
@@ -129,7 +141,7 @@ type memory struct {
 // Without a Load (the ruleset text can stay the same, for example when a
 // selector names the interface), Converge calls AddEntries for each
 // narrowed policy with the entries that its table held before this pass:
-// AddEntries ends the states to them. Step 1 ended the states to the
+// AddEntries ends the states to them. Step 2 ended the states to the
 // other entries. So each state ends once, and without a Load a policy
 // whose verdict did not narrow keeps its states.
 //
@@ -178,14 +190,18 @@ func (r Reconciler) ConvergeResolver(ctx context.Context, in Inputs) (Report, er
 // AddObserved adds the addresses to the table of one policy. It is the
 // fast path for a DNS report: it neither reads the actual state nor
 // recompiles. A nil error means the Backend holds every address in the
-// table.
-func (r Reconciler) AddObserved(ctx context.Context, name policy.Name, addrs []netip.Addr) error {
+// table. It refuses a batch with the zero blockable.Addr
+// (blockable.ErrZero) and then calls no Backend method.
+func (r Reconciler) AddObserved(ctx context.Context, name policy.Name, addrs []blockable.Addr) error {
+	if err := blockable.Check(addrs); err != nil {
+		return fmt.Errorf("adding to table %s: %w", name, err)
+	}
 	if len(addrs) == 0 {
 		return nil
 	}
 	entries := make([]netip.Prefix, len(addrs))
 	for i, a := range addrs {
-		entries[i] = host(a)
+		entries[i] = host(a.Addr())
 	}
 	if err := r.Backend.AddEntries(ctx, name, entries); err != nil {
 		return fmt.Errorf("adding to table %s: %w", name, err)
@@ -208,10 +224,16 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 		return fmt.Errorf("reading backend: %w", err)
 	}
 	rep.Problems = append(rep.Problems, actual.Problems...)
-	want := desiredTables(in)
+	want, err := desiredTables(in)
+	if err != nil {
+		return err
+	}
 	have := make(map[policy.Name]prefixSet, len(actual.Tables))
 	for name, entries := range actual.Tables {
 		have[name] = newPrefixSet(entries)
+	}
+	if err := r.removeRefused(ctx, in.Policies, have, rep); err != nil {
+		return err
 	}
 	if err := r.addMissing(ctx, in.Policies, want, have, rep); err != nil {
 		return err
@@ -245,26 +267,62 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 // table, and a revert of the configuration must find its addresses. A
 // daemon that starts without a snapshot adopts them, so a lost snapshot
 // keeps addresses blocked instead of unblocking them all. Host-file
-// addresses look learned too; the caller tells them apart.
-func (r Reconciler) Adoptable(ctx context.Context, policies []policy.Policy) (map[policy.Name][]netip.Addr, error) {
+// addresses look learned too; the caller tells them apart. An entry
+// that blockable.New refuses is not adoptable: Converge removes it.
+func (r Reconciler) Adoptable(ctx context.Context, policies []policy.Policy) (map[policy.Name][]blockable.Addr, error) {
 	actual, err := r.Backend.Read(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("reading backend: %w", err)
 	}
-	static := make(map[policy.Name]prefixSet, len(policies))
-	for _, p := range policies {
-		static[p.Name] = staticEntries(p)
-	}
-	out := make(map[policy.Name][]netip.Addr)
+	out := make(map[policy.Name][]blockable.Addr)
 	for name, entries := range actual.Tables {
-		for _, e := range entries {
-			if _, ok := static[name][e]; ok || !e.IsSingleIP() {
-				continue
-			}
-			out[name] = append(out[name], e.Addr())
+		if adopt, _ := learnedLooking(name, entries, policies); len(adopt) > 0 {
+			out[name] = adopt
 		}
 	}
 	return out, nil
+}
+
+// learnedLooking splits the single-address entries of the table of name
+// that are not an IP destination of that policy. Adopt gets the
+// addresses that blockable.New accepts. Refused gets the other entries.
+// A policy that policies does not have has no destinations.
+func learnedLooking(name policy.Name, entries []netip.Prefix, policies []policy.Policy) (adopt []blockable.Addr, refused []netip.Prefix) {
+	var static prefixSet
+	if i := slices.IndexFunc(policies, func(p policy.Policy) bool { return p.Name == name }); i >= 0 {
+		static = staticEntries(policies[i])
+	}
+	for _, e := range entries {
+		if _, ok := static[e]; ok || !e.IsSingleIP() {
+			continue
+		}
+		if a, ok := blockable.New(e.Addr()); ok {
+			adopt = append(adopt, a)
+		} else {
+			refused = append(refused, e)
+		}
+	}
+	return adopt, refused
+}
+
+// removeRefused is step 1 of Converge. It also removes the entries from
+// have, so the later steps do not remove them again.
+func (r Reconciler) removeRefused(ctx context.Context, policies []policy.Policy, have map[policy.Name]prefixSet, rep *Report) error {
+	for _, name := range slices.Sorted(maps.Keys(have)) {
+		_, refused := learnedLooking(name, slices.Collect(maps.Keys(have[name])), policies)
+		if len(refused) == 0 {
+			continue
+		}
+		slices.SortFunc(refused, netip.Prefix.Compare)
+		if err := r.Backend.RemoveEntries(ctx, name, refused); err != nil {
+			return fmt.Errorf("removing from table %s: %w", name, err)
+		}
+		rep.Writes++
+		for _, e := range refused {
+			delete(have[name], e)
+		}
+	}
+	return nil
 }
 
 func (r Reconciler) addMissing(ctx context.Context, policies []policy.Policy, want, have map[policy.Name]prefixSet, rep *Report) error {
@@ -432,20 +490,25 @@ func atOrBelow(d, apex policy.Domain) bool {
 func compareDomains(a, b policy.Domain) int { return strings.Compare(a.String(), b.String()) }
 
 // desiredTables has a key for every policy, also when its table is empty:
-// a missing key marks a table to drop.
-func desiredTables(in Inputs) map[policy.Name]prefixSet {
+// a missing key marks a table to drop. It refuses the zero
+// blockable.Addr in the learned and the host addresses.
+func desiredTables(in Inputs) (map[policy.Name]prefixSet, error) {
 	out := make(map[policy.Name]prefixSet, len(in.Policies))
 	for _, p := range in.Policies {
-		s := staticEntries(p)
-		for _, a := range in.Book.Addrs(p.Name) {
-			s[host(a)] = struct{}{}
+		book, hosts := in.Book.Addrs(p.Name), in.Hosts[p.Name]
+		if err := blockable.Check(book); err != nil {
+			return nil, fmt.Errorf("learned addresses of %s: %w", p.Name, err)
 		}
-		for _, a := range in.Hosts[p.Name] {
-			s[host(a)] = struct{}{}
+		if err := blockable.Check(hosts); err != nil {
+			return nil, fmt.Errorf("host addresses of %s: %w", p.Name, err)
+		}
+		s := staticEntries(p)
+		for _, a := range slices.Concat(book, hosts) {
+			s[host(a.Addr())] = struct{}{}
 		}
 		out[p.Name] = s
 	}
-	return out
+	return out, nil
 }
 
 // staticEntries are the table entries that the configuration gives.

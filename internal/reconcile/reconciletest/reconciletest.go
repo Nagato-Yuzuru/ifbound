@@ -368,9 +368,26 @@ func (b *Backend) Load(_ context.Context, rs reconcile.Ruleset) error {
 	})
 }
 
-// AddEntries implements reconcile.Backend.
+// errEntry is the error of a write with an invalid entry. The real
+// Backend refuses such a batch too, so a test cannot pass on an entry
+// that the kernel never gets.
+var errEntry = errors.New("reconciletest: invalid table entry")
+
+// checkEntries returns errEntry when entries holds an invalid entry.
+func checkEntries(entries []netip.Prefix) error {
+	if i := slices.IndexFunc(entries, func(e netip.Prefix) bool { return !e.IsValid() }); i >= 0 {
+		return fmt.Errorf("%w: %v", errEntry, entries[i])
+	}
+	return nil
+}
+
+// AddEntries implements reconcile.Backend. It refuses a batch with an
+// invalid entry and then changes nothing.
 func (b *Backend) AddEntries(_ context.Context, table policy.Name, entries []netip.Prefix) error {
 	return b.w.write(func() error {
+		if err := checkEntries(entries); err != nil {
+			return err
+		}
 		t := b.w.tables[table]
 		if t == nil {
 			t = make(map[netip.Prefix]struct{})
@@ -384,9 +401,13 @@ func (b *Backend) AddEntries(_ context.Context, table policy.Name, entries []net
 	})
 }
 
-// RemoveEntries implements reconcile.Backend.
+// RemoveEntries implements reconcile.Backend. It refuses a batch with an
+// invalid entry, as AddEntries does.
 func (b *Backend) RemoveEntries(_ context.Context, table policy.Name, entries []netip.Prefix) error {
 	return b.w.write(func() error {
+		if err := checkEntries(entries); err != nil {
+			return err
+		}
 		for _, e := range entries {
 			delete(b.w.tables[table], e)
 		}

@@ -45,9 +45,11 @@ func contractEntry() netip.Prefix { return netip.MustParsePrefix("203.0.113.7/32
 // for a disabled firewall: what Read and LoadedID report while the
 // firewall is disabled, a Load that the Backend refuses soon after an
 // enable, a Load after the rate limit, and AddEntries while the firewall
-// is disabled. Each case gets a new target from newTarget.
+// is disabled. It also runs a write with an invalid entry. Each case
+// gets a new target from newTarget.
 func RunBackendContract(t *testing.T, newTarget func(t *testing.T) ContractTarget) {
 	t.Helper()
+	t.Run("invalid entry is refused", func(t *testing.T) { runInvalidEntry(t, newTarget(t)) })
 	tests := []struct {
 		name  string
 		steps []contractStep
@@ -126,4 +128,35 @@ func (tg ContractTarget) check(t *testing.T, want string, voids, added bool) {
 	if added && !slices.Contains(st.Tables[tg.Table], contractEntry()) {
 		t.Errorf("Read.Tables[%s] = %v, want %v in it", tg.Table, st.Tables[tg.Table], contractEntry())
 	}
+}
+
+// runInvalidEntry checks that AddEntries and RemoveEntries refuse a
+// batch with an invalid entry and change nothing, also for the valid
+// entry in the same batch.
+func runInvalidEntry(t *testing.T, tg ContractTarget) {
+	tg.run(t, stepLoad)
+	batch := []netip.Prefix{contractEntry(), {}}
+	if err := tg.Backend.AddEntries(t.Context(), tg.Table, batch); err == nil {
+		t.Error("AddEntries with an invalid entry = nil, want an error")
+	}
+	if tg.holds(t) {
+		t.Errorf("Read.Tables[%s] holds %v after a refused AddEntries", tg.Table, contractEntry())
+	}
+	tg.run(t, stepAdd)
+	if err := tg.Backend.RemoveEntries(t.Context(), tg.Table, batch); err == nil {
+		t.Error("RemoveEntries with an invalid entry = nil, want an error")
+	}
+	if !tg.holds(t) {
+		t.Errorf("Read.Tables[%s] lost %v after a refused RemoveEntries", tg.Table, contractEntry())
+	}
+}
+
+// holds reports whether Read reports contractEntry in the Table.
+func (tg ContractTarget) holds(t *testing.T) bool {
+	t.Helper()
+	st, err := tg.Backend.Read(t.Context())
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	return slices.Contains(st.Tables[tg.Table], contractEntry())
 }

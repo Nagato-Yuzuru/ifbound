@@ -20,6 +20,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
@@ -31,8 +32,6 @@ const maxSaveSlack = time.Hour
 
 // Errors that Observe returns for input it refuses.
 var (
-	ErrInvalidAddr = errors.New("addrbook: invalid address")
-	ErrZonedAddr   = errors.New("addrbook: zoned address")
 	ErrEmptyPolicy = errors.New("addrbook: empty policy name")
 	ErrNegativeTTL = errors.New("addrbook: negative ttl")
 )
@@ -66,7 +65,7 @@ type record struct {
 type AddrBook struct {
 	retain  time.Duration
 	now     func() time.Time
-	entries map[policy.Name]map[netip.Addr]*record
+	entries map[policy.Name]map[blockable.Addr]*record
 	rename  func(oldpath, newpath string) error // a seam for the crash test
 }
 
@@ -76,26 +75,13 @@ func New(retain time.Duration, now func() time.Time) *AddrBook {
 	return &AddrBook{
 		retain:  retain,
 		now:     now,
-		entries: make(map[policy.Name]map[netip.Addr]*record),
+		entries: make(map[policy.Name]map[blockable.Addr]*record),
 		rename:  osRename,
 	}
 }
 
 func (b *AddrBook) saveSlack() time.Duration {
 	return min(maxSaveSlack, b.retain/2)
-}
-
-// canonical returns the stored form of an address: IPv4-mapped IPv6 is
-// unmapped, so one host has one key. A zone is an error. Dropping it would
-// merge distinct link-local hosts into one entry.
-func canonical(a netip.Addr) (netip.Addr, error) {
-	switch {
-	case !a.IsValid():
-		return netip.Addr{}, ErrInvalidAddr
-	case a.Zone() != "":
-		return netip.Addr{}, ErrZonedAddr
-	}
-	return a.Unmap(), nil
 }
 
 // Observe records that an answer for the policy contained addrs with ttl.
@@ -107,29 +93,26 @@ func canonical(a netip.Addr) (netip.Addr, error) {
 // the expiry in the last successful Save is more than the save slack
 // before the new expiry. A failed Save changes nothing, so the retry
 // still reports true. If any input is invalid, Observe changes nothing.
-func (b *AddrBook) Observe(name policy.Name, addrs []netip.Addr, ttl time.Duration) (needSave bool, err error) {
+// The zero blockable.Addr is invalid: the error then wraps
+// blockable.ErrZero.
+func (b *AddrBook) Observe(name policy.Name, addrs []blockable.Addr, ttl time.Duration) (needSave bool, err error) {
 	if name == "" {
 		return false, ErrEmptyPolicy
 	}
 	if ttl < 0 {
 		return false, ErrNegativeTTL
 	}
-	canon := make([]netip.Addr, 0, len(addrs))
-	for _, a := range addrs {
-		c, err := canonical(a)
-		if err != nil {
-			return false, fmt.Errorf("observe %q: %w", name, err)
-		}
-		canon = append(canon, c)
+	if err := blockable.Check(addrs); err != nil {
+		return false, fmt.Errorf("addrbook: policy %s: %w", name, err)
 	}
 	now := b.now().Round(0) // strip the monotonic reading
 	floor := now.Add(max(ttl, b.retain))
 	byAddr := b.entries[name]
-	if byAddr == nil && len(canon) > 0 {
-		byAddr = make(map[netip.Addr]*record)
+	if byAddr == nil && len(addrs) > 0 {
+		byAddr = make(map[blockable.Addr]*record)
 		b.entries[name] = byAddr
 	}
-	for _, a := range canon {
+	for _, a := range addrs {
 		rec := &record{lastSeen: now, ttl: ttl, expiry: floor}
 		if old, ok := byAddr[a]; ok {
 			rec.savedExpiry = old.savedExpiry
@@ -146,12 +129,12 @@ func (b *AddrBook) Observe(name policy.Name, addrs []netip.Addr, ttl time.Durati
 }
 
 // Addrs returns the addresses of one policy in ascending order.
-func (b *AddrBook) Addrs(name policy.Name) []netip.Addr {
-	out := make([]netip.Addr, 0, len(b.entries[name]))
+func (b *AddrBook) Addrs(name policy.Name) []blockable.Addr {
+	out := make([]blockable.Addr, 0, len(b.entries[name]))
 	for a := range b.entries[name] {
 		out = append(out, a)
 	}
-	slices.SortFunc(out, netip.Addr.Compare)
+	slices.SortFunc(out, blockable.Addr.Compare)
 	return out
 }
 
@@ -212,8 +195,8 @@ func (b *AddrBook) Prune(keep []policy.Name) []Entry {
 	return removed
 }
 
-func entryOf(name policy.Name, a netip.Addr, r *record) Entry {
-	return Entry{Policy: name, Addr: a, LastSeen: r.lastSeen, TTL: r.ttl, Expiry: r.expiry}
+func entryOf(name policy.Name, a blockable.Addr, r *record) Entry {
+	return Entry{Policy: name, Addr: a.Addr(), LastSeen: r.lastSeen, TTL: r.ttl, Expiry: r.expiry}
 }
 
 func (b *AddrBook) isEmpty() bool {

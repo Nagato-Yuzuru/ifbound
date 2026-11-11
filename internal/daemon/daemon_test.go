@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
@@ -27,7 +28,11 @@ func writeSnapshot(t *testing.T, path string, entries map[policy.Name]string) {
 	t.Helper()
 	b := addrbook.New(time.Hour, time.Now)
 	for name, addr := range entries {
-		if _, err := b.Observe(name, []netip.Addr{netip.MustParseAddr(addr)}, time.Minute); err != nil {
+		a, ok := blockable.New(netip.MustParseAddr(addr))
+		if !ok {
+			t.Fatalf("blockable.New(%s) refused", addr)
+		}
+		if _, err := b.Observe(name, []blockable.Addr{a}, time.Minute); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
@@ -68,7 +69,7 @@ type fixture struct {
 	inv   *reconciletest.Inventory
 	rec   reconcile.Reconciler
 	book  *addrbook.AddrBook
-	hosts map[policy.Name][]netip.Addr
+	hosts map[policy.Name][]blockable.Addr
 	now   time.Time
 	cfg   policy.Config
 }
@@ -112,11 +113,7 @@ func (f *fixture) converge(t *testing.T) reconcile.Report {
 
 func (f *fixture) observe(t *testing.T, name policy.Name, addrs ...string) {
 	t.Helper()
-	as := make([]netip.Addr, len(addrs))
-	for i, s := range addrs {
-		as[i] = netip.MustParseAddr(s)
-	}
-	if _, err := f.book.Observe(name, as, time.Minute); err != nil {
+	if _, err := f.book.Observe(name, learned(addrs...), time.Minute); err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
 }
@@ -334,9 +331,9 @@ func TestConvergeExpiryRemovesAddress(t *testing.T) {
 // host file drops it. A policy that is not configured gets no table.
 func TestConvergeHostAddresses(t *testing.T) {
 	f := installV1(t)
-	f.hosts = map[policy.Name][]netip.Addr{
-		"web":  {netip.MustParseAddr("203.0.113.1"), netip.MustParseAddr("203.0.113.9")},
-		"gone": {netip.MustParseAddr("203.0.113.7")},
+	f.hosts = map[policy.Name][]blockable.Addr{
+		"web":  learned("203.0.113.1", "203.0.113.9"),
+		"gone": learned("203.0.113.7"),
 	}
 
 	rep := f.converge(t)
@@ -490,12 +487,12 @@ func TestAdoptableReturnsLearnedLookingEntries(t *testing.T) {
 		t.Fatalf("Adoptable: %v", err)
 	}
 
-	want := map[policy.Name][]netip.Addr{
+	want := map[policy.Name][]blockable.Addr{
 		// 192.0.2.10 is an IP destination; the /24 and /8 are not hosts.
-		"web": {netip.MustParseAddr("198.51.100.7"), netip.MustParseAddr("203.0.113.1")},
-		"ads": {netip.MustParseAddr("3fff::1")},
+		"web": learned("198.51.100.7", "203.0.113.1"),
+		"ads": learned("3fff::1"),
 		// A loaded rule can still refer to the table of a removed policy.
-		"gone": {netip.MustParseAddr("203.0.113.9")},
+		"gone": learned("203.0.113.9"),
 	}
 	if !maps.EqualFunc(got, want, slices.Equal) {
 		t.Errorf("Adoptable = %v, want %v", got, want)
@@ -514,9 +511,7 @@ func TestAdoptableOfEmptyKernelIsEmpty(t *testing.T) {
 
 func TestAddObservedAddsHostEntries(t *testing.T) {
 	f := installV1(t)
-	addrs := []netip.Addr{netip.MustParseAddr("203.0.113.7"), netip.MustParseAddr("3fff::7")}
-
-	if err := f.rec.AddObserved(t.Context(), "web", addrs); err != nil {
+	if err := f.rec.AddObserved(t.Context(), "web", learned("203.0.113.7", "3fff::7")); err != nil {
 		t.Fatalf("AddObserved: %v", err)
 	}
 

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
@@ -73,8 +74,9 @@ type snapshotEntry struct {
 // Save writes the book to path. It removes the temporary files of earlier
 // crashed saves, writes a new temporary file in the same directory, syncs
 // it, renames it over path, and syncs the directory. A crash leaves either
-// the old file or the new one. Save refuses a path that is a symlink and
-// times that Unix nanoseconds cannot hold; it then writes nothing.
+// the old file or the new one. Save refuses a path that is a symlink,
+// times that Unix nanoseconds cannot hold, and the zero blockable.Addr
+// (blockable.ErrZero); it then writes nothing.
 //
 // Only a successful Save moves the saved expiry that Observe compares.
 func (b *AddrBook) Save(path string) error {
@@ -117,13 +119,17 @@ func osRename(oldpath, newpath string) error { return os.Rename(oldpath, newpath
 func (b *AddrBook) encode() ([]byte, error) {
 	f := snapshotFile{Version: snapshotVersion, Entries: []snapshotEntry{}}
 	for _, name := range slices.Sorted(maps.Keys(b.entries)) {
-		for _, a := range b.Addrs(name) {
+		addrs := b.Addrs(name)
+		if err := blockable.Check(addrs); err != nil {
+			return nil, fmt.Errorf("policy %s: %w", name, err)
+		}
+		for _, a := range addrs {
 			r := b.entries[name][a]
 			seen, exp, err := unixNanos(r)
 			if err != nil {
 				return nil, err
 			}
-			f.Entries = append(f.Entries, snapshotEntry{name, a, seen, int64(r.ttl), exp})
+			f.Entries = append(f.Entries, snapshotEntry{name, a.Addr(), seen, int64(r.ttl), exp})
 		}
 	}
 	return json.Marshal(f)
@@ -191,6 +197,8 @@ func syncDir(dir string) error {
 // link, a missing directory and every other read error are errors. Load
 // never loads a part of a snapshot, and a failed Load leaves the book
 // unchanged. Load does not drop expired entries. The next Expire does.
+// Load drops an entry with an address that blockable.New refuses: an
+// earlier version can have saved it. The next Save does not write it.
 //
 // If the configured retain is larger than when the snapshot was saved,
 // the expiry becomes the later of the stored one and
@@ -245,7 +253,7 @@ func badf(format string, args ...any) error {
 // decode reads a snapshot. It accepts each key once, spelled exactly,
 // and nothing after the document. It decodes in two passes: the key set
 // depends on the version.
-func (b *AddrBook) decode(data []byte) (map[policy.Name]map[netip.Addr]*record, error) {
+func (b *AddrBook) decode(data []byte) (map[policy.Name]map[blockable.Addr]*record, error) {
 	var head struct {
 		Version *int `json:"version"`
 	}
@@ -303,15 +311,19 @@ func parseAddr(s string) (netip.Addr, error) {
 	return a, nil
 }
 
-func (b *AddrBook) decodeEntries(items []loadedEntry) (map[policy.Name]map[netip.Addr]*record, error) {
-	out := make(map[policy.Name]map[netip.Addr]*record)
+func (b *AddrBook) decodeEntries(items []loadedEntry) (map[policy.Name]map[blockable.Addr]*record, error) {
+	out := make(map[policy.Name]map[blockable.Addr]*record)
 	for i, item := range items {
-		name, k, r, err := b.decodeEntry(item)
+		name, a, r, err := b.decodeEntry(item)
 		if err != nil {
 			return nil, fmt.Errorf("item %d: %w", i, err)
 		}
+		k, ok := blockable.New(a)
+		if !ok {
+			continue
+		}
 		if out[name] == nil {
-			out[name] = make(map[netip.Addr]*record)
+			out[name] = make(map[blockable.Addr]*record)
 		}
 		if _, dup := out[name][k]; dup {
 			return nil, fmt.Errorf("item %d: %w", i, errDuplicate)
