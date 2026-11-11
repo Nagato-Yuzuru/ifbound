@@ -109,11 +109,13 @@ type Config struct {
 	// negative value keeps the group of the new file, for tests.
 	ConfigGID int
 	// AddrStore is the path of the address book directory (see
-	// addrstore). It must be absolute and clean.
+	// addrstore; layout.AddrBook on the real system). It must be
+	// absolute and clean.
 	AddrStore string
 	// Snapshot is the path of the JSON snapshot of the address book that
-	// earlier versions wrote. Each open of AddrStore merges it into the
-	// book when it exists, and removes it. Empty means none.
+	// earlier versions wrote (layout.Snapshot on the real system). Each
+	// open of AddrStore merges it into the book when it exists, and
+	// removes it. Empty means none.
 	Snapshot string
 	// Hosts reads the host file. It is required.
 	Hosts HostsReader
@@ -245,8 +247,9 @@ func (c Config) check() error {
 // whose last write a crash cut off, or a fresh book without an address
 // of a configured policy, makes the daemon adopt the learned-looking kernel entries that
 // the book does not hold, and save them, before it leaves StateStarting.
-// A damaged place in the book does not stop the open: the daemon logs it
-// and uses the rest (see addrstore.Store.Damage). The self-heal timer retries the open and the
+// A damaged place in the book does not stop the open: the daemon logs it,
+// uses the rest, and is in StateDegraded while that book is open (see
+// addrstore.Store.Damage). The self-heal timer retries the open and the
 // convergence until both succeed. The first pass that opens the book is
 // a normal convergence: it can remove entries.
 //

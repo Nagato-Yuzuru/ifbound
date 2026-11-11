@@ -282,6 +282,11 @@ func (l *loop) reconcile(ctx context.Context, trigger string) error {
 	if p, ok := l.accountsProblem(conf.cfg.Policies); ok {
 		rep.Problems = append(rep.Problems, p)
 	}
+	if loadErr == nil {
+		if p, ok := bookProblem(book); ok {
+			rep.Problems = append(rep.Problems, p)
+		}
+	}
 	if conf.upstream != nil {
 		// Only the stored file at start can fail the check: Apply refuses
 		// such a configuration. The check protects only DNS, so the

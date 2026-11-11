@@ -37,8 +37,9 @@ func damageFirstRecord(t *testing.T, path string) {
 }
 
 // A damaged record in the address book does not stop the open: the
-// daemon logs the damage, uses the rest of the book, and adopts the
-// address of the lost lease from the kernel table.
+// daemon logs the damage, uses the rest of the book, adopts the address
+// of the lost lease from the kernel table, and shows the damage in its
+// status. The damage does not void the enforcement: reports are acked.
 func TestDamagedAddressBookLoadsTheRestAndAdopts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, configV1)
@@ -50,7 +51,11 @@ func TestDamagedAddressBookLoadsTheRestAndAdopts(t *testing.T) {
 
 		h = launch(t, h.spec)
 		defer h.stop()
-		h.wantState(daemon.StateReady)
+		st := h.wantState(daemon.StateDegraded)
+		if !slices.ContainsFunc(st.Reasons, func(r string) bool { return strings.Contains(r, "address book is damaged (places: 1)") }) {
+			t.Errorf("reasons = %q, want the book damage", st.Reasons)
+		}
+		mustDo(t, h.observe(obs("www.example.net", "203.0.113.3")))
 		if got := h.saved("web"); !slices.Contains(got, lost) || !slices.Contains(got, kept) {
 			t.Errorf("web in the book = %v, want %v adopted and %v kept", got, lost, kept)
 		}

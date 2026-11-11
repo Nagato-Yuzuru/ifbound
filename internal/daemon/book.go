@@ -2,11 +2,13 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
+	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
 // addrBook is the address book as the loop uses it. *addrstore.Store
@@ -60,4 +62,26 @@ func (l *loop) closeBook() {
 		return
 	}
 	_ = m.book.Close() //nolint:errcheck // nothing is left to write, so a close error loses nothing
+}
+
+// bookProblem returns the Problem of a book that Open found damaged. The
+// daemon adopted the kernel entries, but a lease that only a suspended
+// VM still holds can be lost. The Problem does not void the enforcement,
+// and it stays while this book is open: the damage stays in the book
+// until its segment expires.
+func bookProblem(b addrBook) (reconcile.Problem, bool) {
+	if b == nil {
+		return reconcile.Problem{}, false
+	}
+	err := b.Damage()
+	if err == nil {
+		return reconcile.Problem{}, false
+	}
+	places := []error{err}
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		places = j.Unwrap()
+	}
+	return reconcile.Problem{Text: fmt.Sprintf(
+		"the address book is damaged (places: %d); the kernel entries were adopted, and a lease outside them can be lost; first: %v",
+		len(places), places[0])}, true
 }
