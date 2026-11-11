@@ -363,8 +363,9 @@ func (l *loop) logStatesEnded(ctx context.Context, cause string, policies []poli
 // loadBook opens the address book. A book that can miss a lease that an
 // earlier run acknowledged makes it adopt the learned-looking entries of
 // the kernel tables that the book does not hold, and commit them first:
-// a book with damage, and a fresh book (see addrstore.Store.Fresh)
-// without an address of a configured policy. Those addresses then stay
+// a book with damage, a torn book (see addrstore.Store.Torn: a damaged
+// last record looks like a cut write), and a fresh book (see
+// addrstore.Store.Fresh) without an address of a configured policy. Those addresses then stay
 // blocked for one retain period instead of being unblocked. A book that
 // this version wrote holds each acknowledged lease, because each lease
 // is durable before its ack; an adoption would only keep the entries
@@ -396,7 +397,7 @@ func (l *loop) loadBook(ctx context.Context, conf activeConfig, retain time.Dura
 			slog.String(logattr.ErrorType, logattr.ErrorTypeSnapshot), slog.String(logattr.ExceptionMessage, err.Error()))
 	}
 	hasConfigured := slices.ContainsFunc(policyNames(conf.cfg), func(n policy.Name) bool { return len(book.Addrs(n)) > 0 })
-	if book.Damage() != nil || book.Fresh() && !hasConfigured {
+	if book.Damage() != nil || book.Torn() || book.Fresh() && !hasConfigured {
 		if err := l.adopt(ctx, book, conf.cfg.Policies); err != nil {
 			_ = book.Close() //nolint:errcheck // the adoption error is the one to report; the next attempt opens the book again
 			return nil, err

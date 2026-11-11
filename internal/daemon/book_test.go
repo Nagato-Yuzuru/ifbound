@@ -60,6 +60,53 @@ func TestDamagedAddressBookLoadsTheRestAndAdopts(t *testing.T) {
 	})
 }
 
+// damageLastRecord flips a byte in the last record of the last segment
+// of the book at path. A load cannot tell it from a write that a crash
+// cut off.
+func damageLastRecord(t *testing.T, path string) {
+	t.Helper()
+	ents, err := os.ReadDir(path)
+	mustDo(t, err)
+	var last string
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), ".seg") {
+			last = e.Name() // ReadDir sorts by name; the test writes one day only
+		}
+	}
+	if last == "" {
+		t.Fatal("no segment")
+	}
+	seg := filepath.Join(path, last)
+	image := readFile(t, seg)
+	image[len(image)-1] ^= 0xff
+	mustDo(t, os.WriteFile(seg, image, 0o600))
+}
+
+// A damaged last record of an acknowledged lease looks like a cut write,
+// so the load drops it without a damage report. The daemon then adopts
+// the kernel entries, and the address stays blocked: the convergence
+// does not remove it from the table.
+func TestDamagedLastRecordStaysBlocked(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, configV1)
+		acked := netip.MustParseAddr("203.0.113.1")
+		mustDo(t, h.observe(obs("www.example.net", acked.String())))
+		h.stop()
+		damageLastRecord(t, bookPath(h.snapshot))
+
+		h = launch(t, h.spec)
+		defer h.stop()
+		h.wantState(daemon.StateReady)
+		heal()
+		if !h.hasEntry("web", netip.PrefixFrom(acked, 32)) {
+			t.Errorf("web table = %v, want the acked %v kept", h.world.Tables()["web"], acked)
+		}
+		if got := h.saved("web"); !slices.Contains(got, acked) {
+			t.Errorf("web in the book = %v, want %v adopted", got, acked)
+		}
+	})
+}
+
 // An upgrade, a downgrade, and an upgrade again: the earlier version acks
 // an address and writes it to its JSON snapshot. The next start merges
 // the snapshot into the address book, so the address stays blocked.

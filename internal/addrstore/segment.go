@@ -2,6 +2,7 @@ package addrstore
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -223,6 +225,8 @@ func parseSegName(name string) (day int64, seq int, ok bool) {
 // segment is what a load found in one segment.
 type segment struct {
 	name    string
+	day     int64
+	seq     int
 	records []lease
 	// bound is the latest expiry that a record of the segment can give:
 	// after it, the segment holds nothing that a load keeps.
@@ -230,17 +234,33 @@ type segment struct {
 	// damage is the error for each place that is not in the file format,
 	// with ErrCorrupt in its chain.
 	damage []error
+	// torn is true when the segment ends in a write that a crash cut off.
+	// end is then the length of its good part.
+	torn bool
+	end  int
 }
 
-// readSegment parses the bytes of one segment. A run of bad records and
-// a part record at the end are a write that never completed: no ack
-// came after it, so it is not damage. A bad record with a good one after
-// it is damage, and so is a bad header.
-func readSegment(name string, data []byte, retain time.Duration) segment {
-	seg := segment{name: name}
+// readSegment parses the bytes of one segment. last tells whether it is
+// the newest segment. Only that one can end in a write that a crash cut
+// off: each older one was synced in full before a newer one started, and
+// a failed append takes back what it wrote (see segDir.append).
+//
+// In the last segment, a run of bad records and a part record at the end
+// are such a cut write: no ack came after it, so they are not damage.
+// Everywhere else a bad record or a part record is damage: an ack can
+// have come after it. A bad header is damage, and so is a short one in a
+// segment that is not the last.
+func readSegment(name string, data []byte, last bool, retain time.Duration) segment {
+	day, seq, _ := parseSegName(name)
+	seg := segment{name: name, day: day, seq: seq, end: len(data)}
 	if len(data) < headerLen {
-		// A creation that never completed: no ack came after it.
 		seg.bound = nameBound(name, retain)
+		if last {
+			// A creation that a crash cut off.
+			seg.torn, seg.end = true, 0
+			return seg
+		}
+		seg.damage = append(seg.damage, fmt.Errorf("%w: segment %s: %d bytes, shorter than a header", ErrCorrupt, name, len(data)))
 		return seg
 	}
 	if err := checkHeader(data[:headerLen]); err != nil {
@@ -249,7 +269,9 @@ func readSegment(name string, data []byte, retain time.Duration) segment {
 		return seg
 	}
 	var pending []error // bad records since the last good one
-	for off := headerLen; off+recordLen <= len(data); off += recordLen {
+	good := headerLen   // the end of the last good record
+	off := headerLen
+	for ; off+recordLen <= len(data); off += recordLen {
 		r, ok, err := decodeRecord(data[off : off+recordLen])
 		if err != nil {
 			pending = append(pending, fmt.Errorf("%w: segment %s offset %d: %v", ErrCorrupt, name, off, err))
@@ -257,9 +279,20 @@ func readSegment(name string, data []byte, retain time.Duration) segment {
 		}
 		seg.damage = append(seg.damage, pending...)
 		pending = nil
+		good = off + recordLen
 		seg.bound = max(seg.bound, r.stamp(retain).expiry)
 		if ok {
 			seg.records = append(seg.records, r)
+		}
+	}
+	if off < len(data) {
+		pending = append(pending, fmt.Errorf("%w: segment %s offset %d: a part record of %d bytes", ErrCorrupt, name, off, len(data)-off))
+	}
+	if len(pending) > 0 {
+		if last {
+			seg.torn, seg.end = true, good
+		} else {
+			seg.damage = append(seg.damage, pending...)
 		}
 	}
 	return seg
@@ -336,18 +369,59 @@ func loadSegments(root *os.Root, retain time.Duration) ([]segment, error) {
 	if err != nil {
 		return nil, err
 	}
-	var segs []segment
+	type found struct {
+		name string
+		day  int64
+		seq  int
+	}
+	var names []found
 	for _, e := range ents {
-		if _, _, ok := parseSegName(e.Name()); !ok || !e.Type().IsRegular() {
+		day, seq, ok := parseSegName(e.Name())
+		if !ok || !e.Type().IsRegular() {
 			continue
 		}
-		data, err := root.ReadFile(e.Name())
+		names = append(names, found{e.Name(), day, seq})
+	}
+	// The last segment is the one with the latest day and, in that day,
+	// the highest sequence number: segDir.create never makes an earlier
+	// name.
+	slices.SortFunc(names, func(a, b found) int {
+		if a.day != b.day {
+			return cmp.Compare(a.day, b.day)
+		}
+		return cmp.Compare(a.seq, b.seq)
+	})
+	segs := make([]segment, 0, len(names))
+	for i, n := range names {
+		data, err := root.ReadFile(n.name)
 		if err != nil {
 			return nil, err
 		}
-		segs = append(segs, readSegment(e.Name(), data, retain))
+		segs = append(segs, readSegment(n.name, data, i == len(names)-1, retain))
 	}
 	return segs, nil
+}
+
+// repair removes the cut write at the end of seg, and makes that
+// durable, so that a later load does not see it again: then the segment
+// is no longer the last one, and a bad end there is damage.
+func (d *segDir) repair(seg segment) error {
+	if seg.end < headerLen {
+		if err := d.root.Remove(seg.name); err != nil {
+			return err
+		}
+		delete(d.bounds, seg.name)
+		return d.syncDir()
+	}
+	f, err := d.root.OpenFile(seg.name, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	err = f.Truncate(int64(seg.end))
+	if err == nil {
+		err = d.sync(f)
+	}
+	return errors.Join(err, f.Close())
 }
 
 // append writes recs at the end of the segment for day, and makes them
@@ -373,17 +447,14 @@ func (d *segDir) append(recs []lease, day int64, retain time.Duration) error {
 		bound = max(bound, r.stamp(retain).expiry)
 	}
 	if _, err := d.cur.WriteAt(buf, d.size); err != nil {
-		d.closeCur()
-		return err
+		return d.takeBack(fresh, err)
 	}
 	if err := d.sync(d.cur); err != nil {
-		d.closeCur()
-		return err
+		return d.takeBack(fresh, err)
 	}
 	if fresh {
 		if err := d.syncDir(); err != nil {
-			d.closeCur()
-			return err
+			return d.takeBack(fresh, err)
 		}
 	}
 	d.size += int64(len(buf))
@@ -391,20 +462,48 @@ func (d *segDir) append(recs []lease, day int64, retain time.Duration) error {
 	return nil
 }
 
-// create makes the next free segment of day the one in use.
-func (d *segDir) create(day int64) error {
-	for seq := 0; ; seq++ {
-		name := segName(day, seq)
-		f, err := d.root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
-		if errors.Is(err, fs.ErrExist) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		d.cur, d.name, d.day, d.size = f, name, day, 0
-		return nil
+// takeBack undoes a failed append and returns err. A fresh segment goes;
+// an older one is cut back to its size before the append. The group got
+// no ack, so its records must not stay in a segment that is not the last
+// one: a load would read them as damage. A take-back that fails leaves
+// them, and the next load reports damage and adopts, which fails closed.
+func (d *segDir) takeBack(fresh bool, err error) error {
+	if fresh {
+		d.closeCur()
+		_ = d.root.Remove(d.name) //nolint:errcheck // see the doc comment: a failed take-back fails closed
+		return err
 	}
+	_ = d.cur.Truncate(d.size) //nolint:errcheck // see the doc comment: a failed take-back fails closed
+	d.closeCur()
+	return err
+}
+
+// create makes a new segment of day the one in use. Its sequence number
+// is one more than the highest of that day, so the newest segment always
+// has the last name (see loadSegments).
+func (d *segDir) create(day int64) error {
+	seq := 0
+	dir, err := d.root.Open(".")
+	if err != nil {
+		return err
+	}
+	ents, err := dir.ReadDir(-1)
+	_ = dir.Close() //nolint:errcheck // a read-only directory handle
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		if eday, eseq, ok := parseSegName(e.Name()); ok && eday == day {
+			seq = max(seq, eseq+1)
+		}
+	}
+	name := segName(day, seq)
+	f, err := d.root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	d.cur, d.name, d.day, d.size = f, name, day, 0
+	return nil
 }
 
 func (d *segDir) closeCur() {

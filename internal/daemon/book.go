@@ -19,6 +19,7 @@ type addrBook interface {
 	Facts() <-chan addrstore.BookFacts
 	Damage() error
 	Fresh() bool
+	Torn() bool
 	Close() error
 }
 

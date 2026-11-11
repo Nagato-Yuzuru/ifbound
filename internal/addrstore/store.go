@@ -125,6 +125,7 @@ type Store struct {
 	retain time.Duration
 	damage error
 	fresh  bool
+	torn   bool
 
 	reqs      chan request
 	stop      chan struct{}
@@ -147,6 +148,7 @@ type Store struct {
 // Open reads every segment. A place that is not in the file format does
 // not stop the open: Open skips it, keeps the rest, and Damage reports
 // it. A write that a crash cut off is not damage: no ack came after it.
+// Open removes it (see Torn).
 //
 // When the JSON snapshot at legacy exists, Open writes its entries to
 // the book and then removes it. Earlier versions wrote that snapshot,
@@ -200,16 +202,7 @@ func (s *Store) prepare(legacy string) error {
 	if err != nil {
 		return err
 	}
-	var damage []error
-	s.index = make(map[policy.Name]map[blockable.Addr]*slot)
-	for _, seg := range segs {
-		damage = append(damage, seg.damage...)
-		s.dir.bounds[seg.name] = seg.bound
-		for _, r := range seg.records {
-			s.loadRecord(r)
-		}
-	}
-	s.damage = errors.Join(damage...)
+	s.damage = s.loadIndex(segs)
 	s.fresh = len(segs) == 0
 	if legacy == "" {
 		return nil
@@ -240,6 +233,30 @@ func (s *Store) prepare(legacy string) error {
 		return fmt.Errorf("remove the imported snapshot: %w", err)
 	}
 	return nil
+}
+
+// loadIndex puts the records of segs in a new index, repairs a cut
+// write, and returns the damage, joined.
+func (s *Store) loadIndex(segs []segment) error {
+	var damage []error
+	s.index = make(map[policy.Name]map[blockable.Addr]*slot)
+	for _, seg := range segs {
+		damage = append(damage, seg.damage...)
+		s.dir.bounds[seg.name] = seg.bound
+		// A new segment never gets an earlier day than the last one.
+		s.dir.day = max(s.dir.day, seg.day)
+		for _, r := range seg.records {
+			s.loadRecord(r)
+		}
+		if !seg.torn {
+			continue
+		}
+		s.torn = true
+		if err := s.dir.repair(seg); err != nil {
+			damage = append(damage, fmt.Errorf("%w: segment %s: the cut write at offset %d stays: %v", ErrCorrupt, seg.name, seg.end, err))
+		}
+	}
+	return errors.Join(damage...)
 }
 
 // loadRecord merges one record into the index.
@@ -300,6 +317,12 @@ func (s *Store) Damage() error { return s.damage }
 // its ack.
 func (s *Store) Fresh() bool { return s.fresh }
 
+// Torn reports whether Open found a write at the end of the last segment
+// that a crash cut off, and removed it. No ack came after such a write.
+// A damaged last record and a cut write look the same there, so a caller
+// that must fail closed treats a torn book as one that can miss a lease.
+func (s *Store) Torn() bool { return s.torn }
+
 // Entry is one entry of the book as a load gives it.
 type Entry struct {
 	Policy policy.Name
@@ -311,7 +334,8 @@ type Entry struct {
 // Read returns the entries that a Store with retain would load from the
 // book at path, sorted by policy and address. It takes no lock and
 // writes nothing, so it can read the book of a running Store; it then
-// sees each record that was durable when it read the segment. It returns
+// sees each record that was durable when it read the segment, and it
+// skips a cut write at the end of the last segment. It returns
 // the entries also when the error wraps ErrCorrupt: the error is then the
 // Damage of such a load. A missing directory is an empty book.
 func Read(path string, retain time.Duration) ([]Entry, error) {

@@ -241,8 +241,9 @@ func (c Config) check() error {
 // configuration removed, and it removes only the entries that
 // blockable.New refuses (see reconcile.Inputs.AddOnly). So after a
 // reboot the destinations that need no book are blocked, and an address
-// that the kernel tables hold stays blocked. A book with damage, or a
-// fresh book without an address of a configured policy, makes the daemon adopt the learned-looking kernel entries that
+// that the kernel tables hold stays blocked. A book with damage, a book
+// whose last write a crash cut off, or a fresh book without an address
+// of a configured policy, makes the daemon adopt the learned-looking kernel entries that
 // the book does not hold, and save them, before it leaves StateStarting.
 // A damaged place in the book does not stop the open: the daemon logs it
 // and uses the rest (see addrstore.Store.Damage). The self-heal timer retries the open and the
