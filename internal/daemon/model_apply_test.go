@@ -297,11 +297,11 @@ func (m *amModel) external() {
 		m.logf("external load")
 	case 3:
 		if m.rnd.IntN(2) == 0 {
-			w.SetProblems([]reconcile.Problem{pfDisabled}, nil)
-			m.logf("pf disabled")
+			w.SetProblems([]reconcile.Problem{unreferenced}, nil)
+			m.logf("voiding problem set")
 		} else {
 			w.SetProblems(nil, nil)
-			m.logf("pf enabled")
+			m.logf("voiding problem cleared")
 		}
 	}
 	if m.frozen != nil {

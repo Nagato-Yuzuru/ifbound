@@ -434,7 +434,7 @@ func TestWarmUpRunsOnlyWhileTheDaemonAcks(t *testing.T) {
 	t.Run("unenforced", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			world := reconciletest.NewWorld()
-			world.SetProblems([]reconcile.Problem{pfDisabled}, nil)
+			world.SetProblems([]reconcile.Problem{unreferenced}, nil)
 			cfgText := warmText(names...)
 			cfg := parse(t, cfgText)
 			h := startWarm(t, world, snapshotPath(t), cfgText, newWarmNet(world, cfg.DNS.Listen))
@@ -461,7 +461,7 @@ func TestWarmUpRunsOnlyWhileTheDaemonAcks(t *testing.T) {
 			h.wantState(daemon.StateReady)
 			h.wantCounts(once("old.example"))
 
-			world.SetProblems([]reconcile.Problem{pfDisabled}, nil)
+			world.SetProblems([]reconcile.Problem{unreferenced}, nil)
 			if err := h.d.Reconfigure(t.Context(), warmConfig(t, "new.example")); err != nil {
 				t.Fatal(err)
 			}
@@ -505,7 +505,7 @@ func TestWarmUpStopsWhenEnforcementEndsAndStartsAgain(t *testing.T) {
 
 		// An interface change converges before the held lookups reach
 		// WarmUpTimeout.
-		world.SetProblems([]reconcile.Problem{pfDisabled}, nil)
+		world.SetProblems([]reconcile.Problem{unreferenced}, nil)
 		h.inv.Set(en0, utun0)
 		time.Sleep(daemon.InterfaceDebounce)
 		synctest.Wait()

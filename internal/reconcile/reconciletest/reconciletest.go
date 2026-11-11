@@ -27,6 +27,10 @@ import (
 // on their own.
 var ErrInjected = errors.New("reconciletest: injected fault")
 
+// DisabledText is the text of the Problem that the Backend reports
+// while the firewall is disabled. The Problem voids enforcement.
+const DisabledText = "the firewall is disabled"
+
 // World is the fake kernel and resolver state. It is safe for concurrent
 // use: the daemon goroutine writes while the test goroutine reads.
 type World struct {
@@ -37,6 +41,8 @@ type World struct {
 	// applied are the resolver entries that the fake system uses now.
 	applied  map[policy.Domain]netip.AddrPort
 	delay    bool
+	disabled bool
+	refuse   bool
 	bproblem []reconcile.Problem
 	rproblem []reconcile.Problem
 	writes   int
@@ -80,11 +86,23 @@ func (w *World) SetAfterWrite(f func()) {
 }
 
 // SetProblems sets the external problems that the Backend and the
-// Resolver report.
+// Resolver report. They stay until the next SetProblems: no write
+// repairs them. DisableFirewall gives the Problem of a disabled firewall.
 func (w *World) SetProblems(backend, resolver []reconcile.Problem) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.bproblem, w.rproblem = slices.Clone(backend), slices.Clone(resolver)
+}
+
+// SetEnableRefused selects whether a Load can enable the firewall. When
+// on is true, a Load while the firewall is disabled fails with
+// ErrInjected and changes nothing, as the real Backend refuses an enable
+// within its rate limit. A Load while the firewall is enabled is not an
+// enable, so it is not refused.
+func (w *World) SetEnableRefused(on bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.refuse = on
 }
 
 // SetResolverDelay selects how the fake system applies resolver changes.
@@ -136,16 +154,33 @@ func (w *World) EndedStates() []netip.Prefix {
 	return slices.Clone(w.ended)
 }
 
-// Ruleset returns the loaded ruleset.
+// Ruleset returns the ruleset in the anchor, also while the firewall is
+// disabled.
 func (w *World) Ruleset() reconcile.Ruleset {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.ruleset
 }
 
-// Referenced returns the policies whose table the loaded ruleset refers
-// to. It reads a ruleset that Compiler built.
-func (w *World) Referenced() []policy.Name { return declared(w.Ruleset()) }
+// FirewallDisabled reports whether the firewall is disabled.
+func (w *World) FirewallDisabled() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.disabled
+}
+
+// Referenced returns the policies whose table the rules in effect refer
+// to: none while the firewall is disabled. It reads a ruleset that
+// Compiler built. It reads the World, not the Backend, so a test can use
+// it to check what the Backend reports.
+func (w *World) Referenced() []policy.Name {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.disabled {
+		return nil
+	}
+	return declared(w.ruleset)
+}
 
 // declared returns the tables that a ruleset of Compiler declares.
 func declared(rs reconcile.Ruleset) []policy.Name {
@@ -221,6 +256,16 @@ func (w *World) ExternalLoad(body []byte) {
 	w.ruleset = reconcile.NewRuleset(body)
 }
 
+// DisableFirewall disables the firewall, as an external "pfctl -d"
+// would. It is not a write: no hook runs. The ruleset and the tables
+// stay, but the Backend reports no loaded ruleset until a Load enables
+// the firewall again.
+func (w *World) DisableFirewall() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.disabled = true
+}
+
 // RemoveResolverEntry deletes a resolver entry, as an external tool
 // would. It is not a write: no hook runs. The system applies it as it
 // applies a Remove.
@@ -237,8 +282,10 @@ func (w *World) removeLocked(d policy.Domain) {
 	}
 }
 
-// write runs one write call: the before hook, apply, the after hook.
-func (w *World) write(apply func()) error {
+// write runs one write call: the before hook, apply, the after hook. When
+// apply fails, the World must not have changed, and the after hook does
+// not run.
+func (w *World) write(apply func() error) error {
 	w.mu.Lock()
 	w.writes++
 	n, before := w.writes, w.before
@@ -249,9 +296,12 @@ func (w *World) write(apply func()) error {
 		}
 	}
 	w.mu.Lock()
-	apply()
+	err := apply()
 	after := w.after
 	w.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	if after != nil {
 		after()
 	}
@@ -265,26 +315,46 @@ type Backend struct{ w *World }
 
 var _ reconcile.Backend = (*Backend)(nil)
 
-// Read implements reconcile.Backend.
+// Read implements reconcile.Backend. While the firewall is disabled, the
+// ruleset ID is "" and a Problem voids the enforcement.
 func (b *Backend) Read(context.Context) (reconcile.BackendState, error) {
 	b.w.mu.Lock()
 	defer b.w.mu.Unlock()
+	problems := slices.Clone(b.w.bproblem)
+	if b.w.disabled {
+		problems = append(problems, reconcile.Problem{Text: DisabledText, Voids: true})
+	}
 	return reconcile.BackendState{
-		Ruleset:  b.w.ruleset.ID(),
+		Ruleset:  b.w.loadedIDLocked(),
 		Tables:   b.w.tablesLocked(),
-		Problems: slices.Clone(b.w.bproblem),
+		Problems: problems,
 	}, nil
 }
 
 // LoadedID implements reconcile.Backend.
 func (b *Backend) LoadedID(context.Context) (string, error) {
-	return b.w.Ruleset().ID(), nil
+	b.w.mu.Lock()
+	defer b.w.mu.Unlock()
+	return b.w.loadedIDLocked(), nil
 }
 
-// Load implements reconcile.Backend.
+// loadedIDLocked returns the ID of the loaded ruleset, or "" while the
+// firewall is disabled: no rule is in effect then.
+func (w *World) loadedIDLocked() string {
+	if w.disabled {
+		return ""
+	}
+	return w.ruleset.ID()
+}
+
+// Load implements reconcile.Backend. It enables the firewall, or fails
+// when SetEnableRefused refuses the enable.
 func (b *Backend) Load(_ context.Context, rs reconcile.Ruleset) error {
-	return b.w.write(func() {
-		b.w.ruleset = rs
+	return b.w.write(func() error {
+		if b.w.disabled && b.w.refuse {
+			return fmt.Errorf("enabling the firewall: %w", ErrInjected)
+		}
+		b.w.ruleset, b.w.disabled = rs, false
 		for _, name := range declared(rs) {
 			if b.w.tables[name] == nil {
 				b.w.tables[name] = make(map[netip.Prefix]struct{})
@@ -294,12 +364,13 @@ func (b *Backend) Load(_ context.Context, rs reconcile.Ruleset) error {
 		for _, name := range slices.Sorted(maps.Keys(tables)) {
 			b.w.ended = append(b.w.ended, tables[name]...)
 		}
+		return nil
 	})
 }
 
 // AddEntries implements reconcile.Backend.
 func (b *Backend) AddEntries(_ context.Context, table policy.Name, entries []netip.Prefix) error {
-	return b.w.write(func() {
+	return b.w.write(func() error {
 		t := b.w.tables[table]
 		if t == nil {
 			t = make(map[netip.Prefix]struct{})
@@ -309,21 +380,26 @@ func (b *Backend) AddEntries(_ context.Context, table policy.Name, entries []net
 			t[e] = struct{}{}
 		}
 		b.w.ended = append(b.w.ended, entries...)
+		return nil
 	})
 }
 
 // RemoveEntries implements reconcile.Backend.
 func (b *Backend) RemoveEntries(_ context.Context, table policy.Name, entries []netip.Prefix) error {
-	return b.w.write(func() {
+	return b.w.write(func() error {
 		for _, e := range entries {
 			delete(b.w.tables[table], e)
 		}
+		return nil
 	})
 }
 
 // DropTable implements reconcile.Backend.
 func (b *Backend) DropTable(_ context.Context, table policy.Name) error {
-	return b.w.write(func() { delete(b.w.tables, table) })
+	return b.w.write(func() error {
+		delete(b.w.tables, table)
+		return nil
+	})
 }
 
 // Resolver is the reconcile.SysResolver face of a World.
@@ -344,17 +420,21 @@ func (r *Resolver) Read(context.Context) (reconcile.ResolverState, error) {
 // Write implements reconcile.SysResolver. With a delay, the fake system
 // uses the entry only after SettleResolver.
 func (r *Resolver) Write(_ context.Context, e reconcile.ResolverEntry) error {
-	return r.w.write(func() {
+	return r.w.write(func() error {
 		r.w.resolver[e.Domain] = e.Server
 		if !r.w.delay {
 			r.w.applied[e.Domain] = e.Server
 		}
+		return nil
 	})
 }
 
 // Remove implements reconcile.SysResolver.
 func (r *Resolver) Remove(_ context.Context, d policy.Domain) error {
-	return r.w.write(func() { r.w.removeLocked(d) })
+	return r.w.write(func() error {
+		r.w.removeLocked(d)
+		return nil
+	})
 }
 
 // Compiler is a fake reconcile.Compiler. Its ruleset text has one

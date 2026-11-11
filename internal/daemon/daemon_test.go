@@ -277,12 +277,12 @@ func TestFailedFirstConvergenceIsUnenforced(t *testing.T) {
 func TestVoidingProblemAtStartIsUnenforced(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		world := reconciletest.NewWorld()
-		world.SetProblems([]reconcile.Problem{pfDisabled}, nil)
+		world.SetProblems([]reconcile.Problem{unreferenced}, nil)
 		h := start(t, world, reconciletest.NewInventory(en0), filepath.Join(t.TempDir(), "s.json"), configV1)
 		defer h.stop()
 
 		st := h.wantState(daemon.StateUnenforced)
-		if !slices.Equal(st.Reasons, []string{pfDisabled.Text}) {
+		if !slices.Equal(st.Reasons, []string{unreferenced.Text}) {
 			t.Errorf("reasons = %q, want the problem", st.Reasons)
 		}
 		if err := h.observe(obs("www.example.net", "203.0.113.1")); !errors.Is(err, daemon.ErrUnenforced) {
@@ -302,11 +302,11 @@ func TestVoidingProblemAfterReadyStopsAcks(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, configV1)
 		defer h.stop()
-		h.world.SetProblems([]reconcile.Problem{pfDisabled}, []reconcile.Problem{conflict})
+		h.world.SetProblems([]reconcile.Problem{unreferenced}, []reconcile.Problem{conflict})
 		heal()
 
 		st := h.wantState(daemon.StateUnenforced)
-		if want := []string{pfDisabled.Text, conflict.Text}; !slices.Equal(st.Reasons, want) {
+		if want := []string{unreferenced.Text, conflict.Text}; !slices.Equal(st.Reasons, want) {
 			t.Errorf("reasons = %q, want %q", st.Reasons, want)
 		}
 		if err := h.observe(obs("www.example.net", "203.0.113.1")); !errors.Is(err, daemon.ErrUnenforced) {
@@ -689,7 +689,7 @@ func TestObserveWithoutAddressNeedsAnEnforcingPhase(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, configV1)
 		defer h.stop()
-		h.world.SetProblems([]reconcile.Problem{pfDisabled}, nil)
+		h.world.SetProblems([]reconcile.Problem{unreferenced}, nil)
 		heal()
 		h.wantState(daemon.StateUnenforced)
 		if _, err := h.d.Observe(t.Context(), obs("www.example.net")); !errors.Is(err, daemon.ErrUnenforced) {
@@ -721,17 +721,18 @@ func TestForeignRulesetIsUnenforcedWhileRepairFails(t *testing.T) {
 }
 
 // TestVoidingProblemIsNoticedWithinSelfHealInterval pins the accepted
-// window: the daemon learns of a problem that voids enforcement only at a
-// convergence. A problem that appears just after one is noticed at the
-// next self-heal, no later than SelfHealInterval after it appears, and
-// from then on no report is acknowledged.
+// window: the daemon learns of a problem that voids enforcement and keeps
+// the loaded ruleset only at a convergence. A problem that appears just
+// after one is noticed at the next self-heal, no later than
+// SelfHealInterval after it appears, and from then on no report is
+// acknowledged.
 func TestVoidingProblemIsNoticedWithinSelfHealInterval(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, configV1)
 		defer h.stop()
 		heal() // a self-heal pass has just run
 		time.Sleep(time.Millisecond)
-		h.world.SetProblems([]reconcile.Problem{pfDisabled}, nil)
+		h.world.SetProblems([]reconcile.Problem{unreferenced}, nil)
 
 		time.Sleep(daemon.SelfHealInterval)
 		synctest.Wait()
@@ -739,6 +740,47 @@ func TestVoidingProblemIsNoticedWithinSelfHealInterval(t *testing.T) {
 		h.wantState(daemon.StateUnenforced)
 		if err := h.observe(obs("www.example.net", "203.0.113.1")); !errors.Is(err, daemon.ErrUnenforced) {
 			t.Errorf("Observe = %v, want ErrUnenforced", err)
+		}
+	})
+}
+
+// A disabled firewall has no window: the Backend reports no loaded
+// ruleset, so the next protected report gets no ack. The convergence
+// that the report starts enables the firewall again, and the acks come
+// back at the next convergence.
+func TestDisabledFirewallStopsTheNextAck(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, configV1)
+		defer h.stop()
+		h.wantState(daemon.StateReady)
+		installed := h.world.Ruleset().ID()
+		heal() // a self-heal pass has just run
+		h.world.DisableFirewall()
+
+		if err := h.observe(obs("www.example.net", "203.0.113.1")); !errors.Is(err, daemon.ErrUnenforced) {
+			t.Fatalf("Observe with the firewall disabled = %v, want ErrUnenforced", err)
+		}
+		synctest.Wait() // no time passes: this is not the self-heal
+
+		if id, err := h.world.Backend().LoadedID(t.Context()); err != nil || id != installed {
+			t.Errorf("LoadedID after the convergence = %q, %v; want the installed ruleset %q", id, err, installed)
+		}
+		// Known behavior, not a promise: the convergence still reports the
+		// Problem that it read before its Load. A change that reads the
+		// Backend again after the Load flips this to ready and must
+		// update this check.
+		if st := h.wantState(daemon.StateUnenforced); !slices.Equal(st.Reasons, []string{reconciletest.DisabledText}) {
+			t.Errorf("reasons after the convergence = %q, want the stale Problem %q", st.Reasons, reconciletest.DisabledText)
+		}
+		heal()
+		h.wantState(daemon.StateReady)
+		if err := h.observe(obs("www.example.net", "203.0.113.2")); err != nil {
+			t.Errorf("Observe after the next convergence = %v, want ack", err)
+		}
+		for _, a := range []string{"203.0.113.1", "203.0.113.2"} {
+			if !h.hasEntry("web", host(a)) {
+				t.Errorf("address %s is not in the table", a)
+			}
 		}
 	})
 }
