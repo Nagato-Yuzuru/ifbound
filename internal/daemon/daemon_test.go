@@ -75,8 +75,13 @@ func TestStartPrunesRemovedPoliciesAfterInstall(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if got := h.saved("gone"); len(got) != 0 {
-			t.Errorf("snapshot keeps %v for a policy that left the configuration", got)
+		// The log of the book keeps the record of the removed policy, and
+		// each load prunes it again: a restart does not block it.
+		h = h.restart()
+		defer h.stop()
+		h.wantState(daemon.StateReady)
+		if h.tablesHold(netip.MustParseAddr("203.0.113.9")) {
+			t.Errorf("after a restart, tables = %v hold 203.0.113.9 of the removed policy", h.world.Tables())
 		}
 	})
 }
@@ -275,10 +280,9 @@ func TestStartWithoutSnapshotAdoptsKernelEntries(t *testing.T) {
 		}
 		// The table of a policy outside the configuration is adopted too,
 		// and it goes away once the installed ruleset no longer refers to
-		// it. The prune after the install removes it from the book.
-		if got := h.saved("gone"); len(got) != 0 {
-			t.Errorf("book gone = %v, want it pruned after the install", got)
-		}
+		// it. The prune after the install removes it from the book in
+		// memory; its record stays in the log until it expires, and each
+		// load prunes it again (TestStartPrunesRemovedPoliciesAfterInstall).
 		if _, ok := h.world.Tables()["gone"]; ok {
 			t.Error("the table of a policy outside the configuration stays after the install")
 		}
@@ -950,8 +954,14 @@ func TestReconfigurePrunesRemovedPolicyAfterInstall(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if got := h.saved("ads"); len(got) != 0 {
-			t.Errorf("snapshot keeps %v of the removed policy", got)
+		// The prune removes the entry from the book in memory, so no table
+		// holds it. Its record stays in the log, and each load prunes it
+		// again (TestStartPrunesRemovedPoliciesAfterInstall).
+		if h.tablesHold(netip.MustParseAddr("3fff::1")) {
+			t.Errorf("tables = %v hold 3fff::1 of the removed policy", h.world.Tables())
+		}
+		if got := h.status().Addrs; got != 1 {
+			t.Errorf("status counts %d learned addresses, want 1 (203.0.113.2 of web)", got)
 		}
 	})
 }

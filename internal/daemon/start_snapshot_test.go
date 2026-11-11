@@ -318,7 +318,7 @@ func TestWarmUpWaitsForTheProbeAndRetriesLater(t *testing.T) {
 		d := daemon.New(daemon.Config{
 			ConfigPath: storeConfig(t, t.TempDir(), rigCfgA),
 			ConfigGID:  -1,
-			AddrStore:  filepath.Join(t.TempDir(), "addrbook.db"),
+			AddrStore:  filepath.Join(t.TempDir(), "addrbook"),
 			// A missing host file: the tests here do not read the host file of the machine.
 			Hosts: &fakeHosts{},
 			Platform: reconcile.Reconciler{

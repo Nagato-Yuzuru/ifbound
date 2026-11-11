@@ -2,7 +2,6 @@ package daemon_test
 
 import (
 	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -387,7 +386,7 @@ func TestAdoptionSkipsHostAddresses(t *testing.T) {
 		h.writeHosts("10.1.1.1 example.com\n")
 		heal()
 		h.stop()
-		if err := os.Remove(bookPath(h.snapshot)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := os.RemoveAll(bookPath(h.snapshot)); err != nil {
 			t.Fatal(err)
 		}
 

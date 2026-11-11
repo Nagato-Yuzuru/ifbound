@@ -184,7 +184,7 @@ func pvStack(t *testing.T, timeout time.Duration) (*handler, *pvCounter, *reconc
 	d := daemon.New(daemon.Config{
 		ConfigPath: store,
 		ConfigGID:  -1,
-		AddrStore:  filepath.Join(t.TempDir(), "addrbook.db"),
+		AddrStore:  filepath.Join(t.TempDir(), "addrbook"),
 		// A missing host file: the test does not read the host file of the machine.
 		Hosts: hostsfs.Reader{Path: filepath.Join(t.TempDir(), "hosts")},
 		Platform: reconcile.Reconciler{

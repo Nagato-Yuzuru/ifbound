@@ -17,6 +17,8 @@ type addrBook interface {
 	Commit(ctx context.Context, p addrstore.Pending) error
 	Apply(ctx context.Context, op addrstore.Op) (int, error)
 	Facts() <-chan addrstore.BookFacts
+	Damage() error
+	Fresh() bool
 	Close() error
 }
 
@@ -49,15 +51,12 @@ func (l *loop) bookFacts(b addrBook) addrstore.BookFacts {
 	return l.facts
 }
 
-// closeBook writes the refreshes of the book that are only in memory, and
-// closes the book. ctx can be done: the flush does not end with it.
-func (l *loop) closeBook(ctx context.Context) {
+// closeBook closes the book. Each acknowledged lease is already durable,
+// so the close has nothing to write.
+func (l *loop) closeBook() {
 	m, ok := l.mode.(runningMode)
 	if !ok {
 		return
 	}
-	// A failed flush loses at most the refreshes inside the save slack,
-	// as a crash does; the persist rule allows it.
-	_, _ = m.book.Apply(context.WithoutCancel(ctx), addrstore.Flush{}) //nolint:errcheck // see above
-	_ = m.book.Close()                                                 //nolint:errcheck // the flush above is the last write; a close error loses nothing
+	_ = m.book.Close() //nolint:errcheck // nothing is left to write, so a close error loses nothing
 }

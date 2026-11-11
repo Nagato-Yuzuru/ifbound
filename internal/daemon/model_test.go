@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -34,8 +33,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"go.etcd.io/bbolt"
-
+	"github.com/Nagato-Yuzuru/ifbound/internal/addrstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
@@ -59,13 +57,9 @@ var (
 	omStats = map[string]int{}
 )
 
-const (
-	omRetain = time.Hour
-	// omSlack is the save slack of the addrbook persist rule for omRetain:
-	// min(1h, retain/2). After a restart, an ack is durable only to its
-	// expiry minus this slack.
-	omSlack = 30 * time.Minute
-)
+// omRetain is the retain of the model configurations. Each ack is
+// durable to its full expiry: a record of the book never gives less.
+const omRetain = time.Hour
 
 // ---- configuration model ----
 
@@ -828,7 +822,7 @@ func (r *omRun) deleteSnapshotLocked() {
 	if err := os.Chmod(r.dir, 0o700); err != nil {
 		r.t.Fatal(err)
 	}
-	if err := os.Remove(r.snap); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.RemoveAll(r.snap); err != nil {
 		r.t.Fatal(err)
 	}
 	if r.saveFail {
@@ -880,7 +874,7 @@ func (r *omRun) computeAdoption() {
 	}
 }
 
-// ---- address book reader, written from the file format of addrstore ----
+// ---- address book reader ----
 
 type omSnapEntry struct {
 	Policy string
@@ -888,46 +882,18 @@ type omSnapEntry struct {
 	Expiry int64
 }
 
-// snapEntries reads a copy of the book file: the daemon locks the file
-// while it runs.
+// snapEntries returns the entries that a load of the book gives, also
+// the expired ones and those of a removed policy: the log of the book
+// records no removal. addrstore.Read takes no lock, so it reads the book
+// of the running daemon.
 func (r *omRun) snapEntries() []omSnapEntry {
-	data, err := os.ReadFile(r.snap)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	entries, err := addrstore.Read(r.snap, 0)
 	if err != nil {
 		r.violate("reading the book: %v", err)
-		return nil
 	}
-	cp := filepath.Join(r.t.TempDir(), "book.db")
-	if err := os.WriteFile(cp, data, 0o600); err != nil {
-		r.t.Fatal(err)
-	}
-	db, err := bbolt.Open(cp, 0o600, &bbolt.Options{ReadOnly: true})
-	if err != nil {
-		r.violate("the book is not a bbolt file: %v", err)
-		return nil
-	}
-	defer db.Close() //nolint:errcheck // a read-only copy
-	var out []omSnapEntry
-	err = db.View(func(tx *bbolt.Tx) error {
-		book := tx.Bucket([]byte("book"))
-		if book == nil {
-			return nil
-		}
-		return book.ForEachBucket(func(name []byte) error {
-			return book.Bucket(name).ForEach(func(k, v []byte) error {
-				var a netip.Addr
-				if err := a.UnmarshalBinary(k); err != nil || len(v) != 24 {
-					return fmt.Errorf("bad entry %x=%x: %v", k, v, err)
-				}
-				out = append(out, omSnapEntry{string(name), a.String(), int64(binary.BigEndian.Uint64(v[16:24]))})
-				return nil
-			})
-		})
-	})
-	if err != nil {
-		r.violate("reading the book: %v", err)
+	out := make([]omSnapEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, omSnapEntry{string(e.Policy), e.Addr.String(), e.Expiry.UnixNano()})
 	}
 	return out
 }
@@ -1103,11 +1069,11 @@ func (r *omRun) recordAckLocked(matched []string, addrs []netip.Addr, exp time.T
 			if exp.After(e.mem) {
 				e.mem = exp
 			}
-			if d := exp.Add(-omSlack); d.After(e.disk) {
-				e.disk = d
+			if exp.After(e.disk) {
+				e.disk = exp
 			}
-			if got, ok := r.snapExpiry(k); !ok || got.Before(exp.Add(-omSlack)) {
-				r.violate("spec1: ack of %s/%v, snapshot expiry %v (present %v), want >= %v", p, a, got, ok, exp.Add(-omSlack))
+			if got, ok := r.snapExpiry(k); !ok || got.Before(exp) {
+				r.violate("spec1: ack of %s/%v, snapshot expiry %v (present %v), want >= %v", p, a, got, ok, exp)
 			}
 		}
 	}
@@ -1581,7 +1547,7 @@ func newOmRun(t *testing.T, initial omCfg) *omRun {
 	dir := t.TempDir()
 	r := &omRun{
 		t: t, world: reconciletest.NewWorld(), inv: reconciletest.NewInventory(omEn0),
-		dir: dir, snap: filepath.Join(dir, "addrbook.db"), store: filepath.Join(t.TempDir(), "config.toml"),
+		dir: dir, snap: filepath.Join(dir, "addrbook"), store: filepath.Join(t.TempDir(), "config.toml"),
 		tracked: map[omKey]*omEntry{}, pending: map[omKey]*omEntry{}, rsDamageSeq: -1,
 	}
 	r.setCfg(initial.clone())

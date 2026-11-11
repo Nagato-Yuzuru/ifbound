@@ -5,61 +5,58 @@ import (
 	"io/fs"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
-	"time"
 
-	"go.etcd.io/bbolt"
-
-	"github.com/Nagato-Yuzuru/ifbound/internal/addrstore"
-	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
-// writeDamagedBook writes an address book at path with one address, and
-// then damages the type of each page after the two meta pages.
-func writeDamagedBook(t *testing.T, path string) {
+// damageFirstRecord flips a byte in the first record of the first
+// segment of the book at path. The record after it stays good, so a load
+// sees damage, not a torn write.
+func damageFirstRecord(t *testing.T, path string) {
 	t.Helper()
-	s, err := addrstore.Open(path, "", time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, _ := blockable.New(netip.MustParseAddr("203.0.113.1"))
-	p, err := s.Touch([]policy.Name{"web"}, []blockable.Addr{a}, 0, time.Now())
+	ents, err := os.ReadDir(path)
 	mustDo(t, err)
-	mustDo(t, s.Commit(t.Context(), p))
-	mustDo(t, s.Close())
-	db, err := bbolt.Open(path, 0o600, &bbolt.Options{ReadOnly: true})
-	mustDo(t, err)
-	pageSize := db.Info().PageSize
-	mustDo(t, db.Close())
-	image := readFile(t, path)
-	const flagsAt = 8 // the offset of the page type in the page header
-	for off := 2 * pageSize; off < len(image); off += pageSize {
-		image[off+flagsAt], image[off+flagsAt+1] = 0xff, 0xff
+	for _, e := range ents {
+		if !strings.HasSuffix(e.Name(), ".seg") {
+			continue
+		}
+		seg := filepath.Join(path, e.Name())
+		image := readFile(t, seg)
+		const firstRecord = 32 // after the segment header
+		image[firstRecord+30] ^= 0xff
+		mustDo(t, os.WriteFile(seg, image, 0o600))
+		return
 	}
-	mustDo(t, os.WriteFile(path, image, 0o600))
+	t.Fatal("no segment")
 }
 
-// An address book with a damaged page does not open, and the daemon
-// lives: it starts add-only, as for any book that does not open.
-func TestDamagedAddressBookGivesTheAddOnlyStart(t *testing.T) {
+// A damaged record in the address book does not stop the open: the
+// daemon logs the damage, uses the rest of the book, and adopts the
+// address of the lost lease from the kernel table.
+func TestDamagedAddressBookLoadsTheRestAndAdopts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s := unloadableWithKernelEntries(t)
-		mustDo(t, os.Remove(s.snapshot))
-		writeDamagedBook(t, bookPath(s.snapshot))
-		h := launch(t, s)
-		defer h.stop()
+		h := newHarness(t, configV1)
+		lost, kept := netip.MustParseAddr("203.0.113.1"), netip.MustParseAddr("203.0.113.2")
+		mustDo(t, h.observe(obs("www.example.net", lost.String())))
+		mustDo(t, h.observe(obs("www.example.net", kept.String())))
+		h.stop()
+		damageFirstRecord(t, bookPath(h.snapshot))
 
-		wantAddOnly(h)
-		if st := h.status(); !strings.Contains(st.Reasons[0], addrstore.ErrCorrupt.Error()) {
-			t.Errorf("first reason = %q, want the corrupt store", st.Reasons[0])
+		h = launch(t, h.spec)
+		defer h.stop()
+		h.wantState(daemon.StateReady)
+		if got := h.saved("web"); !slices.Contains(got, lost) || !slices.Contains(got, kept) {
+			t.Errorf("web in the book = %v, want %v adopted and %v kept", got, lost, kept)
 		}
-		heal()
-		wantAddOnly(h)
+		if len(h.logs.events("address book damaged")) != 1 {
+			t.Error("no log of the damage")
+		}
 	})
 }
 

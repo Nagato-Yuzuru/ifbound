@@ -345,7 +345,7 @@ func TestApplyWithAnEndedContextNeverStores(t *testing.T) {
 func TestRunRefusesABadConfig(t *testing.T) {
 	const (
 		path = "/var/db/ifbound/config.toml"
-		book = "/var/db/ifbound/addrbook.db"
+		book = "/var/db/ifbound/addrbook"
 	)
 	tests := []struct {
 		name string
@@ -358,8 +358,8 @@ func TestRunRefusesABadConfig(t *testing.T) {
 		{"relative path", "state/config.toml", book, -1, false},
 		{"path not clean", "/var/db/ifbound/../ifbound/config.toml", book, -1, false},
 		{"empty path", "", book, -1, false},
-		{"relative book path", path, "addrbook.db", -1, false},
-		{"book path not clean", path, "/var/db/ifbound/./addrbook.db", -1, false},
+		{"relative book path", path, "addrbook", -1, false},
+		{"book path not clean", path, "/var/db/ifbound/./addrbook", -1, false},
 		{"empty book path", path, "", -1, false},
 		{"zero gid", path, book, 0, false},
 		{"nil hosts", path, book, -1, true},

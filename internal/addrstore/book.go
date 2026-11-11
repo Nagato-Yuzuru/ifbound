@@ -7,38 +7,36 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go.etcd.io/bbolt"
-
 	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
-// slot is one entry of the index. cur is the entry in memory; saved is
-// the entry that the last commit wrote. cur is never earlier than saved
-// for long: the committer sets saved and then merges it into cur.
+// slot is one entry of the index. cur is the entry in memory; bound is
+// the expiry that the durable records of the entry give at a load. cur
+// can be later than bound only during a commit that writes it.
 type slot struct {
 	cur   atomic.Pointer[stamp]
-	saved atomic.Pointer[stamp]
+	bound atomic.Int64
 }
 
-func newSlot(cur, saved stamp) *slot {
+func newSlot(cur stamp, bound int64) *slot {
 	sl := &slot{}
 	sl.cur.Store(&cur)
-	sl.saved.Store(&saved)
+	sl.bound.Store(bound)
 	return sl
 }
 
-// refresh merges obs into the entry in memory when the merged expiry is
-// at most slack after the expiry on disk. It reports whether it did; on
-// false the entry needs a commit. A removed entry always needs one.
-func (sl *slot) refresh(obs stamp, slack int64) bool {
+// refresh merges obs into the entry in memory when the durable bound
+// covers the merged expiry. It reports whether it did; on false the
+// entry needs a commit. A removed entry always needs one.
+func (sl *slot) refresh(obs stamp) bool {
 	for {
 		old := sl.cur.Load()
 		if old.gone {
 			return false
 		}
 		next := merge(*old, obs)
-		if next.expiry-slack > sl.saved.Load().expiry {
+		if next.expiry > sl.bound.Load() {
 			return false
 		}
 		if next == *old || sl.cur.CompareAndSwap(old, &next) {
@@ -53,6 +51,16 @@ func (sl *slot) mergeCur(st stamp) {
 		old := sl.cur.Load()
 		next := merge(*old, st)
 		if next == *old || sl.cur.CompareAndSwap(old, &next) {
+			return
+		}
+	}
+}
+
+// raise moves the durable bound to b when b is later.
+func (sl *slot) raise(b int64) {
+	for {
+		old := sl.bound.Load()
+		if b <= old || sl.bound.CompareAndSwap(old, b) {
 			return
 		}
 	}
@@ -76,11 +84,11 @@ func (p Pending) Empty() bool { return len(p.writes) == 0 }
 // later of the old expiry and at + max(ttl, retain), so it never moves
 // earlier.
 //
-// A known address whose new expiry is at most the save slack after its
-// expiry on disk changes only in memory, at once. Every other address,
-// and every new one, goes into the Pending, and the index does not change
-// until Commit writes it. Commit the Pending, and acknowledge the answer
-// only after Commit returns nil.
+// A known address whose durable record covers the new expiry changes
+// only in memory, at once. Every other address, and every new one, goes
+// into the Pending, and the index does not change until Commit writes
+// it. Commit the Pending, and acknowledge the answer only after Commit
+// returns nil.
 //
 // If any input is invalid, Touch changes nothing. The zero
 // blockable.Addr is invalid: the error then wraps blockable.ErrZero.
@@ -94,7 +102,7 @@ func (s *Store) Touch(names []policy.Name, addrs []blockable.Addr, ttl time.Dura
 	defer s.mu.RUnlock()
 	for _, name := range names {
 		for _, a := range addrs {
-			if sl := s.index[name][a]; sl != nil && sl.refresh(obs, s.slack) {
+			if sl := s.index[name][a]; sl != nil && sl.refresh(obs) {
 				continue
 			}
 			p.writes = append(p.writes, write{key{name, a}, obs})
@@ -123,15 +131,23 @@ func (s *Store) observation(names []policy.Name, addrs []blockable.Addr, ttl tim
 	if !ok {
 		return stamp{}, fmt.Errorf("%w: %v + %v", ErrTimeRange, at, max(ttl, s.retain))
 	}
-	return stamp{seen: seen, ttl: int64(ttl), expiry: exp}, nil
+	st := stamp{seen: seen, expiry: exp}
+	for _, name := range names {
+		// A record must hold the entry: check the fields now, so that a
+		// commit cannot fail for one member of a group.
+		if _, err := recordOf(key{policy: name}, st); err != nil {
+			return stamp{}, err
+		}
+	}
+	return st, nil
 }
 
-// Commit writes the entries of p. It shares one transaction with the
-// other requests that wait at the same time, and returns the result of
-// that transaction. After a nil return the entries are on disk and in
-// the index. After an error the index is as before. An empty p returns
-// nil at once. It returns ctx.Err() when ctx ends first, and ErrClosed
-// after Close; the commit can still happen after ctx ends.
+// Commit writes the entries of p. It shares one sync with the other
+// requests that wait at the same time, and returns the result of that
+// write. After a nil return the entries are durable and in the index.
+// After an error the index is as before. An empty p returns nil at once.
+// It returns ctx.Err() when ctx ends first, and ErrClosed after Close;
+// the commit can still happen after ctx ends.
 func (s *Store) Commit(ctx context.Context, p Pending) error {
 	if p.Empty() {
 		return nil
@@ -145,50 +161,35 @@ func (s *Store) Commit(ctx context.Context, p Pending) error {
 //sumtype:decl
 type Op interface{ isOp() }
 
-// Expire removes each entry whose expiry is before At.
+// Expire removes each entry whose expiry is before At. It also removes
+// each segment that holds no entry that is kept at At.
 type Expire struct{ At time.Time }
 
 // Prune removes every entry of a policy that is not in Keep. An empty
 // Keep removes all entries.
 type Prune struct{ Keep []policy.Name }
 
-// Adopt writes the addresses in Found as answers with TTL 0 at At: each
-// gets a fresh retain period. Adopt always commits each entry, also one
-// inside the save slack.
+// Adopt writes each address in Found that the book does not hold, as an
+// answer with TTL 0 at At: it gets a fresh retain period. An address
+// that the book holds keeps its expiry, so an adoption at each start
+// does not keep an entry forever.
 type Adopt struct {
 	Found map[policy.Name][]blockable.Addr
 	At    time.Time
 }
 
-// Flush writes each entry whose state in memory is not on disk: the
-// refreshes inside the save slack. Call it before Close.
-type Flush struct{}
-
 func (Expire) isOp() {}
 func (Prune) isOp()  {}
 func (Adopt) isOp()  {}
-func (Flush) isOp()  {}
-
-// queuedOp is an Op that the committer runs alone, in its order. Adopt is
-// not one: Apply sends it as writes.
-//
-//sumtype:decl
-type queuedOp interface{ isQueuedOp() }
-
-func (Expire) isQueuedOp() {}
-func (Prune) isQueuedOp()  {}
-func (Flush) isQueuedOp()  {}
 
 // Apply runs op on the committer, after the requests before it. It
-// returns the number of entries that Expire or Prune removed, and 0 for
-// the other operations.
+// returns the number of entries that Expire or Prune removed, or that
+// Adopt wrote.
 //
-// Adopt and Flush are commits: after an error, the index is as before.
-// A removal by Expire or Prune is final in memory also when its delete
-// fails, and the count includes it: an entry that the delete left on
-// disk is expired, and the next Expire after Open removes it again, or
-// it is of a removed policy, and the next Prune removes it again. A
-// failed Expire thus cannot repeat at once.
+// Expire and Prune change only the index: the log never records a
+// removal (see the package doc). Adopt is a commit: after an error, the
+// index is as before. Expire returns an error only when a segment that
+// it removes stays; its count is then still right.
 //
 // Errors: as Commit, and the errors of Touch for the input of Adopt.
 func (s *Store) Apply(ctx context.Context, op Op) (int, error) {
@@ -197,42 +198,30 @@ func (s *Store) Apply(ctx context.Context, op Op) (int, error) {
 		if _, err := nanos(op.At); err != nil {
 			return 0, err
 		}
-		return s.send(ctx, request{op: op})
 	case Prune:
-		return s.send(ctx, request{op: op})
-	case Flush:
-		return s.send(ctx, request{op: op})
 	case Adopt:
-		var writes []write
 		for name, addrs := range op.Found {
-			obs, err := s.observation([]policy.Name{name}, addrs, 0, op.At)
-			if err != nil {
+			if _, err := s.observation([]policy.Name{name}, addrs, 0, op.At); err != nil {
 				return 0, err
 			}
-			for _, a := range addrs {
-				writes = append(writes, write{key{name, a}, obs})
-			}
 		}
-		if len(writes) == 0 {
-			return 0, nil
-		}
-		return s.send(ctx, request{writes: writes})
 	default:
 		return 0, fmt.Errorf("%w: %T", errUnknownOp, op)
 	}
+	return s.send(ctx, request{op: op})
 }
 
 // request is one unit of work for the committer: a group member with
 // writes, or an op.
 type request struct {
 	writes []write
-	op     queuedOp
+	op     Op
 	reply  chan result
 }
 
 type result struct {
-	removed int
-	err     error
+	n   int
+	err error
 }
 
 func (s *Store) send(ctx context.Context, r request) (int, error) {
@@ -249,7 +238,7 @@ func (s *Store) send(ctx context.Context, r request) (int, error) {
 	}
 	select {
 	case res := <-r.reply:
-		return res.removed, res.err
+		return res.n, res.err
 	case <-ctx.Done():
 		return 0, ctx.Err()
 	}
@@ -274,8 +263,8 @@ func (s *Store) run() {
 			}
 		}
 		if r.op != nil {
-			removed, err := s.runOp(r.op)
-			r.reply <- result{removed, err}
+			n, err := s.runOp(r.op)
+			r.reply <- result{n, err}
 			continue
 		}
 		var group []request
@@ -308,23 +297,51 @@ func (s *Store) group(first request) (group []request, next *request) {
 	}
 }
 
-func (s *Store) runOp(op queuedOp) (int, error) {
+func (s *Store) runOp(op Op) (int, error) {
 	switch op := op.(type) {
 	case Expire:
 		at := op.At.UnixNano()
-		return s.remove(func(_ policy.Name, st *stamp) bool { return at > st.expiry })
+		n := s.remove(func(_ policy.Name, st *stamp) bool { return at > st.expiry })
+		if err := s.dir.gc(at); err != nil {
+			return n, fmt.Errorf("addrstore: remove expired segments: %w", err)
+		}
+		return n, nil
 	case Prune:
-		return s.remove(func(name policy.Name, _ *stamp) bool { return !slices.Contains(op.Keep, name) })
-	case Flush:
-		return 0, s.flush()
+		return s.remove(func(name policy.Name, _ *stamp) bool { return !slices.Contains(op.Keep, name) }), nil
+	case Adopt:
+		return s.adopt(op)
 	default:
 		return 0, fmt.Errorf("%w: %T", errUnknownOp, op)
 	}
 }
 
-// commit writes writes in one transaction, each merged with the entry in
-// memory, and then puts them in the index. After an error the index is
-// unchanged.
+// adopt commits the addresses of op that the index does not hold.
+func (s *Store) adopt(op Adopt) (int, error) {
+	var writes []write
+	s.mu.RLock()
+	for name, addrs := range op.Found {
+		// Apply checked the input, so the observation cannot fail.
+		obs, _ := s.observation([]policy.Name{name}, addrs, 0, op.At) //nolint:errcheck // see above
+		for _, a := range addrs {
+			if sl := s.index[name][a]; sl != nil && !sl.cur.Load().gone {
+				continue
+			}
+			writes = append(writes, write{key{name, a}, obs})
+		}
+	}
+	s.mu.RUnlock()
+	if len(writes) == 0 {
+		return 0, nil
+	}
+	if err := s.commit(writes); err != nil {
+		return 0, err
+	}
+	return len(writes), nil
+}
+
+// commit appends one record for each entry of writes, each merged with
+// the entry in memory, syncs, and then puts them in the index. After an
+// error the index is unchanged.
 func (s *Store) commit(writes []write) error {
 	merged := make(map[key]stamp, len(writes))
 	for _, w := range writes {
@@ -343,11 +360,23 @@ func (s *Store) commit(writes []write) error {
 		}
 	}
 	s.mu.RUnlock()
-	if err := s.write(merged); err != nil {
+	recs := make([]lease, 0, len(merged))
+	var day int64
+	for k, st := range merged {
+		r, err := recordOf(k, st)
+		if err != nil {
+			return fmt.Errorf("addrstore: commit: %w", err)
+		}
+		recs = append(recs, r)
+		day = max(day, int64(r.minute)/(24*60))
+	}
+	if err := s.dir.append(recs, day, s.retain); err != nil {
 		return fmt.Errorf("addrstore: commit: %w", err)
 	}
 	s.mu.Lock()
-	for k, st := range merged {
+	for _, r := range recs {
+		k, st := r.key(), merged[r.key()]
+		bound := r.stamp(s.retain).expiry
 		byAddr := s.index[k.policy]
 		if byAddr == nil {
 			byAddr = make(map[blockable.Addr]*slot)
@@ -355,12 +384,12 @@ func (s *Store) commit(writes []write) error {
 		}
 		sl := byAddr[k.addr]
 		if sl == nil || sl.cur.Load().gone {
-			byAddr[k.addr] = newSlot(st, st)
+			byAddr[k.addr] = newSlot(st, bound)
 			continue
 		}
-		// saved first: a refresh between the two steps then compares
-		// with the new disk state.
-		sl.saved.Store(&st)
+		// bound first: a refresh between the two steps then compares
+		// with the new durable state.
+		sl.raise(bound)
 		sl.mergeCur(st)
 	}
 	s.mu.Unlock()
@@ -368,69 +397,25 @@ func (s *Store) commit(writes []write) error {
 	return nil
 }
 
-func (s *Store) write(entries map[key]stamp) error {
-	return s.update(func(tx *bbolt.Tx) error {
-		book := tx.Bucket([]byte(bookBucket))
-		if book == nil {
-			return fmt.Errorf("%w: no bucket %q", ErrCorrupt, bookBucket)
-		}
-		for k, st := range entries {
-			if err := put(book, k, st); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-}
-
-// flush commits each entry whose state in memory is not on disk.
-func (s *Store) flush() error {
-	dirty := make(map[key]stamp)
-	s.mu.RLock()
-	for name, byAddr := range s.index {
-		for a, sl := range byAddr {
-			if cur := sl.cur.Load(); !cur.gone && *cur != *sl.saved.Load() {
-				dirty[key{name, a}] = *cur
-			}
-		}
-	}
-	s.mu.RUnlock()
-	if len(dirty) == 0 {
-		return nil
-	}
-	writes := make([]write, 0, len(dirty))
-	for k, st := range dirty {
-		writes = append(writes, write{k, st})
-	}
-	return s.commit(writes)
-}
-
-// remove marks each entry for which drop is true as gone, deletes them
-// in one transaction, and then takes them out of the index, also when
-// the delete fails.
-func (s *Store) remove(drop func(policy.Name, *stamp) bool) (int, error) {
+// remove marks each entry for which drop is true as gone, and then takes
+// them out of the index. It returns their number.
+func (s *Store) remove(drop func(policy.Name, *stamp) bool) int {
 	gone := s.mark(drop)
-	if len(gone) == 0 {
-		// The facts can be behind a refresh in memory: a NextExpiry
-		// before the real first expiry. New facts let the owner wait for
-		// the real one.
-		s.publish()
-		return 0, nil
-	}
-	err := s.update(func(tx *bbolt.Tx) error { return deleteKeys(tx, gone) })
-	s.mu.Lock()
-	for _, k := range gone {
-		delete(s.index[k.policy], k.addr)
-		if len(s.index[k.policy]) == 0 {
-			delete(s.index, k.policy)
+	if len(gone) > 0 {
+		s.mu.Lock()
+		for _, k := range gone {
+			delete(s.index[k.policy], k.addr)
+			if len(s.index[k.policy]) == 0 {
+				delete(s.index, k.policy)
+			}
 		}
+		s.mu.Unlock()
 	}
-	s.mu.Unlock()
+	// With no removal, the facts can still be behind a refresh in memory:
+	// a NextExpiry before the real first expiry. New facts let the owner
+	// wait for the real one.
 	s.publish()
-	if err != nil {
-		return len(gone), fmt.Errorf("addrstore: delete: %w", err)
-	}
-	return len(gone), nil
+	return len(gone)
 }
 
 // mark marks each entry for which drop is true as gone, and returns
@@ -462,25 +447,4 @@ func (sl *slot) markIf(drop func(*stamp) bool) bool {
 			return true
 		}
 	}
-}
-
-func deleteKeys(tx *bbolt.Tx, gone []key) error {
-	book := tx.Bucket([]byte(bookBucket))
-	if book == nil {
-		return fmt.Errorf("%w: no bucket %q", ErrCorrupt, bookBucket)
-	}
-	for _, k := range gone {
-		pb := book.Bucket([]byte(k.policy))
-		if pb == nil {
-			continue
-		}
-		addr, err := k.addr.Addr().MarshalBinary()
-		if err != nil {
-			return err
-		}
-		if err := pb.Delete(addr); err != nil {
-			return err
-		}
-	}
-	return nil
 }

@@ -34,8 +34,8 @@ func (d *Daemon) SetStore(f func(path string, data []byte, gid int) (policy.Conf
 var ErrInjectedBook = errors.New("daemon test: injected book write fault")
 
 // SetBookFault makes the writes of the address book fail while fail is
-// set: Commit of a Pending that is not empty, Adopt with an address, and
-// Flush. A failed write changes nothing, as a failed commit of the store
+// set: Commit of a Pending that is not empty, and Adopt with an address.
+// A failed write changes nothing, as a failed commit of the store
 // does. Expire and Prune still run. Call it before Run.
 func (d *Daemon) SetBookFault(fail *atomic.Bool) {
 	open := d.openBook
@@ -71,8 +71,6 @@ func (b faultyBook) Apply(ctx context.Context, op addrstore.Op) (int, error) {
 				return 0, ErrInjectedBook
 			}
 		}
-	case addrstore.Flush:
-		return 0, ErrInjectedBook
 	case addrstore.Expire, addrstore.Prune:
 	}
 	return b.addrBook.Apply(ctx, op)

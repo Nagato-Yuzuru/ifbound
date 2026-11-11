@@ -9,10 +9,10 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 )
 
-// A refresh inside the save slack is not written at once. A stop of the
-// daemon writes it, so a restart keeps the address for the full retain
-// period after its last answer.
-func TestStopWritesTheRefreshesInsideTheSlack(t *testing.T) {
+// A refresh that the record of an earlier answer covers is not written.
+// A stop then writes nothing, and a restart still keeps the address for
+// the full retain period after its last answer.
+func TestRecordCoversTheRefreshesAfterIt(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, configV1)
 		h.wantState(daemon.StateReady)
@@ -20,7 +20,7 @@ func TestStopWritesTheRefreshesInsideTheSlack(t *testing.T) {
 		if err := h.observe(obs("www.example.net", a.String())); err != nil {
 			t.Fatalf("Observe: %v", err)
 		}
-		time.Sleep(20 * time.Minute) // inside the slack of retain 1h
+		time.Sleep(20 * time.Minute) // the record of the first answer covers this one
 		last := time.Now()
 		if err := h.observe(obs("www.example.net", a.String())); err != nil {
 			t.Fatalf("Observe: %v", err)

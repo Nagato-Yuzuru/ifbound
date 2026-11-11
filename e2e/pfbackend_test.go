@@ -512,6 +512,27 @@ func TestPfBackendUnloadAfterRestart(t *testing.T) {
 	}
 }
 
+// TestPfBackendLoadAfterRestartKeepsTableEntries checks that a new
+// Backend on the same pf (a restarted daemon) that loads the ruleset again
+// keeps the entries of the persist tables. A restart then needs no book
+// to keep the acknowledged addresses blocked: adoption reads them back
+// from the tables.
+func TestPfBackendLoadAfterRestartKeepsTableEntries(t *testing.T) {
+	b, _ := newPfBackend(t)
+	rs := compilePolicies(t, policyA)
+	load(t, b, rs)
+	learned := netip.MustParsePrefix("203.0.113.7/32")
+	if err := b.AddEntries(t.Context(), "e2e-a", []netip.Prefix{learned}); err != nil {
+		t.Fatalf("AddEntries: %v", err)
+	}
+	again := pfbackend.New(pfbackend.Exec{Path: pfbackend.Path}, openPf(t), time.Now, slog.New(slog.DiscardHandler))
+	readState(t, again)
+	load(t, again, rs)
+	if got := readState(t, again).Tables["e2e-a"]; !slices.Contains(got, learned) {
+		t.Errorf("table e2e-a after the Load of the restarted Backend = %v, want %v in it", got, learned)
+	}
+}
+
 // references returns the tokens that "pfctl -s References" lists, of
 // every process: pfctl, and the test process for the references of the
 // Backend. A line of a reference starts with the pid and ends with the

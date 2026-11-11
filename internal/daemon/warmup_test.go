@@ -1,10 +1,9 @@
 package daemon_test
 
 import (
+	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"io/fs"
 	"log/slog"
 	"maps"
 	"net/netip"
@@ -901,14 +900,14 @@ func TestWarmUpWritesNothingAndItsReportsTakeTheNormalPath(t *testing.T) {
 			defer h.stop()
 			h.wantState(daemon.StateReady)
 			writes := world.Writes()
-			snap := readOrEmpty(t, bookPath(h.snapshot))
+			snap := bookImage(t, bookPath(h.snapshot))
 			close(hold.release)
 			synctest.Wait()
 			h.wantCounts(once(seqNames("w", 6)...))
 			if got := world.Writes(); got != writes {
 				t.Errorf("platform writes = %d after the warm-up, want %d", got, writes)
 			}
-			if after := readOrEmpty(t, bookPath(h.snapshot)); after != snap {
+			if after := bookImage(t, bookPath(h.snapshot)); !bytes.Equal(after, snap) {
 				t.Error("the snapshot changed during a warm-up without reports")
 			}
 		})
@@ -934,15 +933,4 @@ func TestWarmUpWritesNothingAndItsReportsTakeTheNormalPath(t *testing.T) {
 			}
 		})
 	})
-}
-
-// readOrEmpty returns the content of the file at path, or "" when it does
-// not exist.
-func readOrEmpty(t *testing.T, path string) string {
-	t.Helper()
-	b, err := os.ReadFile(path)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		t.Fatal(err)
-	}
-	return string(b)
 }

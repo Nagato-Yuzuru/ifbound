@@ -360,36 +360,50 @@ func (l *loop) logStatesEnded(ctx context.Context, cause string, policies []poli
 		slog.String(logattr.StatesCause, cause), slog.Any(logattr.PolicyNames, names))
 }
 
-// loadBook opens the address book. A book without addresses of the
-// configured policies (most often a new file) makes it adopt the
-// learned-looking entries of the kernel tables and commit them first: a
-// lost book then keeps addresses blocked for one retain period instead
-// of unblocking them.
+// loadBook opens the address book. A book that can miss a lease that an
+// earlier run acknowledged makes it adopt the learned-looking entries of
+// the kernel tables that the book does not hold, and commit them first:
+// a book with damage, and a fresh book (see addrstore.Store.Fresh)
+// without an address of a configured policy. Those addresses then stay
+// blocked for one retain period instead of being unblocked. A book that
+// this version wrote holds each acknowledged lease, because each lease
+// is durable before its ack; an adoption would only keep the entries
+// that the tables hold without a lease, such as the host addresses of a
+// host file entry that went away. A fresh book with an address of a
+// configured policy comes from the JSON snapshot of an earlier version,
+// which also held each acknowledged address.
 //
-// The trigger looks at the configured policies only, so it also adopts
-// when the book holds addresses only of policies that the configuration
-// removed. Adoption reads every table, also the table of a removed
-// policy: its removal may not be installed yet, and a revert must find
-// its addresses. reconcile prunes them after the install. This is broader
-// than "the book is empty", and it fails closed: adoption adds entries
-// that the tables already hold, and each one expires after one retain
-// period. After a good read of the host file, its addresses are not
-// adopted: they leave the tables with their host entries. Before a good
-// read, they are adopted. Entries that expired while the daemon was down
-// leave the book here. After an error, no book is open.
+// The test of a fresh book looks at the configured policies only, so it
+// also adopts when the snapshot holds addresses only of policies that
+// the configuration removed.
+// Adoption reads every table, also the table of a removed policy: its
+// removal may not be installed yet, and a revert must find its addresses.
+// reconcile prunes them after the install. It fails closed: adoption
+// adds entries that the tables already hold, and each one expires after
+// one retain period. After a good read of the host file, its addresses
+// are not adopted: they leave the tables with their host entries. Before
+// a good read, they are adopted. Entries that expired while the daemon
+// was down leave the book here. After an error, no book is open.
 func (l *loop) loadBook(ctx context.Context, conf activeConfig, retain time.Duration) (addrBook, error) {
 	book, err := l.openBook(l.addrStore, l.snapshot, retain)
 	if err != nil {
 		return nil, fmt.Errorf("loading the address book: %w", err)
 	}
-	if !slices.ContainsFunc(policyNames(conf.cfg), func(n policy.Name) bool { return len(book.Addrs(n)) > 0 }) {
+	if err := book.Damage(); err != nil {
+		// The leases in the damaged places are lost; the adoption below
+		// keeps those that the tables hold.
+		l.log.WarnContext(ctx, "address book damaged",
+			slog.String(logattr.ErrorType, logattr.ErrorTypeSnapshot), slog.String(logattr.ExceptionMessage, err.Error()))
+	}
+	hasConfigured := slices.ContainsFunc(policyNames(conf.cfg), func(n policy.Name) bool { return len(book.Addrs(n)) > 0 })
+	if book.Damage() != nil || book.Fresh() && !hasConfigured {
 		if err := l.adopt(ctx, book, conf.cfg.Policies); err != nil {
 			_ = book.Close() //nolint:errcheck // the adoption error is the one to report; the next attempt opens the book again
 			return nil, err
 		}
 	}
-	// A failed delete leaves the expired entries on disk only; the next
-	// start removes them again.
+	// A failed removal of an old segment leaves it on disk only; the next
+	// Expire removes it again.
 	_, _ = book.Apply(ctx, addrstore.Expire{At: time.Now()}) //nolint:errcheck // see above
 	return book, nil
 }

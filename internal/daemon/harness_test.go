@@ -2,7 +2,6 @@ package daemon_test
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -13,13 +12,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
-	"go.etcd.io/bbolt"
-
+	"github.com/Nagato-Yuzuru/ifbound/internal/addrstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
@@ -232,12 +231,14 @@ func launchHook(t *testing.T, s harnessSpec, hook func(*daemon.Daemon)) *harness
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
 	synctest.Wait()
-	stop := func() {
+	// A test that restarts the daemon can stop the first one also in a
+	// deferred call: the second call does nothing.
+	stop := sync.OnceFunc(func() {
 		cancel()
 		if err := <-done; err != nil {
 			t.Errorf("Run: %v", err)
 		}
-	}
+	})
 	return &harness{
 		t: t, world: s.world, inv: s.inv, snapshot: s.snapshot, store: s.store,
 		hosts: s.hosts, logs: logs, d: d, stop: stop, spec: s,
@@ -313,56 +314,63 @@ func (h *harness) savedExpiry(name policy.Name, a netip.Addr) (time.Time, bool) 
 	return exp, ok
 }
 
-// bookPath returns the address book file of a test whose JSON snapshot
-// path is snapshot: the file addrbook.db in the same directory.
-func bookPath(snapshot string) string { return filepath.Join(filepath.Dir(snapshot), "addrbook.db") }
+// bookPath returns the address book of a test whose JSON snapshot path
+// is snapshot: the directory addrbook next to it.
+func bookPath(snapshot string) string { return filepath.Join(filepath.Dir(snapshot), "addrbook") }
 
-// readBook returns the expiry of each address of each policy in the
-// address book file at path, read from the file format that addrstore
-// documents. It reads a copy, because the daemon locks the file while it
-// runs. A missing file, and a file without the bucket "book", is an empty
-// book.
+// readBook returns the expiry of each address of each policy that a load
+// of the address book at path gives. The log of the book records no
+// removal, so it also returns expired entries and those of a removed
+// policy. A missing book is empty.
 func readBook(t testing.TB, path string) map[policy.Name]map[netip.Addr]time.Time {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	entries, err := addrstore.Read(path, 0)
+	if err != nil && !errors.Is(err, addrstore.ErrCorrupt) {
+		t.Fatalf("read the address book: %v", err)
+	}
+	out := map[policy.Name]map[netip.Addr]time.Time{}
+	for _, e := range entries {
+		if out[e.Policy] == nil {
+			out[e.Policy] = map[netip.Addr]time.Time{}
+		}
+		out[e.Policy][e.Addr.Addr()] = e.Expiry
+	}
+	return out
+}
+
+// bookImage returns the names and the bytes of the segments of the book
+// at path, so that a test can see any write. A missing book is empty.
+func bookImage(t testing.TB, path string) []byte {
+	t.Helper()
+	ents, err := os.ReadDir(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
-		t.Fatalf("read the address book: %v", err)
-	}
-	cp := filepath.Join(t.TempDir(), "book-copy.db")
-	if err := os.WriteFile(cp, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	db, err := bbolt.Open(cp, 0o600, &bbolt.Options{ReadOnly: true})
-	if err != nil {
-		t.Fatalf("open the address book copy: %v", err)
-	}
-	defer db.Close() //nolint:errcheck // a read-only copy
-	out := map[policy.Name]map[netip.Addr]time.Time{}
-	err = db.View(func(tx *bbolt.Tx) error {
-		book := tx.Bucket([]byte("book"))
-		if book == nil {
-			return nil
+	var out []byte
+	for _, e := range ents {
+		if !strings.HasSuffix(e.Name(), ".seg") {
+			continue
 		}
-		return book.ForEachBucket(func(name []byte) error {
-			m := map[netip.Addr]time.Time{}
-			out[policy.Name(name)] = m
-			return book.Bucket(name).ForEach(func(k, v []byte) error {
-				var a netip.Addr
-				if err := a.UnmarshalBinary(k); err != nil || len(v) != 24 {
-					return fmt.Errorf("bad entry %x=%x: %v", k, v, err)
-				}
-				m[a] = time.Unix(0, int64(binary.BigEndian.Uint64(v[16:24])))
-				return nil
-			})
-		})
-	})
-	if err != nil {
-		t.Fatalf("read the address book copy: %v", err)
+		data, err := os.ReadFile(filepath.Join(path, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(append(out, e.Name()...), data...)
 	}
 	return out
+}
+
+// tablesHold reports whether any table holds a.
+func (h *harness) tablesHold(a netip.Addr) bool {
+	for _, entries := range h.world.Tables() {
+		if slices.Contains(entries, netip.PrefixFrom(a, a.BitLen())) {
+			return true
+		}
+	}
+	return false
 }
 
 // failWrites makes every write fail until h.world.SetBeforeWrite(nil).

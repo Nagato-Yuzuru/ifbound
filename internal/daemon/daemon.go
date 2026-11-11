@@ -108,8 +108,8 @@ type Config struct {
 	// wheel, so a zero is a field that the caller did not set. A
 	// negative value keeps the group of the new file, for tests.
 	ConfigGID int
-	// AddrStore is the path of the address book file (see addrstore). It
-	// must be absolute and clean.
+	// AddrStore is the path of the address book directory (see
+	// addrstore). It must be absolute and clean.
 	AddrStore string
 	// Snapshot is the path of the JSON snapshot of the address book that
 	// earlier versions wrote. Each open of AddrStore merges it into the
@@ -220,8 +220,8 @@ func (c Config) check() error {
 
 // Run is the event loop. It loads the stored configuration and the
 // address book, converges, and then serves events until ctx ends. When
-// ctx ends, it writes the refreshes of the book that are only in memory
-// (addrstore.Flush) and closes the book. It returns
+// ctx ends, it closes the book: each acknowledged lease is already
+// durable. It returns
 // nil when ctx ends, ErrAlreadyRunning when called a second time, and
 // an error that wraps ErrBadConfig when a field of Config is not valid.
 //
@@ -234,17 +234,18 @@ func (c Config) check() error {
 // the failure makes the state StateDegraded.
 //
 // An address book that does not open, such as one whose JSON snapshot
-// does not import or one with a damaged page, keeps the daemon in
+// does not import or one that another process holds, keeps the daemon in
 // StateStarting, with the open error as the first reason. The daemon then still loads the ruleset and
 // adds the IP and CIDR destinations and the host addresses to their
 // tables, but it drops no table, also not the table of a policy that the
 // configuration removed, and it removes only the entries that
 // blockable.New refuses (see reconcile.Inputs.AddOnly). So after a
 // reboot the destinations that need no book are blocked, and an address
-// that the kernel tables hold stays blocked. A book without an address
-// of a configured policy, such as a new file, makes the daemon adopt the
-// learned-looking kernel entries and save them before it leaves
-// StateStarting. The self-heal timer retries the open and the
+// that the kernel tables hold stays blocked. A book with damage, or a
+// fresh book without an address of a configured policy, makes the daemon adopt the learned-looking kernel entries that
+// the book does not hold, and save them, before it leaves StateStarting.
+// A damaged place in the book does not stop the open: the daemon logs it
+// and uses the rest (see addrstore.Store.Damage). The self-heal timer retries the open and the
 // convergence until both succeed. The first pass that opens the book is
 // a normal convergence: it can remove entries.
 //
@@ -308,7 +309,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	l := newLoop(d.cfg, d.store, d.openBook, &d.status)
 	// Before done closes, so that a new daemon can open the book.
-	defer l.closeBook(ctx)
+	defer l.closeBook()
 	l.loadStored(ctx)
 	heal := time.NewTicker(SelfHealInterval)
 	defer heal.Stop()

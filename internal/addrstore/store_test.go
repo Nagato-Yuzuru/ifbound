@@ -4,17 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
-	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
-
-	"go.etcd.io/bbolt"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
@@ -23,77 +20,77 @@ import (
 
 const retain = time.Hour
 
-// slack is the save slack for retain: min(1h, retain/2).
-const slack = 30 * time.Minute
-
 var (
 	t0          = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	errInjected = errors.New("injected")
 )
 
-// commits is the transaction function of a test Store. It counts the
-// commits, and the test can fail them or hold them at a step. Every
-// fsync of the Store is in a commit, so a count of 0 means no fsync.
-type commits struct {
-	mu   sync.Mutex
-	n    int
-	fail error
-	// before and after, when set, run around the write of the file. They
-	// can block to hold the committer at that step.
-	before, after func()
+// bound is the durable bound of a record written at at with ttl 0:
+// what a load gives for that answer.
+func bound(at time.Time) time.Time {
+	return at.Truncate(time.Minute).Add(renewAfter + retain)
 }
 
-func (c *commits) update(db *bbolt.DB, fn func(*bbolt.Tx) error) error {
+// syncs is the sync function of a test Store. It counts the syncs of
+// segment files and of the directory, and the test can fail them or
+// hold them at a step. Each fsync of the Store goes through it.
+type syncs struct {
+	mu        sync.Mutex
+	files     int
+	dirs      int
+	fail      error
+	beforeOne func() // when set, runs before a file sync; it can block
+}
+
+func (c *syncs) sync(f *os.File) error {
 	c.mu.Lock()
-	c.n++
-	before := c.before
+	isDir := filepath.Base(f.Name()) == "."
+	if isDir {
+		c.dirs++
+	} else {
+		c.files++
+	}
+	before, fail := c.beforeOne, c.fail
 	c.mu.Unlock()
-	if before != nil {
+	if before != nil && !isDir {
 		before()
 	}
-	c.mu.Lock()
-	fail, after := c.fail, c.after
-	c.mu.Unlock()
 	if fail != nil {
 		return fail
 	}
-	err := db.Update(fn)
-	if after != nil {
-		after()
-	}
-	return err
+	return f.Sync()
 }
 
-func (c *commits) count() int {
+func (c *syncs) count() (files, dirs int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.n
+	return c.files, c.dirs
 }
 
-func (c *commits) set(f func(c *commits)) {
+func (c *syncs) set(f func(c *syncs)) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	f(c)
 }
 
-func dbPath(t *testing.T) string { return filepath.Join(t.TempDir(), "addrbook.db") }
+func bookDir(t *testing.T) string { return filepath.Join(t.TempDir(), "addrbook") }
 
-// openCounted opens a Store with a counting transaction function. The
-// count starts after Open.
-func openCounted(t *testing.T, path, legacy string) (*Store, *commits) {
+// openCounted opens a Store with a counting sync function. The counts
+// start after Open.
+func openCounted(t *testing.T, path, legacy string) (*Store, *syncs) {
 	t.Helper()
-	c := &commits{}
-	s, err := open(path, legacy, retain, c.update)
+	c := &syncs{}
+	s, err := open(path, legacy, retain, c.sync)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	t.Cleanup(func() { _ = s.Close() }) //nolint:errcheck // a second Close after the test closed it returns the same result
-	c.set(func(c *commits) { c.n = 0 })
+	c.set(func(c *syncs) { c.files, c.dirs = 0, 0 })
 	return s, c
 }
 
 func addr(s string) blockable.Addr {
-	a, ok := blockable.New(netip.MustParseAddr(s))
+	a, ok := blockable.New(netipMust(s))
 	if !ok {
 		panic("refused test address " + s)
 	}
@@ -111,7 +108,7 @@ func addrs(ss ...string) []blockable.Addr {
 func names(ns ...policy.Name) []policy.Name { return ns }
 
 // record touches and commits one answer, as the daemon does for a report.
-func record(t *testing.T, s *Store, name policy.Name, ttl time.Duration, at time.Time, as ...string) Pending {
+func record(t *testing.T, s *Store, name policy.Name, ttl time.Duration, at time.Time, as ...string) {
 	t.Helper()
 	p, err := s.Touch(names(name), addrs(as...), ttl, at)
 	if err != nil {
@@ -120,7 +117,6 @@ func record(t *testing.T, s *Store, name policy.Name, ttl time.Duration, at time
 	if err := s.Commit(context.Background(), p); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	return p
 }
 
 // latestFacts returns the latest facts that the Store sent.
@@ -135,7 +131,7 @@ func latestFacts(t *testing.T, s *Store) BookFacts {
 	}
 }
 
-// reopen closes s and opens the file again with retain r.
+// reopen closes s and opens the book again with retain r.
 func reopen(t *testing.T, s *Store, path string, r time.Duration) *Store {
 	t.Helper()
 	if err := s.Close(); err != nil {
@@ -157,22 +153,49 @@ func strs(as []blockable.Addr) []string {
 	return out
 }
 
-// runGroup holds the committer in the commit of a first report, lets
-// each of waiters start and block, sets fail for the next commits, and
-// then releases the committer. It returns the error of the first report
-// and the errors of the waiters. Call it inside a synctest bubble.
-//
-// It returns the errors of the waiters first, and then the error of the
-// first report.
-func runGroup(s *Store, c *commits, fail error, waiters []func() error) (group []error, first error) {
+func segments(t *testing.T, path string) []string {
+	t.Helper()
+	ents, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), segSuffix) {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+func commitOne(s *Store, name policy.Name, a string) error {
+	p, err := s.Touch(names(name), addrs(a), 0, t0)
+	if err != nil {
+		return err
+	}
+	return s.Commit(context.Background(), p)
+}
+
+// runGroup holds the committer in the sync of a first report, lets each
+// of waiters start and block, sets fail for the next syncs, and then
+// releases the committer. It returns the errors of the waiters and the
+// error of the first report. Call it inside a synctest bubble. It first
+// commits 192.0.2.1 of web, and resets the counts.
+func runGroup(s *Store, c *syncs, fail error, waiters []func() error) (group []error, first error) {
+	// A first append starts the segment, so that the held report and the
+	// group then do only file syncs.
+	if err := commitOne(s, "web", "192.0.2.1"); err != nil {
+		return nil, err
+	}
+	c.set(func(c *syncs) { c.files, c.dirs = 0, 0 })
 	entered, release := make(chan struct{}), make(chan struct{})
-	c.set(func(c *commits) {
-		c.before = func() { entered <- struct{}{}; <-release }
+	c.set(func(c *syncs) {
+		c.beforeOne = func() { entered <- struct{}{}; <-release }
 	})
 	firstErr := make(chan error, 1)
 	go func() { firstErr <- commitOne(s, "web", "192.0.2.2") }()
-	<-entered // the committer holds the first commit
-	c.set(func(c *commits) { c.before, c.fail = nil, fail })
+	<-entered // the committer holds the first sync
+	c.set(func(c *syncs) { c.beforeOne, c.fail = nil, fail })
 	results := make(chan error, len(waiters))
 	for _, w := range waiters {
 		go func() { results <- w() }()
@@ -194,263 +217,184 @@ func newAddressWaiters(s *Store, n int) []func() error {
 	return ws
 }
 
-// A new address needs one commit. The group of reports that wait while
-// the committer is busy shares one commit and one result.
-func TestWaitingReportsShareOneCommit(t *testing.T) {
+// The reports that wait while the committer is busy share one sync and
+// one result.
+func TestWaitingReportsShareOneSync(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s, c := openCounted(t, dbPath(t), "")
-		const n = 5
-		group, first := runGroup(s, c, nil, newAddressWaiters(s, n))
+		s, c := openCounted(t, bookDir(t), "")
+		group, first := runGroup(s, c, nil, newAddressWaiters(s, 5))
 		if first != nil {
-			t.Fatalf("first Commit: %v", first)
+			t.Fatalf("first report: %v", first)
 		}
-		for _, err := range group {
+		for i, err := range group {
 			if err != nil {
-				t.Errorf("Commit of the group: %v", err)
+				t.Errorf("waiter %d: %v", i, err)
 			}
 		}
-		if got := c.count(); got != 2 {
-			t.Errorf("commits = %d, want 2: one for the first report, one for the group of %d", got, n)
+		// One file sync for the held report, one for the group.
+		if files, dirs := c.count(); files != 2 || dirs != 0 {
+			t.Errorf("syncs = %d file, %d directory; want 2, 0", files, dirs)
 		}
-		if got := len(s.Addrs("web")); got != 1+n {
-			t.Errorf("web has %d addresses, want %d", got, 1+n)
+		if got := len(s.Addrs("web")); got != 7 {
+			t.Errorf("web has %d addresses, want 7", got)
 		}
 	})
 }
 
-// A failed commit fails every waiter of its group and leaves the index
-// and the file as before.
-func TestFailedCommitFailsTheGroupAndChangesNothing(t *testing.T) {
+// A failed sync fails each member of its group, and the index stays as
+// before. The next commit starts a new segment.
+func TestFailedSyncFailsTheGroupAndChangesNothing(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		path := dbPath(t)
+		path := bookDir(t)
 		s, c := openCounted(t, path, "")
-		record(t, s, "web", 0, t0, "192.0.2.1")
-		// One waiter refreshes the known address beyond the slack, the
-		// others bring new addresses.
-		refresh := func() error {
-			p, err := s.Touch(names("web"), addrs("192.0.2.1"), 0, t0.Add(slack+time.Second))
-			if err != nil {
-				return err
-			}
-			return s.Commit(context.Background(), p)
+		group, first := runGroup(s, c, errInjected, newAddressWaiters(s, 3))
+		if first != nil {
+			t.Fatalf("first report: %v", first)
 		}
-		group, first := runGroup(s, c, errInjected, append(newAddressWaiters(s, 2), refresh))
-		if !errors.Is(first, errInjected) {
-			t.Fatalf("first Commit = %v, want the injected error", first)
-		}
-		for _, err := range group {
+		for i, err := range group {
 			if !errors.Is(err, errInjected) {
-				t.Errorf("Commit of the group = %v, want the injected error", err)
+				t.Errorf("waiter %d = %v, want the injected error", i, err)
 			}
 		}
-		checkOnlyTheOldEntry(t, s, c, path)
+		if got := strs(s.Addrs("web")); !slices.Equal(got, []string{"192.0.2.1", "192.0.2.2"}) {
+			t.Errorf("web = %v, want only the reports before the group", got)
+		}
+		c.set(func(c *syncs) { c.fail = nil })
+		if err := commitOne(s, "web", "192.0.2.10"); err != nil {
+			t.Fatalf("commit after the failure: %v", err)
+		}
+		if got := len(segments(t, path)); got != 2 {
+			t.Errorf("%d segments, want 2: a failed append starts a new one", got)
+		}
 	})
 }
 
-// checkOnlyTheOldEntry checks that web holds only 192.0.2.1 with the
-// expiry of its commit at t0, in memory and on disk, while the commits
-// still fail.
-func checkOnlyTheOldEntry(t *testing.T, s *Store, c *commits, path string) {
-	t.Helper()
-	if got := strs(s.Addrs("web")); !slices.Equal(got, []string{"192.0.2.1"}) {
-		t.Errorf("web = %v, want only the committed 192.0.2.1", got)
-	}
-	// The expiry in memory did not move: Expire just after the old
-	// expiry removes the entry. The delete fails, but the removal in
-	// memory is final and counts.
-	if n, err := s.Apply(context.Background(), Expire{At: t0.Add(retain + time.Nanosecond)}); n != 1 || !errors.Is(err, errInjected) {
-		t.Errorf("Expire after the old expiry = %d, %v; want 1 and the injected error", n, err)
-	}
-	if got := s.Addrs("web"); len(got) != 0 {
-		t.Errorf("web after Expire = %v, want none", got)
-	}
-	c.set(func(c *commits) { c.fail = nil })
-	s2 := reopen(t, s, path, retain)
-	if got := strs(s2.Addrs("web")); !slices.Equal(got, []string{"192.0.2.1"}) {
-		t.Errorf("web on disk = %v, want only 192.0.2.1", got)
-	}
-	if f := latestFacts(t, s2); !f.NextExpiry.Equal(t0.Add(retain + time.Nanosecond)) {
-		t.Errorf("NextExpiry on disk = %v, want the old expiry %v", f.NextExpiry, t0.Add(retain))
-	}
-}
-
-func commitOne(s *Store, name policy.Name, a string) error {
-	p, err := s.Touch(names(name), addrs(a), 0, t0)
-	if err != nil {
-		return err
-	}
-	return s.Commit(context.Background(), p)
-}
-
-// An entry is in the index only after its commit: while the committer
-// holds a written transaction, a reader does not see the entry, and a
-// Touch of it still needs a commit.
-func TestEntryIsInTheIndexOnlyAfterItsCommit(t *testing.T) {
+// An entry is in the index only after its sync returned.
+func TestEntryIsInTheIndexOnlyAfterItsSync(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		s, c := openCounted(t, dbPath(t), "")
-		written, release := make(chan struct{}), make(chan struct{})
-		c.set(func(c *commits) {
-			c.after = func() { written <- struct{}{}; <-release }
-		})
+		s, c := openCounted(t, bookDir(t), "")
+		entered, release := make(chan struct{}), make(chan struct{})
+		c.set(func(c *syncs) { c.beforeOne = func() { entered <- struct{}{}; <-release } })
 		done := make(chan error, 1)
 		go func() { done <- commitOne(s, "web", "192.0.2.1") }()
-		<-written // the transaction is on disk; the index is not changed yet
-
+		<-entered
 		if got := s.Addrs("web"); len(got) != 0 {
-			t.Errorf("web = %v before the commit returned, want none", got)
+			t.Errorf("web = %v during the sync, want nothing", strs(got))
 		}
-		if p, err := s.Touch(names("web"), addrs("192.0.2.1"), 0, t0); err != nil || p.Empty() {
-			t.Errorf("Touch before the commit returned: Empty %v, err %v; want a Pending", p.Empty(), err)
-		}
-
-		c.set(func(c *commits) { c.after = nil })
 		close(release)
 		if err := <-done; err != nil {
-			t.Fatalf("Commit: %v", err)
+			t.Fatal(err)
 		}
 		if got := strs(s.Addrs("web")); !slices.Equal(got, []string{"192.0.2.1"}) {
-			t.Errorf("web = %v after the commit, want [192.0.2.1]", got)
-		}
-		if p, err := s.Touch(names("web"), addrs("192.0.2.1"), 0, t0); err != nil || !p.Empty() {
-			t.Errorf("Touch after the commit: Empty %v, err %v; want an empty Pending", p.Empty(), err)
+			t.Errorf("web = %v after the sync, want [192.0.2.1]", got)
 		}
 	})
 }
 
-// The structural counts of the persist rule: a new address is one
-// commit; a refresh inside the slack is none; a refresh beyond the slack
-// is one.
-func TestCommitCounts(t *testing.T) {
-	s, c := openCounted(t, dbPath(t), "")
+// A new address needs one file sync. A refresh that its record covers
+// needs none; a refresh past it needs one.
+func TestSyncCounts(t *testing.T) {
+	edge := bound(t0).Add(-retain) // the latest answer whose expiry the record covers
 	steps := []struct {
-		name    string
-		at      time.Time
-		as      []string
-		commits int
+		name string
+		at   time.Time
+		as   []string
+		want int
 	}{
 		{"new address", t0, []string{"192.0.2.1"}, 1},
-		{"same address again", t0, []string{"192.0.2.1"}, 0},
-		{"refresh at the slack edge", t0.Add(slack), []string{"192.0.2.1"}, 0},
-		{"refresh past the slack", t0.Add(slack + time.Nanosecond), []string{"192.0.2.1"}, 1},
-		{"two new addresses and a known one", t0.Add(slack), []string{"192.0.2.1", "192.0.2.2", "2001:db8::1"}, 1},
+		{"refresh at the bound", edge, []string{"192.0.2.1"}, 0},
+		{"refresh past the bound", edge.Add(time.Nanosecond), []string{"192.0.2.1"}, 1},
+		{"two new addresses and a covered one", edge, []string{"192.0.2.1", "192.0.2.2", "2001:db8::1"}, 1},
 	}
+	s, c := openCounted(t, bookDir(t), "")
 	for _, st := range steps {
-		before := c.count()
+		before, _ := c.count()
 		record(t, s, "web", 0, st.at, st.as...)
-		if got := c.count() - before; got != st.commits {
-			t.Errorf("%s: %d commits, want %d", st.name, got, st.commits)
+		if files, _ := c.count(); files-before != st.want {
+			t.Errorf("%s: %d file syncs, want %d", st.name, files-before, st.want)
 		}
 	}
 }
 
-// Refreshes inside the slack, in any order, give the same expiry, and
-// Flush writes it with one commit.
-func TestSlackRefreshesInAnyOrderGiveTheSameExpiry(t *testing.T) {
-	ats := []time.Time{t0.Add(10 * time.Minute), t0.Add(25 * time.Minute), t0.Add(slack)}
-	want := t0.Add(slack + retain + time.Nanosecond)
-	for _, order := range [][]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}} {
-		t.Run(fmt.Sprint(order), func(t *testing.T) {
-			path := dbPath(t)
-			s, c := openCounted(t, path, "")
-			record(t, s, "web", 0, t0, "192.0.2.1")
-			before := c.count()
-			refreshInOrder(t, s, ats, order)
-			if got := c.count() - before; got != 0 {
-				t.Errorf("%d commits for refreshes inside the slack, want 0", got)
-			}
-			if _, err := s.Apply(context.Background(), Flush{}); err != nil {
-				t.Fatalf("Flush: %v", err)
-			}
-			if got := c.count() - before; got != 1 {
-				t.Errorf("%d commits for the Flush, want 1", got)
-			}
-			s2 := reopen(t, s, path, retain)
-			if f := latestFacts(t, s2); !f.NextExpiry.Equal(want) {
-				t.Errorf("NextExpiry after the Flush = %v, want %v", f.NextExpiry, want)
-			}
-		})
+// A load keeps each acknowledged lease: the expiry after the load is not
+// earlier than in memory before it, and at most renewAfter and a minute
+// later.
+func TestReopenKeepsEachAcknowledgedLease(t *testing.T) {
+	path := bookDir(t)
+	s, _ := openCounted(t, path, "")
+	record(t, s, "web", 0, t0.Add(30*time.Second), "192.0.2.1")
+	record(t, s, "web", 3*time.Hour, t0, "2001:db8::1")
+	record(t, s, "ads", 0, t0, "192.0.2.1")
+	before := latestFacts(t, s)
+	s = reopen(t, s, path, retain)
+	after := latestFacts(t, s)
+	if !sameCounts(before.Counts, after.Counts) {
+		t.Errorf("counts after the load = %v, want %v", after.Counts, before.Counts)
+	}
+	if lo, hi := before.NextExpiry, before.NextExpiry.Add(renewAfter+time.Minute); after.NextExpiry.Before(lo) || after.NextExpiry.After(hi) {
+		t.Errorf("NextExpiry after the load = %v, want in [%v, %v]", after.NextExpiry, lo, hi)
+	}
+	if got := strs(s.Addrs("ads")); !slices.Equal(got, []string{"192.0.2.1"}) {
+		t.Errorf("ads = %v, want [192.0.2.1]", got)
 	}
 }
 
-// refreshInOrder touches 192.0.2.1 of web at each time of ats, in the
-// order of order. Each must be a refresh in memory.
-func refreshInOrder(t *testing.T, s *Store, ats []time.Time, order []int) {
-	t.Helper()
-	for _, i := range order {
-		if p, err := s.Touch(names("web"), addrs("192.0.2.1"), 0, ats[i]); err != nil || !p.Empty() {
-			t.Errorf("Touch at %v: Empty %v, err %v; want a refresh in memory", ats[i], p.Empty(), err)
+func sameCounts[K comparable, V comparable](a, b map[K]V) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if w, ok := b[k]; !ok || w != v {
+			return false
 		}
 	}
+	return true
 }
 
-// Without Flush, a refresh inside the slack stays in memory: a crash
-// keeps the expiry on disk, which is at most the slack earlier. A Flush
-// with nothing to write does no commit.
-func TestCloseWithoutFlushKeepsTheDiskExpiry(t *testing.T) {
-	path := dbPath(t)
+// Expire and Prune change only the index: a load brings the entries
+// back, and the owner removes them again.
+func TestRemovalsAreNotRecorded(t *testing.T) {
+	path := bookDir(t)
 	s, c := openCounted(t, path, "")
 	record(t, s, "web", 0, t0, "192.0.2.1")
-	record(t, s, "web", 0, t0.Add(slack), "192.0.2.1")
-	s2 := reopen(t, s, path, retain)
-	if f := latestFacts(t, s2); !f.NextExpiry.Equal(t0.Add(retain + time.Nanosecond)) {
-		t.Errorf("NextExpiry = %v, want the expiry of the commit %v", f.NextExpiry, t0.Add(retain))
+	record(t, s, "gone", 0, t0, "192.0.2.9")
+	files, _ := c.count()
+	if n, err := s.Apply(context.Background(), Prune{Keep: names("web")}); err != nil || n != 1 {
+		t.Fatalf("Prune = %d, %v; want 1, nil", n, err)
 	}
-	before := c.count()
-	if _, err := s2.Apply(context.Background(), Flush{}); err != nil {
-		t.Fatalf("Flush: %v", err)
+	if n, err := s.Apply(context.Background(), Expire{At: t0.Add(2 * retain)}); err != nil || n != 1 {
+		t.Fatalf("Expire = %d, %v; want 1, nil", n, err)
 	}
-	if got := c.count() - before; got != 0 {
-		t.Errorf("Flush with nothing to write: %d commits, want 0", got)
+	if got, _ := c.count(); got != files {
+		t.Errorf("the removals made %d syncs, want 0", got-files)
+	}
+	s = reopen(t, s, path, retain)
+	if len(s.Addrs("gone")) != 1 || len(s.Addrs("web")) != 1 {
+		t.Errorf("after the load: web %v, gone %v; want both back", strs(s.Addrs("web")), strs(s.Addrs("gone")))
 	}
 }
 
-// Expire removes an entry one nanosecond after its expiry, durably, and
-// sends the new facts.
-func TestExpireRemovesAfterTheExpiry(t *testing.T) {
-	path := dbPath(t)
+// Expire removes the entries that expired, and the segments whose
+// records give no entry that is still kept.
+func TestExpireRemovesEntriesAndOldSegments(t *testing.T) {
+	path := bookDir(t)
 	s, _ := openCounted(t, path, "")
 	record(t, s, "web", 0, t0, "192.0.2.1")
-	record(t, s, "web", 2*time.Hour, t0, "192.0.2.2")
-	if f := latestFacts(t, s); f.Counts["web"] != 2 || !f.NextExpiry.Equal(t0.Add(retain+time.Nanosecond)) {
-		t.Errorf("facts = %+v, want 2 web addresses and the first expiry after %v", f, t0.Add(retain))
+	later := t0.Add(72 * time.Hour)
+	record(t, s, "web", 0, later, "192.0.2.2")
+	if got := len(segments(t, path)); got != 2 {
+		t.Fatalf("%d segments, want one for each day", got)
 	}
-	if n, err := s.Apply(context.Background(), Expire{At: t0.Add(retain)}); err != nil || n != 0 {
-		t.Errorf("Expire at the expiry = %d, %v; want 0, nil", n, err)
+	n, err := s.Apply(context.Background(), Expire{At: bound(t0).Add(time.Nanosecond)})
+	if err != nil || n != 1 {
+		t.Fatalf("Expire = %d, %v; want 1, nil", n, err)
 	}
-	if n, err := s.Apply(context.Background(), Expire{At: t0.Add(retain + time.Nanosecond)}); err != nil || n != 1 {
-		t.Errorf("Expire after the expiry = %d, %v; want 1, nil", n, err)
+	if got := segments(t, path); len(got) != 1 || !strings.HasPrefix(got[0], "2026-01-04.") {
+		t.Errorf("segments = %v, want only the one of 2026-01-04", got)
 	}
-	if f := latestFacts(t, s); f.Counts["web"] != 1 || !f.NextExpiry.Equal(t0.Add(2*time.Hour+time.Nanosecond)) {
-		t.Errorf("facts = %+v, want 1 web address that expires after %v", f, t0.Add(2*time.Hour))
-	}
-	s2 := reopen(t, s, path, retain)
-	if got := strs(s2.Addrs("web")); !slices.Equal(got, []string{"192.0.2.2"}) {
-		t.Errorf("web on disk = %v, want [192.0.2.2]", got)
-	}
-}
-
-// Prune removes each policy that is not kept, durably.
-func TestPruneRemovesThePoliciesNotKept(t *testing.T) {
-	path := dbPath(t)
-	s, c := openCounted(t, path, "")
-	record(t, s, "web", 0, t0, "192.0.2.1")
-	record(t, s, "gone", 0, t0, "192.0.2.1", "192.0.2.9")
-	before := c.count()
-	if n, err := s.Apply(context.Background(), Prune{Keep: names("web")}); err != nil || n != 2 {
-		t.Errorf("Prune = %d, %v; want 2, nil", n, err)
-	}
-	if n, err := s.Apply(context.Background(), Prune{Keep: names("web")}); err != nil || n != 0 {
-		t.Errorf("second Prune = %d, %v; want 0, nil", n, err)
-	}
-	if got := c.count() - before; got != 1 {
-		t.Errorf("%d commits, want 1: a Prune with nothing to remove writes nothing", got)
-	}
-	s2 := reopen(t, s, path, retain)
-	if got := s2.Addrs("gone"); len(got) != 0 {
-		t.Errorf("gone on disk = %v, want none", got)
-	}
-	if got := strs(s2.Addrs("web")); !slices.Equal(got, []string{"192.0.2.1"}) {
-		t.Errorf("web on disk = %v, want [192.0.2.1]", got)
+	s = reopen(t, s, path, retain)
+	if got := strs(s.Addrs("web")); !slices.Equal(got, []string{"192.0.2.2"}) {
+		t.Errorf("web after the load = %v, want [192.0.2.2]", got)
 	}
 }
 
@@ -460,7 +404,7 @@ func TestPruneRemovesThePoliciesNotKept(t *testing.T) {
 // so a round can miss the race of the two compare-and-swaps on one slot.
 // The race detector checks the rounds.
 func TestConcurrentRefreshAndExpireNeverLoseAKnownEntry(t *testing.T) {
-	s, _ := openCounted(t, dbPath(t), "")
+	s, _ := openCounted(t, bookDir(t), "")
 	for i := range 50 {
 		a := fmt.Sprintf("192.0.2.%d", 1+i)
 		record(t, s, "web", 0, t0, a)
@@ -484,24 +428,41 @@ func TestConcurrentRefreshAndExpireNeverLoseAKnownEntry(t *testing.T) {
 	}
 }
 
-// A larger retain at Open raises each expiry to last_seen + max(ttl,
-// retain).
-func TestOpenRaisesExpiryWhenRetainGrew(t *testing.T) {
-	path := dbPath(t)
-	s, _ := openCounted(t, path, "")
+// Adopt writes only the addresses that the book does not hold, so the
+// adoption at each start does not move a known expiry.
+func TestAdoptWritesOnlyNewAddresses(t *testing.T) {
+	s, _ := openCounted(t, bookDir(t), "")
 	record(t, s, "web", 0, t0, "192.0.2.1")
-	s2 := reopen(t, s, path, 3*time.Hour)
-	if f := latestFacts(t, s2); !f.NextExpiry.Equal(t0.Add(3*time.Hour+time.Nanosecond)) || f.Retain != 3*time.Hour {
-		t.Errorf("facts = %+v, want retain 3h and the first expiry after %v", f, t0.Add(3*time.Hour))
+	known := latestFacts(t, s).NextExpiry
+	found := map[policy.Name][]blockable.Addr{"web": addrs("192.0.2.1", "192.0.2.2")}
+	n, err := s.Apply(context.Background(), Adopt{Found: found, At: t0.Add(10 * time.Hour)})
+	if err != nil || n != 1 {
+		t.Fatalf("Adopt = %d, %v; want 1, nil", n, err)
+	}
+	if got := latestFacts(t, s).NextExpiry; !got.Equal(known) {
+		t.Errorf("NextExpiry = %v, want the known expiry %v", got, known)
+	}
+	if n, err := s.Apply(context.Background(), Adopt{Found: found, At: t0.Add(20 * time.Hour)}); err != nil || n != 0 {
+		t.Errorf("Adopt again = %d, %v; want 0, nil", n, err)
 	}
 }
 
-// Touch and Adopt refuse bad input and change nothing.
-func TestBadInputIsRefused(t *testing.T) {
-	s, c := openCounted(t, dbPath(t), "")
+// A load with a larger retain keeps each entry for that retain.
+func TestLoadAppliesTheLargerRetain(t *testing.T) {
+	path := bookDir(t)
+	s, _ := openCounted(t, path, "")
 	record(t, s, "web", 0, t0, "192.0.2.1")
-	before := c.count()
-	cases := []struct {
+	s = reopen(t, s, path, 3*24*time.Hour)
+	want := t0.Add(renewAfter + 3*24*time.Hour + time.Nanosecond)
+	if got := latestFacts(t, s).NextExpiry; !got.Equal(want) {
+		t.Errorf("NextExpiry = %v, want %v", got, want)
+	}
+}
+
+func TestBadInputIsRefused(t *testing.T) {
+	s, c := openCounted(t, bookDir(t), "")
+	long := policy.Name(strings.Repeat("p", policy.MaxNameLen+1))
+	tests := []struct {
 		name  string
 		names []policy.Name
 		as    []blockable.Addr
@@ -509,119 +470,107 @@ func TestBadInputIsRefused(t *testing.T) {
 		at    time.Time
 		want  error
 	}{
-		{"empty policy", names("web", ""), addrs("192.0.2.2"), 0, t0, ErrEmptyPolicy},
-		{"negative ttl", names("web"), addrs("192.0.2.2"), -time.Second, t0, ErrNegativeTTL},
-		{"zero Addr", names("web"), []blockable.Addr{addr("192.0.2.2"), {}}, 0, t0, blockable.ErrZero},
-		{"time out of range", names("web"), addrs("192.0.2.2"), 0, time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC), ErrTimeRange},
-		{"expiry out of range", names("web"), addrs("192.0.2.2"), 0, time.Unix(0, 1<<63-1), ErrTimeRange},
+		{"empty policy", names(""), addrs("192.0.2.1"), 0, t0, ErrEmptyPolicy},
+		{"long policy", names(long), addrs("192.0.2.1"), 0, t0, ErrLongPolicy},
+		{"negative ttl", names("web"), addrs("192.0.2.1"), -1, t0, ErrNegativeTTL},
+		{"zero address", names("web"), []blockable.Addr{{}}, 0, t0, blockable.ErrZero},
+		{"time before the epoch", names("web"), addrs("192.0.2.1"), 0, time.Unix(-60, 0), ErrTimeRange},
 	}
-	for _, tt := range cases {
+	for _, tt := range tests {
 		if _, err := s.Touch(tt.names, tt.as, tt.ttl, tt.at); !errors.Is(err, tt.want) {
-			t.Errorf("Touch with %s = %v, want %v", tt.name, err, tt.want)
+			t.Errorf("%s: Touch = %v, want %v", tt.name, err, tt.want)
 		}
 	}
-	if _, err := s.Apply(context.Background(), Adopt{Found: map[policy.Name][]blockable.Addr{"web": {{}}}, At: t0}); !errors.Is(err, blockable.ErrZero) {
-		t.Errorf("Adopt of the zero Addr = %v, want blockable.ErrZero", err)
+	if _, err := s.Apply(context.Background(), Adopt{Found: map[policy.Name][]blockable.Addr{long: addrs("192.0.2.1")}, At: t0}); !errors.Is(err, ErrLongPolicy) {
+		t.Errorf("Adopt with a long policy = %v, want ErrLongPolicy", err)
 	}
-	if got := c.count() - before; got != 0 {
-		t.Errorf("%d commits after refused input, want 0", got)
-	}
-	if got := strs(s.Addrs("web")); !slices.Equal(got, []string{"192.0.2.1"}) {
-		t.Errorf("web = %v, want [192.0.2.1]", got)
+	if files, _ := c.count(); files != 0 {
+		t.Errorf("refused input made %d syncs", files)
 	}
 }
 
-// Adopt commits each address with a fresh retain period, in one commit.
-func TestAdoptCommitsEachAddressOnce(t *testing.T) {
-	path := dbPath(t)
-	s, c := openCounted(t, path, "")
-	found := map[policy.Name][]blockable.Addr{"web": addrs("192.0.2.1", "192.0.2.2"), "ads": addrs("198.51.100.1")}
-	if _, err := s.Apply(context.Background(), Adopt{Found: found, At: t0}); err != nil {
-		t.Fatalf("Adopt: %v", err)
-	}
-	if got := c.count(); got != 1 {
-		t.Errorf("%d commits, want 1", got)
-	}
-	s2 := reopen(t, s, path, retain)
-	if got := strs(s2.Addrs("web")); !slices.Equal(got, []string{"192.0.2.1", "192.0.2.2"}) {
-		t.Errorf("web on disk = %v", got)
-	}
-	if f := latestFacts(t, s2); f.Counts["ads"] != 1 || !f.NextExpiry.Equal(t0.Add(retain+time.Nanosecond)) {
-		t.Errorf("facts on disk = %+v", f)
-	}
-}
-
-// A request after Close gets ErrClosed.
 func TestRequestAfterCloseFails(t *testing.T) {
-	s, _ := openCounted(t, dbPath(t), "")
+	s, err := Open(bookDir(t), "", retain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
 	p, err := s.Touch(names("web"), addrs("192.0.2.1"), 0, t0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
 	if err := s.Commit(context.Background(), p); !errors.Is(err, ErrClosed) {
 		t.Errorf("Commit after Close = %v, want ErrClosed", err)
 	}
-	if _, err := s.Apply(context.Background(), Flush{}); !errors.Is(err, ErrClosed) {
-		t.Errorf("Flush after Close = %v, want ErrClosed", err)
+	if _, err := s.Apply(context.Background(), Expire{At: t0}); !errors.Is(err, ErrClosed) {
+		t.Errorf("Expire after Close = %v, want ErrClosed", err)
 	}
 }
 
-// Open refuses a symlink at the path, also one to a valid book. The open
-// itself refuses it, so the link target does not change.
-func TestOpenRefusesASymlink(t *testing.T) {
-	dir := t.TempDir()
-	dangling := filepath.Join(dir, "missing.db")
-	valid := filepath.Join(dir, "valid.db")
-	s, err := Open(valid, "", retain)
-	if err != nil {
-		t.Fatal(err)
+// Only one Store at a time holds a book.
+func TestSecondOpenIsLocked(t *testing.T) {
+	path := bookDir(t)
+	s, _ := openCounted(t, path, "")
+	if _, err := Open(path, "", retain); !errors.Is(err, ErrLocked) {
+		t.Fatalf("second Open = %v, want ErrLocked", err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	before := readBytes(t, valid)
-	for _, target := range []string{dangling, valid} {
-		link := filepath.Join(t.TempDir(), "addrbook.db")
-		if err := os.Symlink(target, link); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := Open(link, "", retain); !errors.Is(err, ErrBadPath) {
-			t.Errorf("Open(symlink to %s) = %v, want ErrBadPath", filepath.Base(target), err)
-		}
+	s2, err := Open(path, "", retain)
+	if err != nil {
+		t.Fatalf("Open after Close: %v", err)
 	}
-	if _, err := os.Stat(dangling); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the dangling link target exists after the refused Open: %v", err)
+	_ = s2.Close() //nolint:errcheck // the test checks only that the Open works
+}
+
+// A path that is a file or a symlink does not open, and Open creates
+// nothing at the target of a link.
+func TestOpenRefusesAFileAndASymlink(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
 	}
-	if !slices.Equal(readBytes(t, valid), before) {
-		t.Error("the valid book changed after the refused Open")
+	if _, err := Open(file, "", retain); !errors.Is(err, ErrBadPath) {
+		t.Errorf("Open(file) = %v, want ErrBadPath", err)
+	}
+	target := filepath.Join(dir, "missing")
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(link, "", retain); !errors.Is(err, ErrBadPath) {
+		t.Errorf("Open(dangling symlink) = %v, want ErrBadPath", err)
+	}
+	if _, err := os.Stat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the link target exists after the refused Open: %v", err)
 	}
 }
 
-// A file with an unknown version does not open.
-func TestOpenRefusesAnUnknownVersion(t *testing.T) {
-	path := dbPath(t)
-	db, err := bbolt.Open(path, 0o600, nil)
+// Read gives what a load gives, and works while a Store holds the book.
+func TestReadSeesTheDurableEntries(t *testing.T) {
+	path := bookDir(t)
+	s, _ := openCounted(t, path, "")
+	record(t, s, "web", 0, t0, "192.0.2.1")
+	record(t, s, "ads", 0, t0, "2001:db8::1")
+	got, err := Read(path, retain)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = db.Update(func(tx *bbolt.Tx) error {
-		meta, err := tx.CreateBucket([]byte(metaBucket))
-		if err != nil {
-			return err
-		}
-		return meta.Put([]byte(versionKey), []byte{0, 0, 0, 0, 0, 0, 0, 2})
-	})
-	if cerr := db.Close(); err == nil {
-		err = cerr
+	want := []Entry{
+		{"ads", addr("2001:db8::1"), bound(t0)},
+		{"web", addr("192.0.2.1"), bound(t0)},
 	}
-	if err != nil {
-		t.Fatal(err)
+	if !slices.EqualFunc(got, want, func(a, b Entry) bool {
+		return a.Policy == b.Policy && a.Addr == b.Addr && a.Expiry.Equal(b.Expiry)
+	}) {
+		t.Errorf("Read = %v, want %v", got, want)
 	}
-	if _, err := Open(path, "", retain); !errors.Is(err, ErrCorrupt) {
-		t.Errorf("Open(version 2) = %v, want ErrCorrupt", err)
+	if got, err := Read(filepath.Join(t.TempDir(), "none"), retain); err != nil || len(got) != 0 {
+		t.Errorf("Read of a missing book = %v, %v; want nothing", got, err)
 	}
 }
 
@@ -647,11 +596,11 @@ func jsonEntry(p, a string, exp time.Duration) string {
 		p, a, t0.UnixNano(), t0.Add(exp).UnixNano())
 }
 
-// Open imports the JSON snapshot into a new book, skips the refused
-// addresses, and removes the snapshot.
+// Open imports the JSON snapshot, skips the refused addresses, and
+// removes the snapshot.
 func TestOpenImportsTheJSONSnapshot(t *testing.T) {
 	dir := t.TempDir()
-	path, legacy := filepath.Join(dir, "addrbook.db"), filepath.Join(dir, "addrbook.json")
+	path, legacy := filepath.Join(dir, "addrbook"), filepath.Join(dir, "addrbook.json")
 	writeJSON(t, legacy,
 		jsonEntry("web", "192.0.2.1", 2*time.Hour),
 		jsonEntry("web", "127.0.0.1", 2*time.Hour),
@@ -674,48 +623,9 @@ func TestOpenImportsTheJSONSnapshot(t *testing.T) {
 	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("the imported snapshot is still there: %v", err)
 	}
-}
-
-// Open merges a JSON snapshot into a book that has entries: an earlier
-// version wrote it after a downgrade. For each address the later expiry
-// wins, and a new address is added.
-func TestOpenMergesTheJSONSnapshotIntoTheBook(t *testing.T) {
-	dir := t.TempDir()
-	path, legacy := filepath.Join(dir, "addrbook.db"), filepath.Join(dir, "addrbook.json")
-	s, err := Open(path, legacy, retain)
-	if err != nil {
-		t.Fatal(err)
-	}
-	record(t, s, "web", 0, t0, "192.0.2.1")                  // expires at t0+1h
-	record(t, s, "web", 0, t0.Add(2*time.Hour), "192.0.2.2") // expires at t0+3h
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	writeJSON(t, legacy,
-		jsonEntry("web", "192.0.2.1", 3*time.Hour),    // later than the book
-		jsonEntry("web", "192.0.2.2", 90*time.Minute), // earlier than the book
-		jsonEntry("ads", "198.51.100.7", 2*time.Hour)) // not in the book
-	s2, err := Open(path, legacy, retain)
-	if err != nil {
-		t.Fatalf("Open with the snapshot: %v", err)
-	}
-	t.Cleanup(func() { _ = s2.Close() }) //nolint:errcheck // a second Close returns the same result
-	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the merged snapshot is still there: %v", err)
-	}
-	expire := []struct {
-		at   time.Duration
-		want int
-	}{
-		{retain + time.Nanosecond, 0},         // 192.0.2.1 has the later expiry of the snapshot
-		{90*time.Minute + time.Nanosecond, 0}, // 192.0.2.2 keeps the later expiry of the book
-		{2*time.Hour + time.Nanosecond, 1},    // 198.51.100.7 of ads
-		{3*time.Hour + time.Nanosecond, 2},    // both web addresses
-	}
-	for _, e := range expire {
-		if n, err := s2.Apply(context.Background(), Expire{At: t0.Add(e.at)}); err != nil || n != e.want {
-			t.Errorf("Expire at t0+%v = %d, %v; want %d, nil", e.at, n, err, e.want)
-		}
+	entries, err := Read(path, retain)
+	if err != nil || len(entries) != 2 {
+		t.Errorf("Read = %v, %v; want the two imported entries", entries, err)
 	}
 }
 
@@ -723,7 +633,7 @@ func TestOpenMergesTheJSONSnapshotIntoTheBook(t *testing.T) {
 // snapshot as it is, and imports nothing.
 func TestOpenRefusesACorruptJSONSnapshot(t *testing.T) {
 	dir := t.TempDir()
-	path, legacy := filepath.Join(dir, "addrbook.db"), filepath.Join(dir, "addrbook.json")
+	path, legacy := filepath.Join(dir, "addrbook"), filepath.Join(dir, "addrbook.json")
 	if err := os.WriteFile(legacy, []byte("not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -733,7 +643,6 @@ func TestOpenRefusesACorruptJSONSnapshot(t *testing.T) {
 	if data, err := os.ReadFile(legacy); err != nil || string(data) != "not json" {
 		t.Errorf("the corrupt snapshot changed: %q, %v", data, err)
 	}
-	// The import did not commit, so a repaired snapshot imports.
 	writeJSON(t, legacy, jsonEntry("web", "192.0.2.1", retain))
 	s, err := Open(path, legacy, retain)
 	if err != nil {
@@ -742,68 +651,5 @@ func TestOpenRefusesACorruptJSONSnapshot(t *testing.T) {
 	defer s.Close() //nolint:errcheck // the test checks no write after this point
 	if got := strs(s.Addrs("web")); !slices.Equal(got, []string{"192.0.2.1"}) {
 		t.Errorf("web = %v, want [192.0.2.1]", got)
-	}
-}
-
-// A crash after the merge committed and before the removal of the
-// snapshot leaves the snapshot. The next Open merges it again, and the
-// book does not change.
-func TestCrashBeforeTheRemovalOfTheSnapshotMergesItAgainWithNoChange(t *testing.T) {
-	dir := t.TempDir()
-	path, legacy := filepath.Join(dir, "addrbook.db"), filepath.Join(dir, "addrbook.json")
-	snapshot := []string{jsonEntry("web", "192.0.2.1", 2*time.Hour), jsonEntry("ads", "198.51.100.7", 3*time.Hour)}
-	writeJSON(t, legacy, snapshot...)
-	var image []byte
-	c := &commits{after: func() {
-		var err error
-		if image, err = os.ReadFile(path); err != nil {
-			t.Error(err)
-		}
-	}}
-	s, err := open(path, legacy, retain, c.update)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := latestFacts(t, s)
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	// The crash state: the file as the merge left it, and the snapshot.
-	if err := os.WriteFile(path, image, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	writeJSON(t, legacy, snapshot...)
-	s2, err := Open(path, legacy, retain)
-	if err != nil {
-		t.Fatalf("Open after the crash: %v", err)
-	}
-	defer s2.Close() //nolint:errcheck // the test checks no write after this point
-	if got := latestFacts(t, s2); !maps.Equal(got.Counts, want.Counts) || !got.NextExpiry.Equal(want.NextExpiry) {
-		t.Errorf("facts after the second merge = %+v, want %+v", got, want)
-	}
-	if n, err := s2.Apply(context.Background(), Expire{At: t0.Add(2*time.Hour + time.Nanosecond)}); err != nil || n != 1 {
-		t.Errorf("Expire after the first expiry = %d, %v; want 1, nil", n, err)
-	}
-	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the snapshot is still there: %v", err)
-	}
-}
-
-// After a refresh in memory, NextExpiry is behind. An Expire at that
-// instant removes nothing, and sends facts with the real first expiry,
-// so a timer on NextExpiry does not fire again at once.
-func TestExpireThatRemovesNothingSendsTheLaterNextExpiry(t *testing.T) {
-	s, _ := openCounted(t, dbPath(t), "")
-	record(t, s, "web", 0, t0, "192.0.2.1")
-	record(t, s, "web", 0, t0.Add(slack), "192.0.2.1") // in memory only
-	stale := latestFacts(t, s).NextExpiry
-	if !stale.Equal(t0.Add(retain + time.Nanosecond)) {
-		t.Fatalf("NextExpiry = %v, want the expiry on disk %v", stale, t0.Add(retain))
-	}
-	if n, err := s.Apply(context.Background(), Expire{At: stale}); err != nil || n != 0 {
-		t.Fatalf("Expire at the stale NextExpiry = %d, %v; want 0, nil", n, err)
-	}
-	if got, want := latestFacts(t, s).NextExpiry, t0.Add(slack+retain+time.Nanosecond); !got.Equal(want) {
-		t.Errorf("NextExpiry after the Expire = %v, want %v", got, want)
 	}
 }

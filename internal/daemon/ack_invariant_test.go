@@ -64,10 +64,7 @@ to = ["*.ads.example", "*.example.net"]
 deny_via = ["@tunnel"]
 `
 
-const (
-	rigRetain = time.Hour
-	rigSlack  = 30 * time.Minute // min(1h, retain/2)
-)
+const rigRetain = time.Hour
 
 // rigMatch is the policy set of each qname, from the policy rules:
 // an exact name matches itself only, "*.d" matches d and every name
@@ -354,14 +351,14 @@ func (rg *rig) checkNoWrites(tablesBefore map[policy.Name][]netip.Prefix, snapBe
 
 // checkAck checks what an ack promises: each address is in the table of
 // each matching policy, the rules in effect refer to that table (none
-// while the firewall is disabled), and the snapshot on disk keeps the
-// address for at least retain minus the save slack. It reads the World,
+// while the firewall is disabled), and the book on disk keeps the
+// address for at least retain. It reads the World,
 // not the Backend that the daemon reads.
 func (rg *rig) checkAck(o ipc.Observation, want []policy.Name, start time.Time) {
 	rg.t.Helper()
 	tables := rg.world.Tables()
 	referenced := rg.world.Referenced()
-	floor := start.Add(max(o.TTL, rigRetain) - rigSlack)
+	floor := start.Add(max(o.TTL, rigRetain))
 	for _, p := range want {
 		if !slices.Contains(referenced, p) {
 			rg.fatalf("acked, but the loaded ruleset does not refer to table %s (refers to %v)", p, referenced)
