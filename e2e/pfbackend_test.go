@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os/exec"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -78,6 +79,7 @@ func pfctl(t testing.TB, args ...string) string {
 // rulesets of the anchor stay.
 func loadOnly(t *testing.T, anchor, flag, rules string) {
 	t.Helper()
+	skipUpCallOnArm64(t, rules)
 	cmd := exec.CommandContext(t.Context(), pfbackend.Path, "-a", anchor, flag, "-f", "-")
 	cmd.Stdin = strings.NewReader(rules)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -376,10 +378,26 @@ func TestPfBackendAddEndsStates(t *testing.T) {
 	}
 }
 
+// skipUpCallOnArm64 skips the test when rules hold an anchor call that
+// starts with "../" and the kernel is arm64. pf_anchor_setup removes each
+// "../" from the call, but it then appends the rest with the length of the
+// full call. The arm64 kernel checks the bounds of the call, so the load
+// stops the kernel with a panic ("Bounds safety trap"), and the host
+// restarts. The Intel kernel does not check the bounds, so the test runs
+// there. The test binary is built for the architecture of the host, so
+// GOARCH is the architecture of the kernel.
+func skipUpCallOnArm64(t testing.TB, rules string) {
+	t.Helper()
+	if runtime.GOARCH == "arm64" && strings.Contains(rules, `anchor "../`) {
+		t.Skip(`an anchor call that starts with "../" stops the arm64 kernel with a panic`)
+	}
+}
+
 // loadAnchor loads rules into an anchor of another tool, and flushes the
 // anchor at the end of the test.
 func loadAnchor(t testing.TB, anchor, rules string) {
 	t.Helper()
+	skipUpCallOnArm64(t, rules)
 	cmd := exec.CommandContext(t.Context(), pfbackend.Path, "-a", anchor, "-f", "-")
 	cmd.Stdin = strings.NewReader(rules)
 	if out, err := cmd.CombinedOutput(); err != nil {
@@ -412,6 +430,59 @@ func TestPfBackendNatPassVoids(t *testing.T) {
 	loadAnchor(t, "com.apple/900.ifbound-e2e", "nat pass on lo0 inet from any to 192.0.2.11 -> 127.0.0.1\n")
 	if !voids() {
 		t.Errorf("problems with a nat pass rule = %v, want a voiding Problem", readState(t, b).Problems)
+	}
+}
+
+// TestPfBackendRulesBeforeTheAnchorVoid checks rules that another tool
+// loads in an anchor that pf evaluates before the ifbound anchor: a quick
+// anchor rule that calls an anchor with a pass rule, and an anchor rule
+// that calls an anchor out of its own subtree, which holds a quick pass
+// rule. Real pf then passes a protected packet on the default route (the
+// physical interface), and Read reports a voiding Problem that names the
+// anchor of the rule.
+func TestPfBackendRulesBeforeTheAnchorVoid(t *testing.T) {
+	// "000.e2e" comes before "000.ifbound" in byte order.
+	const earlier = "com.apple/000.e2e-ifbound"
+	type foreign struct{ anchor, rules string }
+	tests := []struct {
+		name  string
+		loads []foreign // in order
+		want  string    // a part of the text of the voiding Problem
+	}{
+		{"quick anchor that calls a pass rule", []foreign{
+			{earlier, "anchor \"vpn\" quick all\n"},
+			{earlier + "/vpn", "pass out all no state\n"},
+		}, "in the anchor " + earlier + " "},
+		{"absolute call out of the subtree", []foreign{
+			{earlier, "anchor \"/ifbound-e2e-vpn\" all\n"},
+			{"ifbound-e2e-vpn", "pass out quick all no state\n"},
+		}, "in the anchor ifbound-e2e-vpn "},
+		{"relative call out of the subtree", []foreign{
+			{earlier, "anchor \"../zzz.ifbound-e2e\" all\n"},
+			{"com.apple/zzz.ifbound-e2e", "pass out quick all no state\n"},
+		}, "in the anchor com.apple/zzz.ifbound-e2e "},
+	}
+	dst := netip.MustParseAddrPort("192.0.2.12:9")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, _ := newPfBackend(t)
+			config := "[[policy]]\nname = \"e2e-q\"\nto = [\"192.0.2.12\"]\nonly_via = []\n"
+			load(t, b, compilePolicies(t, config))
+			addEntries(t, b, "e2e-q", "192.0.2.12/32")
+			if err := udpExchange(t, dst); !errors.Is(err, syscall.ECONNREFUSED) {
+				t.Fatalf("UDP to %s before the rules of the other tool: %v, want ECONNREFUSED", dst, err)
+			}
+			for _, l := range tt.loads {
+				loadAnchor(t, l.anchor, l.rules)
+			}
+			if err := udpExchange(t, dst); !errors.Is(err, errNoAnswer) {
+				t.Errorf("UDP to %s with the rules of the other tool: %v, want no answer (pf passes it)", dst, err)
+			}
+			ps := readState(t, b).Problems
+			if !slices.ContainsFunc(ps, func(p reconcile.Problem) bool { return p.Voids && strings.Contains(p.Text, tt.want) }) {
+				t.Errorf("problems = %v, want a voiding Problem with %q", ps, tt.want)
+			}
+		})
 	}
 }
 

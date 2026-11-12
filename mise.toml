@@ -22,11 +22,13 @@ run = "go test -c -tags e2e -o bin/e2e.test ./e2e"
 description = "Run end-to-end tests as root on this host. They run only where /var/db/ifbound-e2e-disposable exists (CI, VM)"
 depends = ["e2e:build"]
 # This task does not create the marker, so that it changes nothing on a
-# development host.
+# development host. The test timeout is shorter than the timeout of the CI
+# job. Thus a test that hangs fails with the stacks of all goroutines, and
+# the job keeps the log.
 run = '''
 sudo env \
   IFBOUND_E2E_STRICT="${IFBOUND_E2E_STRICT:-}" \
-  ./bin/e2e.test -test.v
+  ./bin/e2e.test -test.v -test.timeout=10m
 '''
 
 [tasks."vm:e2e"]
@@ -60,7 +62,7 @@ tart exec "$vm" sudo touch /var/db/ifbound-e2e-disposable
 tart exec "$vm" sudo env \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   IFBOUND_E2E_STRICT=1 \
-  "/Volumes/My Shared Files/ifbound/bin/e2e.test" -test.v
+  "/Volumes/My Shared Files/ifbound/bin/e2e.test" -test.v -test.timeout=10m
 '''
 
 # The semconv version lives in telemetry/manifest.yaml only. The task reads

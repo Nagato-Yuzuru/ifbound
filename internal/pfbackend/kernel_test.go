@@ -44,7 +44,8 @@ type kernel struct {
 	pid     int
 	nextPID int
 	// mainRules and mainNat are the filter and the NAT rules of the main
-	// ruleset.
+	// ruleset. An anchor rule keeps its call as the rule was loaded; pfctl
+	// prints it as pf_anchor_copyout gives it (see printed).
 	mainRules []string
 	mainNat   []string
 	// rules and nat map an anchor path to its filter and NAT rules. A key
@@ -54,6 +55,9 @@ type kernel struct {
 	// tables maps an anchor path and a table name to the entries; the
 	// value is true for a negated entry.
 	tables map[string]map[string]map[netip.Prefix]bool
+	// anchorMatch is the match flag of each anchor (struct pf_anchor,
+	// match). pf keeps it across packets.
+	anchorMatch map[string]bool
 	// states holds the destination of each state.
 	states []netip.Addr
 	// ifaces are the lines of "pfctl -sI -v".
@@ -81,13 +85,14 @@ func newKernel() *kernel {
 			"com.apple/200.AirDrop/Bonjour":     nil,
 			"com.apple/250.ApplicationFirewall": {`pass in quick on lo0 all`},
 		},
-		nat:    map[string][]string{},
-		tables: map[string]map[string]map[netip.Prefix]bool{},
-		born:   map[string]time.Time{},
-		owner:  map[string]int{},
-		now:    time.Now,
-		pid:    4242,
-		ifaces: []string{"ALL", "en0", "lo0", "utun4"},
+		nat:         map[string][]string{},
+		tables:      map[string]map[string]map[netip.Prefix]bool{},
+		anchorMatch: map[string]bool{},
+		born:        map[string]time.Time{},
+		owner:       map[string]int{},
+		now:         time.Now,
+		pid:         4242,
+		ifaces:      []string{"ALL", "en0", "lo0", "utun4"},
 	}
 }
 
@@ -209,12 +214,12 @@ func (k *kernel) Rules(rs pf.Ruleset) ([]pf.Rule, error) {
 	if err := k.ioctl("DIOCGETRULES", rs.Anchor, rs.Kind.String()); err != nil {
 		return nil, err
 	}
-	lines := slices.Concat(k.mainRules, k.mainNat)
+	lines := slices.Concat(k.printed(""), k.mainNat)
 	if rs.Anchor != "" {
 		if !k.exists(rs.Anchor) {
 			return nil, fmt.Errorf("anchor %s: %w", rs.Anchor, pf.ErrNotFound)
 		}
-		lines = slices.Concat(k.rules[rs.Anchor], k.nat[rs.Anchor])
+		lines = slices.Concat(k.printed(rs.Anchor), k.nat[rs.Anchor])
 	}
 	return pfbackend.RulesOf(lines, rs.Kind), nil
 }
@@ -405,8 +410,8 @@ func (k *kernel) releaseRef(tok string) (pfbackend.Output, error) {
 
 // load replaces the filter and the NAT rules of an anchor in one
 // transaction. A table line creates its table when it is missing and
-// keeps the entries of a present one. An anchor rule creates its
-// sub-anchor.
+// keeps the entries of a present one. An anchor rule creates the anchor
+// that it calls (pf_anchor_setup).
 func (k *kernel) load(anchor string, stdin []byte) {
 	var rules, nat []string
 	for line := range strings.Lines(string(stdin)) {
@@ -430,9 +435,9 @@ func (k *kernel) load(anchor string, stdin []byte) {
 	k.rules[anchor] = rules
 	k.nat[anchor] = nat
 	for _, r := range rules {
-		if sub, ok := anchorName(r); ok {
-			if _, ok := k.rules[anchor+"/"+sub]; !ok {
-				k.rules[anchor+"/"+sub] = nil
+		if _, c, ok := callOf(anchor, r); ok {
+			if _, ok := k.rules[c.path]; !ok {
+				k.rules[c.path] = nil
 			}
 		}
 	}
@@ -444,13 +449,106 @@ func tableName(line string) string {
 	return strings.Trim(name, `"`)
 }
 
-func anchorName(rule string) (string, bool) {
+// callOf returns the call name of an anchor rule in the ruleset from, as
+// the rule was loaded, and the call as pf keeps it.
+func callOf(from, rule string) (string, anchorCall, bool) {
 	rest, ok := strings.CutPrefix(rule, `anchor "`)
 	if !ok {
-		return "", false
+		return "", anchorCall{}, false
 	}
 	name, _, ok := strings.Cut(rest, `"`)
-	return name, ok
+	if !ok {
+		return "", anchorCall{}, false
+	}
+	c, ok := setup(from, name)
+	return name, c, ok
+}
+
+// anchorCall is the call of an anchor rule as pf keeps it
+// (pf_anchor_setup): the anchor, 0 for an absolute call or 1 plus the
+// number of "../" for a relative call (anchor_relative), and the wildcard
+// flag.
+type anchorCall struct {
+	path     string
+	relative int
+	wildcard bool
+}
+
+// setup reads the call name of an anchor rule in the ruleset from, as
+// pf_anchor_setup in pf_ruleset.c does. ok is false when "../" goes
+// above the main ruleset.
+func setup(from, name string) (c anchorCall, ok bool) {
+	if abs, ok := strings.CutPrefix(name, "/"); ok {
+		c.path = abs
+	} else {
+		c.relative, c.path = 1, from
+		for {
+			rest, ok := strings.CutPrefix(name, "../")
+			if !ok {
+				break
+			}
+			if c.path == "" {
+				return c, false
+			}
+			c.path = c.path[:max(strings.LastIndex(c.path, "/"), 0)]
+			c.relative++
+			name = rest
+		}
+		if c.path != "" {
+			c.path += "/"
+		}
+		c.path += name
+	}
+	c.path, c.wildcard = strings.CutSuffix(c.path, "/*")
+	return c, true
+}
+
+// copyout returns the call of an anchor rule in the ruleset from, as
+// pf_anchor_copyout in pf_ruleset.c gives it to pfctl.
+func (c anchorCall) copyout(from string) string {
+	var call string
+	if c.relative == 0 {
+		call = "/" + c.path
+	} else {
+		a := from
+		for range c.relative - 1 {
+			a = a[:max(strings.LastIndex(a, "/"), 0)]
+			call += "../"
+		}
+		switch {
+		case len(c.path) <= len(a):
+		case a == "":
+			call += c.path
+		default:
+			call += c.path[len(a)+1:]
+		}
+	}
+	if c.wildcard {
+		if call == "" {
+			return "*"
+		}
+		call += "/*"
+	}
+	return call
+}
+
+// printed returns the filter rules of a ruleset as pfctl prints them;
+// "" is the main ruleset. An anchor rule shows the call that
+// pf_anchor_copyout gives, which can differ from the loaded text: pfctl
+// prints "../*" as "..//*".
+func (k *kernel) printed(path string) []string {
+	lines := k.mainRules
+	if path != "" {
+		lines = k.rules[path]
+	}
+	out := make([]string, len(lines))
+	for i, l := range lines {
+		out[i] = l
+		if name, c, ok := callOf(path, l); ok {
+			out[i] = `anchor "` + c.copyout(path) + `"` + strings.TrimPrefix(l, `anchor "`+name+`"`)
+		}
+	}
+	return out
 }
 
 func (k *kernel) flushCmd(p pfctlArgs) (pfbackend.Output, error) {
@@ -476,10 +574,7 @@ func (k *kernel) flushCmd(p pfctlArgs) (pfbackend.Output, error) {
 func (k *kernel) showCmd(p pfctlArgs) (pfbackend.Output, error) {
 	switch p.show {
 	case "r", "rules":
-		if p.anchor == "" {
-			return stdout(joinLines(k.mainRules)), nil
-		}
-		return stdout(joinLines(k.rules[p.anchor])), nil
+		return stdout(joinLines(k.printed(p.anchor))), nil
 	case "n", "nat":
 		if p.anchor == "" {
 			return stdout(joinLines(k.mainNat)), nil

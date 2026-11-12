@@ -44,6 +44,10 @@ func TestParseRules(t *testing.T) {
 		{"pass rule at the top level", append([]pf.Rule{{Action: pf.ActionPass}}, loadedRules...), zeroID, true},
 		{"NAT action at the top level", append([]pf.Rule{{Action: pf.ActionNAT}}, loadedRules...), zeroID, true},
 		{"block rule at the top level", append([]pf.Rule{{Action: pf.ActionDrop}}, loadedRules...), zeroID, false},
+		{"absolute anchor call", append([]pf.Rule{{Action: pf.ActionPass, AnchorCall: "/vpn"}}, loadedRules...), zeroID, true},
+		{"anchor call out of the anchor", append([]pf.Rule{{Action: pf.ActionPass, AnchorCall: "../vpn"}}, loadedRules...), zeroID, true},
+		{"wildcard call below a sub-anchor", append([]pf.Rule{{Action: pf.ActionPass, AnchorCall: "tag.bing/*"}}, loadedRules...), zeroID, true},
+		{"wildcard call of the sub-anchors", append([]pf.Rule{{Action: pf.ActionPass, AnchorCall: "*"}}, loadedRules...), zeroID, true},
 		{"no sentinel", []pf.Rule{{Action: pf.ActionDrop}}, "", false},
 		{"empty anchor", nil, "", false},
 		{"two sentinels", append(slices.Clone(loadedRules), other), "", false},
@@ -227,11 +231,14 @@ func TestPassQuick(t *testing.T) {
 		{"pass quick on lo0 all", true},
 		{"pass out on en0 inet all flags any keep state", false},
 		{"block return out quick all", false},
+		{`pass out on en0 all no state label "keep quick dns"`, false},
+		{`pass out on en0 all no state label "a\" quick "`, false},
+		{`pass out quick on en0 all no state label "a b"`, true},
 		{`anchor "com.apple/*" all`, false},
 		{"", false},
 	}
 	for _, tt := range tests {
-		if got := passQuick(tt.rule); got != tt.want {
+		if got := passQuick(ruleWords(tt.rule)); got != tt.want {
 			t.Errorf("passQuick(%q) = %v, want %v", tt.rule, got, tt.want)
 		}
 	}
