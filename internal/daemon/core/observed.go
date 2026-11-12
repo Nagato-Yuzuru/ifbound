@@ -11,7 +11,8 @@ type ReqID uint64
 // outside the loop: the last good sample, the failure after it, the read
 // in flight, and one pending read. At most one read is in flight. A
 // trigger during the flight does not start a second read: it asks for
-// one more read after the flight ends.
+// one more read after the flight ends. Observed has no deadline: an input
+// with a budget keeps it beside its Observed value.
 //
 // The zero Observed has no sample and no read. Each method returns a new
 // value and never changes the old one.
@@ -21,9 +22,6 @@ type Observed[T any] struct {
 	flight  *Flight
 	// again is true when a trigger came during the flight.
 	again bool
-	// late is true when the last read that ended was at or after its
-	// deadline.
-	late bool
 }
 
 // Sample is the value of the last good read.
@@ -41,20 +39,16 @@ type Failure struct {
 }
 
 // Flight is the read in flight.
-type Flight struct {
-	ID       ReqID
-	Deadline time.Time
-}
+type Flight struct{ ID ReqID }
 
-// Start starts the read id with a budget, and reports true. During a
-// flight it starts nothing, asks for one more read after the flight, and
-// reports false.
-func (o Observed[T]) Start(id ReqID, now time.Time, budget time.Duration) (Observed[T], bool) {
+// Start starts the read id, and reports true. During a flight it starts
+// nothing, asks for one more read after the flight, and reports false.
+func (o Observed[T]) Start(id ReqID) (Observed[T], bool) {
 	if o.flight != nil {
 		o.again = true
 		return o, false
 	}
-	o.flight = &Flight{ID: id, Deadline: now.Add(budget)}
+	o.flight = &Flight{ID: id}
 	o.again = false
 	return o, true
 }
@@ -64,11 +58,10 @@ func (o Observed[T]) Start(id ReqID, now time.Time, budget time.Duration) (Obser
 // read makes a new sample and ends the failure series. A failed read
 // keeps the last sample. The pending read stays for the caller to start.
 func (o Observed[T]) Finish(id ReqID, v T, err error, now time.Time) (Observed[T], bool) {
-	if o.flight == nil || o.flight.ID != id {
+	o, ok := o.Keep(id)
+	if !ok {
 		return o, false
 	}
-	o.late = !now.Before(o.flight.Deadline)
-	o.flight = nil
 	if err != nil {
 		f := Failure{Err: err, Since: now, At: now, Count: 1}
 		if o.failure != nil {
@@ -79,6 +72,18 @@ func (o Observed[T]) Finish(id ReqID, v T, err error, now time.Time) (Observed[T
 	}
 	o.last = &Sample[T]{Value: v, At: now}
 	o.failure = nil
+	return o, true
+}
+
+// Keep ends the read id with no value and no error: the read gave nothing
+// new. The last sample and the failure stay. It reports false, and
+// changes nothing, when id is not the read in flight. The pending read
+// stays for the caller to start.
+func (o Observed[T]) Keep(id ReqID) (Observed[T], bool) {
+	if o.flight == nil || o.flight.ID != id {
+		return o, false
+	}
+	o.flight = nil
 	return o, true
 }
 
@@ -112,13 +117,3 @@ func (o Observed[T]) InFlight() (Flight, bool) {
 // Again reports whether a trigger came during the last flight, and no
 // read started after it.
 func (o Observed[T]) Again() bool { return o.again }
-
-// Overdue reports whether the read in flight is at or past its deadline
-// at now.
-func (o Observed[T]) Overdue(now time.Time) bool {
-	return o.flight != nil && !now.Before(o.flight.Deadline)
-}
-
-// Late reports whether the last read that ended was at or past its
-// deadline.
-func (o Observed[T]) Late() bool { return o.late }

@@ -262,6 +262,9 @@ type capturedLogs struct {
 	mu   sync.Mutex
 	msgs []string
 	evs  []event
+	// onEvent, when set, gets each event on the goroutine that logs it,
+	// without the lock held.
+	onEvent func(event)
 }
 
 // event is one captured log record.
@@ -273,8 +276,6 @@ type event struct {
 
 func (h *capturedLogs) Enabled(context.Context, slog.Level) bool { return true }
 func (h *capturedLogs) Handle(_ context.Context, r slog.Record) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	msg := r.Level.String() + " " + r.Message
 	ev := event{level: r.Level, msg: r.Message, attrs: make(map[string]slog.Value, r.NumAttrs())}
 	r.Attrs(func(a slog.Attr) bool {
@@ -282,8 +283,13 @@ func (h *capturedLogs) Handle(_ context.Context, r slog.Record) error {
 		ev.attrs[a.Key] = a.Value.Resolve()
 		return true
 	})
+	h.mu.Lock()
 	h.msgs = append(h.msgs, msg)
 	h.evs = append(h.evs, ev)
+	h.mu.Unlock()
+	if h.onEvent != nil {
+		h.onEvent(ev)
+	}
 	return nil
 }
 

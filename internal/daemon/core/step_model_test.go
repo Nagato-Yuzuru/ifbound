@@ -123,7 +123,7 @@ func (m *accountModel) step(ev Event) ([]ReadAccounts, error) {
 			reads = append(reads, e)
 		case Converge:
 			converges++
-		case AccountsOverdue, AccountLookupsFailed:
+		case AccountsOverdue, AccountLookupsFailed, ReadHosts, ReadKernelHosts, HostsReadFailed, KernelHostsFailed:
 		}
 	}
 	switch {

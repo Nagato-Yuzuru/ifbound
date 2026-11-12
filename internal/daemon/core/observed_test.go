@@ -8,7 +8,6 @@ import (
 
 var (
 	t0      = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	budget  = 5 * time.Second
 	errRead = errors.New("read failed")
 )
 
@@ -16,19 +15,19 @@ func at(d time.Duration) time.Time { return t0.Add(d) }
 
 func TestObservedStartsOneFlightAndKeepsOnePendingRead(t *testing.T) {
 	var o Observed[int]
-	o, started := o.Start(1, at(0), budget)
+	o, started := o.Start(1)
 	if !started {
 		t.Fatal("Start on an idle input did not start a read")
 	}
 	f, ok := o.InFlight()
-	if !ok || f.ID != 1 || !f.Deadline.Equal(at(budget)) {
-		t.Fatalf("InFlight = %+v, %v; want ID 1 with the deadline %v", f, ok, at(budget))
+	if !ok || f.ID != 1 {
+		t.Fatalf("InFlight = %+v, %v; want ID 1", f, ok)
 	}
 	if o.Again() {
 		t.Error("Again after the first Start, want false")
 	}
 	for range 3 {
-		o, started = o.Start(2, at(time.Second), budget)
+		o, started = o.Start(2)
 		if started {
 			t.Fatal("Start during a flight started a second read")
 		}
@@ -47,7 +46,7 @@ func TestObservedStartsOneFlightAndKeepsOnePendingRead(t *testing.T) {
 	if !o.Again() {
 		t.Error("Finish cleared the pending read")
 	}
-	o, started = o.Start(3, at(2*time.Second), budget)
+	o, started = o.Start(3)
 	if !started || o.Again() {
 		t.Errorf("Start after Finish: started %v, Again %v; want a new read and no pending read", started, o.Again())
 	}
@@ -91,7 +90,7 @@ func TestObservedIgnoresAStaleResult(t *testing.T) {
 	if _, ok := o.Finish(1, 5, nil, at(0)); ok {
 		t.Error("Finish without a flight was taken")
 	}
-	o, _ = o.Start(2, at(0), budget)
+	o, _ = o.Start(2)
 	before := o
 	got, ok := o.Finish(1, 5, nil, at(time.Second))
 	if ok {
@@ -102,60 +101,36 @@ func TestObservedIgnoresAStaleResult(t *testing.T) {
 	}
 }
 
-func TestObservedOverdueFromTheDeadline(t *testing.T) {
+func TestObservedKeepEndsTheFlightAndKeepsTheSampleAndTheFailure(t *testing.T) {
 	var o Observed[int]
-	if o.Overdue(at(time.Hour)) {
-		t.Error("Overdue without a flight")
+	o, _ = o.Start(1)
+	o, ok := o.Keep(1)
+	if !ok {
+		t.Fatal("Keep of the flight was refused")
 	}
-	o, _ = o.Start(1, at(0), budget)
-	for _, c := range []struct {
-		now  time.Time
-		want bool
-	}{
-		{at(0), false},
-		{at(budget - time.Nanosecond), false},
-		{at(budget), true},
-		{at(budget + time.Hour), true},
-	} {
-		if got := o.Overdue(c.now); got != c.want {
-			t.Errorf("Overdue(%v) = %v, want %v", c.now.Sub(t0), got, c.want)
-		}
+	if _, ok := o.InFlight(); ok {
+		t.Error("a flight is left after Keep")
 	}
-}
-
-func TestObservedLateWhenTheReadEndsAtOrAfterItsDeadline(t *testing.T) {
-	for _, c := range []struct {
-		name string
-		took time.Duration
-		err  error
-		want bool
-	}{
-		{"on time", budget - time.Nanosecond, nil, false},
-		{"at the deadline", budget, nil, true},
-		{"after the deadline", 2 * budget, nil, true},
-		{"failed after the deadline", 2 * budget, errRead, true},
-	} {
-		t.Run(c.name, func(t *testing.T) {
-			var o Observed[int]
-			o, _ = o.Start(1, at(0), budget)
-			o = finish(t, o, 1, 1, c.err, at(c.took))
-			if o.Late() != c.want {
-				t.Errorf("Late = %v, want %v", o.Late(), c.want)
-			}
-		})
+	if _, ok := o.Last(); ok {
+		t.Error("Keep without a sample made one")
 	}
 
-	// A read on time after a late one clears Late.
-	var o Observed[int]
-	o, _ = o.Start(1, at(0), budget)
-	o = finish(t, o, 1, 1, nil, at(2*budget))
-	o, _ = o.Start(2, at(2*budget), budget)
-	if !o.Late() {
-		t.Error("Start cleared Late of the last read")
+	o = finish(t, o, 2, 10, nil, at(2*time.Second))
+	o = finish(t, o, 3, 0, errRead, at(3*time.Second))
+	o, _ = o.Start(4)
+	o, ok = o.Keep(4)
+	if !ok {
+		t.Fatal("Keep of the flight was refused")
 	}
-	o = finish(t, o, 2, 1, nil, at(2*budget+time.Second))
-	if o.Late() {
-		t.Error("Late after a read on time")
+	wantSample(t, o, 10, at(2*time.Second))
+	if f, ok := o.Failing(); !ok || f.Count != 1 || !f.At.Equal(at(3*time.Second)) {
+		t.Errorf("Failing = %+v, %v after Keep; want the one failure at %v", f, ok, at(3*time.Second))
+	}
+
+	o, _ = o.Start(5)
+	before := o
+	if got, ok := o.Keep(4); ok || got != before {
+		t.Errorf("Keep with the ID of an older read: %v, %+v; want refused and no change", ok, got)
 	}
 }
 
@@ -163,7 +138,7 @@ func TestObservedLateWhenTheReadEndsAtOrAfterItsDeadline(t *testing.T) {
 func finish(t *testing.T, o Observed[int], id ReqID, v int, err error, now time.Time) Observed[int] {
 	t.Helper()
 	if _, ok := o.InFlight(); !ok {
-		o, _ = o.Start(id, now, budget)
+		o, _ = o.Start(id)
 	}
 	o, ok := o.Finish(id, v, err, now)
 	if !ok {

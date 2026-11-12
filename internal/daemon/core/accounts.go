@@ -15,6 +15,25 @@ import (
 // does not answer can take much longer.
 const AccountReadTimeout = 5 * time.Second
 
+// accountReads is what Step knows of the account reads. They are the only
+// input with a budget, so the deadline is here and not in Observed: an
+// input without a budget cannot be late.
+type accountReads struct {
+	Observed[Accounts]
+	// deadline is the end of the budget of the read in flight.
+	deadline time.Time
+	// late is true when the last read that ended was at or after its
+	// deadline.
+	late bool
+}
+
+// overdue reports whether the read in flight is at or past its deadline
+// at now.
+func (a accountReads) overdue(now time.Time) bool {
+	_, busy := a.InFlight()
+	return busy && !now.Before(a.deadline)
+}
+
 // Accounts is the account snapshot that the convergences use. The
 // Compiler drops the scope of a policy that names an account that is not
 // in the snapshot, so the zero snapshot drops every scope.
@@ -88,7 +107,7 @@ func (s State) AccountIDs() reconcile.Accounts {
 // traffic.
 func AccountsProblem(s State) (reconcile.Problem, bool) {
 	last, done := s.accounts.Last()
-	overdue := s.accounts.Overdue(s.now)
+	overdue := s.accounts.overdue(s.now)
 	var text string
 	switch {
 	case !done:
@@ -96,7 +115,7 @@ func AccountsProblem(s State) (reconcile.Problem, bool) {
 		if overdue {
 			text += fmt.Sprintf("; the read takes longer than %s", AccountReadTimeout)
 		}
-	case overdue || s.accounts.Late():
+	case overdue || s.accounts.late:
 		text = fmt.Sprintf("the account read takes longer than %s, so a changed account applies late", AccountReadTimeout)
 	case last.Value.Failed > 0:
 		text = fmt.Sprintf("the lookup of %d user and group accounts failed; each keeps the id of its last good lookup, and a scope that has an account without one applies to all traffic", last.Value.Failed)
@@ -111,12 +130,12 @@ func AccountsProblem(s State) (reconcile.Problem, bool) {
 // flight ends.
 func (s State) readAccounts(out []Effect) (State, []Effect) {
 	id := s.nextID + 1
-	o, started := s.accounts.Start(id, s.now, AccountReadTimeout)
-	s.accounts = o
+	o, started := s.accounts.Start(id)
+	s.accounts.Observed = o
 	if !started {
 		return s, out
 	}
-	s.nextID = id
+	s.nextID, s.accounts.deadline = id, s.now.Add(AccountReadTimeout)
 	return s, append(out, ReadAccounts{ID: id, Users: s.scope.users, Groups: s.scope.groups})
 }
 
@@ -124,7 +143,7 @@ func (s State) readAccounts(out []Effect) (State, []Effect) {
 // directory that is always slow tells it once: not again while each read
 // ends late.
 func (s State) accountsOverdue(out []Effect) []Effect {
-	if s.accounts.Late() {
+	if s.accounts.late {
 		return out
 	}
 	return append(out, AccountsOverdue{})
@@ -137,7 +156,7 @@ func (s State) accountsOverdue(out []Effect) []Effect {
 // changed. It changes nothing for the result of another read.
 func (s State) applyAccounts(ev AccountsRead, out []Effect) (State, []Effect, bool) {
 	before, wasDone := s.accounts.Last()
-	wasLate := s.accounts.Late()
+	wasLate := s.accounts.late
 	users, failedUsers, userErrs := mergeLookups("user", ev.Users, before.Value.IDs.Users)
 	groups, failedGroups, groupErrs := mergeLookups("group", ev.Groups, before.Value.IDs.Groups)
 	errs := slices.Concat(userErrs, groupErrs)
@@ -146,7 +165,7 @@ func (s State) applyAccounts(ev AccountsRead, out []Effect) (State, []Effect, bo
 	if !ok {
 		return s, out, false
 	}
-	s.accounts = o
+	s.accounts.Observed, s.accounts.late = o, !s.now.Before(s.accounts.deadline)
 	if before.Value.Failed == 0 && len(errs) > 0 {
 		// The details go to the log at the first read that fails after a
 		// good one. The problem text has only the count, so it does not
@@ -156,7 +175,7 @@ func (s State) applyAccounts(ev AccountsRead, out []Effect) (State, []Effect, bo
 	if o.Again() {
 		s, out = s.readAccounts(out)
 	}
-	changed := !wasDone || o.Late() != wasLate || snap.Failed != before.Value.Failed ||
+	changed := !wasDone || s.accounts.late != wasLate || snap.Failed != before.Value.Failed ||
 		!maps.Equal(before.Value.IDs.Users, users) || !maps.Equal(before.Value.IDs.Groups, groups)
 	return s, out, changed
 }

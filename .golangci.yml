@@ -46,6 +46,19 @@ linters:
               desc: core does no I/O; the shell does it
             - pkg: net
               desc: core does no I/O; the shell does it
+            - pkg: log
+              desc: core logs nothing; it returns an OutEffect, and the shell logs it
+        daemon-core-random:
+          # Equal input to Step must give equal output. The model tests of
+          # core use math/rand with a fixed seed.
+          files: ["**/internal/daemon/core/**", "!$test"]
+          deny:
+            - pkg: math/rand
+              desc: core uses no random value; equal input to Step must give equal output
+            - pkg: math/rand/v2
+              desc: core uses no random value; equal input to Step must give equal output
+            - pkg: crypto/rand
+              desc: core uses no random value; equal input to Step must give equal output
         toml-position-walk:
           # One walk over unstable.Parser gives the places of fields and finds
           # duplicate keys. A second walker would drift from it.
@@ -72,10 +85,15 @@ linters:
             - pkg: encoding/json$
               desc: use encoding/json/v2
     forbidigo:
+      # Match the package path, not the name in the file, so an import
+      # with another name does not hide a call.
+      analyze-types: true
       forbid:
-        # The exclusions below limit this rule to internal/daemon/core.
+        # The exclusions below limit these rules to internal/daemon/core.
         - pattern: ^time\.(Now|Since|Until|After|AfterFunc|Sleep|NewTimer|NewTicker|Tick)$
           msg: core reads no clock and starts no timer; the time comes with each event
+        - pattern: ^(fmt\.Print.*|print|println)$
+          msg: core writes nothing; it returns an OutEffect, and the shell logs it
     errcheck:
       check-blank: true # a blank drop needs //nolint:errcheck with a reason; nolintlint enforces the reason
     godox:

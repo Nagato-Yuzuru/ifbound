@@ -305,6 +305,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	_ = l.reconcile(ctx, logattr.TriggerStart) //nolint:errcheck // the phase holds the outcome
 	l.wantAccounts(ctx)
 	for {
+		if l.pending != "" {
+			_ = l.reconcile(ctx, l.pending) //nolint:errcheck // the phase holds the outcome
+		}
 		l.armExpiry(expiry)
 		l.armWake(wake)
 		warm.sync(ctx, l)
@@ -314,10 +317,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return nil
 		case req := <-d.requests:
 			req(ctx, l)
-			if l.recheck {
-				l.recheck = false
-				_ = l.reconcile(ctx, logattr.TriggerRulesetChanged) //nolint:errcheck // the phase holds the outcome
-			}
 		case <-changes:
 			if debounce == nil {
 				debounce = time.After(InterfaceDebounce)
