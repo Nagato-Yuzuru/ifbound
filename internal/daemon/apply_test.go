@@ -343,22 +343,30 @@ func TestApplyWithAnEndedContextNeverStores(t *testing.T) {
 }
 
 func TestRunRefusesABadConfig(t *testing.T) {
+	const (
+		path = "/var/db/ifbound/config.toml"
+		book = "/var/db/ifbound/addrbook"
+	)
 	tests := []struct {
 		name string
 		path string
+		book string
 		gid  int
 		// noHosts leaves Config.Hosts nil.
 		noHosts bool
 	}{
-		{"relative path", "state/config.toml", -1, false},
-		{"path not clean", "/var/db/ifbound/../ifbound/config.toml", -1, false},
-		{"empty path", "", -1, false},
-		{"zero gid", "/var/db/ifbound/config.toml", 0, false},
-		{"nil hosts", "/var/db/ifbound/config.toml", -1, true},
+		{"relative path", "state/config.toml", book, -1, false},
+		{"path not clean", "/var/db/ifbound/../ifbound/config.toml", book, -1, false},
+		{"empty path", "", book, -1, false},
+		{"relative book path", path, "addrbook", -1, false},
+		{"book path not clean", path, "/var/db/ifbound/./addrbook", -1, false},
+		{"empty book path", path, "", -1, false},
+		{"zero gid", path, book, 0, false},
+		{"nil hosts", path, book, -1, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := daemon.Config{ConfigPath: tt.path, ConfigGID: tt.gid}
+			cfg := daemon.Config{ConfigPath: tt.path, AddrStore: tt.book, ConfigGID: tt.gid}
 			if !tt.noHosts {
 				cfg.Hosts = &fakeHosts{}
 			}

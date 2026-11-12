@@ -41,12 +41,13 @@ func hostPrefixes(ss ...string) []netip.Prefix {
 	return out
 }
 
-func worldWithLearned(t *testing.T, dir string) *reconciletest.World {
+func worldWithLearned(t *testing.T) *reconciletest.World {
 	t.Helper()
 	// A first daemon learns addresses; the kernel tables keep them after
-	// it stops.
+	// it stops. Its address book is in another directory: the second
+	// daemon finds only the JSON snapshot of an earlier version.
 	w := reconciletest.NewWorld()
-	rg := newRig(t, w, dir, rigCfgA)
+	rg := newRig(t, w, t.TempDir(), rigCfgA)
 	for _, o := range []ipc.Observation{
 		{QName: "example.com", Addrs: []netip.Addr{netip.MustParseAddr("192.0.2.1")}, TTL: time.Minute},
 		{QName: "x.ads.example", Addrs: []netip.Addr{netip.MustParseAddr("2001:db8::5")}, TTL: time.Minute},
@@ -80,7 +81,7 @@ func TestRefusedSnapshotDropsNoKernelAddress(t *testing.T) {
 // on a World whose tables hold learned addresses.
 func checkRefusedSnapshot(t *testing.T, doc string) {
 	dir := t.TempDir()
-	w := worldWithLearned(t, dir)
+	w := worldWithLearned(t)
 	tables := w.Tables()
 	ruleset := w.Ruleset().ID()
 	entries := w.ResolverEntries()
@@ -114,11 +115,12 @@ func checkRefusedSnapshot(t *testing.T, doc string) {
 
 // A v2 snapshot of the previous version with aliases only has no
 // address of a configured policy, so the daemon adopts the kernel
-// entries, keeps them, and saves them in the current format.
+// entries, keeps them, and saves them in the address book. The imported
+// snapshot is gone.
 func TestAliasOnlySnapshotAdoptsKernelEntries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		dir := t.TempDir()
-		w := worldWithLearned(t, dir)
+		w := worldWithLearned(t)
 		data, err := os.ReadFile(v2AliasesOnlySnapshot)
 		if err != nil {
 			t.Fatal(err)
@@ -146,12 +148,8 @@ func TestAliasOnlySnapshotAdoptsKernelEntries(t *testing.T) {
 				t.Errorf("adopted %s %s is not in the saved snapshot", e.p, e.a)
 			}
 		}
-		saved, err := os.ReadFile(snap)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if bytes.Contains(saved, []byte("aliases")) {
-			t.Errorf("the saved snapshot still has aliases: %s", saved)
+		if _, err := os.Stat(snap); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("the imported snapshot is still there: %v", err)
 		}
 		rg.checkResolverEntries(true)
 	})
@@ -165,7 +163,7 @@ func TestAliasOnlySnapshotAdoptsKernelEntries(t *testing.T) {
 func TestRemovedPolicyOnlySnapshotAdoptsKernelEntries(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		dir := t.TempDir()
-		w := worldWithLearned(t, dir)
+		w := worldWithLearned(t)
 		now := time.Now().UnixNano()
 		doc := fmt.Sprintf(`{"version":1,"entries":[{"policy":"gone","addr":"203.0.113.9",`+
 			`"last_seen_unix_nano":%d,"ttl_nano":0,"expiry_unix_nano":%d}]}`, now, now+int64(time.Hour))
@@ -320,7 +318,7 @@ func TestWarmUpWaitsForTheProbeAndRetriesLater(t *testing.T) {
 		d := daemon.New(daemon.Config{
 			ConfigPath: storeConfig(t, t.TempDir(), rigCfgA),
 			ConfigGID:  -1,
-			Snapshot:   filepath.Join(t.TempDir(), "addrbook.json"),
+			AddrStore:  filepath.Join(t.TempDir(), "addrbook"),
 			// A missing host file: the tests here do not read the host file of the machine.
 			Hosts: &fakeHosts{},
 			Platform: reconcile.Reconciler{

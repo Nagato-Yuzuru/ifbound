@@ -1,10 +1,12 @@
 // Package daemon runs the ifboundd event loop.
 //
-// One goroutine, started by Run, owns the address book and drives the
-// platform through a reconcile.Reconciler. Every event goes to it: a DNS
-// report, an interface change, the self-heal and expiry timers, and a
-// configuration change. Other goroutines talk to it only through requests
-// with a reply channel, so its state needs no lock.
+// One goroutine, started by Run, drives the platform through a
+// reconcile.Reconciler. Every event goes to it: a DNS report, an
+// interface change, the self-heal and expiry timers, and a configuration
+// change. Other goroutines talk to it only through requests with a reply
+// channel, so its state needs no lock. It holds the address book (see
+// addrstore) and calls it synchronously; the committer goroutine of the
+// book writes it.
 //
 // Every event that can change the desired state ends in the same
 // convergence. Crash recovery, an external flush, and a configuration
@@ -12,7 +14,7 @@
 // resolver entry: enforcement stays in place while the daemon is down.
 //
 // An acknowledgement of a report means: the addresses are in the tables
-// of the matching policies, in the saved snapshot, and the ruleset that
+// of the matching policies, in the address book on disk, and the ruleset that
 // the last convergence installed for the current configuration and
 // interfaces is still loaded. See State for when the daemon acknowledges.
 //
@@ -106,7 +108,14 @@ type Config struct {
 	// wheel, so a zero is a field that the caller did not set. A
 	// negative value keeps the group of the new file, for tests.
 	ConfigGID int
-	// Snapshot is the path of the address book snapshot.
+	// AddrStore is the path of the address book directory (see
+	// addrstore; layout.AddrBook on the real system). It must be
+	// absolute and clean.
+	AddrStore string
+	// Snapshot is the path of the JSON snapshot of the address book that
+	// earlier versions wrote (layout.Snapshot on the real system). Each
+	// open of AddrStore merges it into the book when it exists, and
+	// removes it. Empty means none.
 	Snapshot string
 	// Hosts reads the host file. It is required.
 	Hosts HostsReader
@@ -162,6 +171,8 @@ type Daemon struct {
 	status atomic.Pointer[Status]
 	// store is configstore.Store. A test can replace it before Run.
 	store storeFunc
+	// openBook opens the address book. A test can replace it before Run.
+	openBook openBookFunc
 
 	// probes are the probe names that a probe waits for. The probe
 	// reports do not go through the loop: a probe report must never wait
@@ -183,6 +194,7 @@ func New(cfg Config) *Daemon {
 	d := &Daemon{
 		cfg:      cfg,
 		store:    configstore.Store,
+		openBook: openStore,
 		requests: make(chan request),
 		done:     make(chan struct{}),
 		probes:   make(map[string]*probeWait),
@@ -197,6 +209,8 @@ func (c Config) check() error {
 	switch {
 	case !filepath.IsAbs(c.ConfigPath) || filepath.Clean(c.ConfigPath) != c.ConfigPath:
 		return fmt.Errorf("%w: ConfigPath %q is not an absolute clean path", ErrBadConfig, c.ConfigPath)
+	case !filepath.IsAbs(c.AddrStore) || filepath.Clean(c.AddrStore) != c.AddrStore:
+		return fmt.Errorf("%w: AddrStore %q is not an absolute clean path", ErrBadConfig, c.AddrStore)
 	case c.ConfigGID == 0:
 		return fmt.Errorf("%w: ConfigGID is zero", ErrBadConfig)
 	case c.Hosts == nil:
@@ -207,7 +221,9 @@ func (c Config) check() error {
 }
 
 // Run is the event loop. It loads the stored configuration and the
-// snapshot, converges, and then serves events until ctx ends. It returns
+// address book, converges, and then serves events until ctx ends. When
+// ctx ends, it closes the book: each acknowledged lease is already
+// durable. It returns
 // nil when ctx ends, ErrAlreadyRunning when called a second time, and
 // an error that wraps ErrBadConfig when a field of Config is not valid.
 //
@@ -219,19 +235,23 @@ func (c Config) check() error {
 // configuration that fails policy.Config.CheckUpstreams still applies;
 // the failure makes the state StateDegraded.
 //
-// A snapshot that does not load keeps the daemon in StateStarting, with
-// the load error as the first reason. The daemon then still loads the
-// ruleset and adds the IP and CIDR destinations and the host addresses
-// to their tables, but it drops no table, also not the table of a policy
-// that the configuration removed, and it removes only the entries that
+// An address book that does not open, such as one whose JSON snapshot
+// does not import or one that another process holds, keeps the daemon in
+// StateStarting, with the open error as the first reason. The daemon then still loads the ruleset and
+// adds the IP and CIDR destinations and the host addresses to their
+// tables, but it drops no table, also not the table of a policy that the
+// configuration removed, and it removes only the entries that
 // blockable.New refuses (see reconcile.Inputs.AddOnly). So after a
-// reboot the destinations that need no snapshot are blocked, and an
-// address that the kernel tables hold stays blocked. A snapshot without
-// an address of a configured policy, such as a missing file, makes the
-// daemon adopt the learned-looking kernel entries and save them before
-// it leaves StateStarting. The self-heal timer retries the load and the
-// convergence until both succeed. The first pass that loads the snapshot
-// is a normal convergence: it can remove entries.
+// reboot the destinations that need no book are blocked, and an address
+// that the kernel tables hold stays blocked. A book with damage, a book
+// whose last write a crash cut off, or a fresh book without an address
+// of a configured policy, makes the daemon adopt the learned-looking kernel entries that
+// the book does not hold, and save them, before it leaves StateStarting.
+// A damaged place in the book does not stop the open: the daemon logs it,
+// uses the rest, and is in StateDegraded while that book is open (see
+// addrstore.Store.Damage). The self-heal timer retries the open and the
+// convergence until both succeed. The first pass that opens the book is
+// a normal convergence: it can remove entries.
 //
 // Each convergence first asks Config.Hosts for the version of the host
 // file, and reads it again when the version changed. While the file
@@ -291,7 +311,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer warm.wait()
 	defer close(d.done)
 
-	l := newLoop(d.cfg, d.store, &d.status)
+	l := newLoop(d.cfg, d.store, d.openBook, &d.status)
+	// Before done closes, so that a new daemon can open the book.
+	defer l.closeBook()
 	l.loadStored(ctx)
 	heal := time.NewTicker(SelfHealInterval)
 	defer heal.Stop()
@@ -346,7 +368,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 // nil error and an unprotected ack. The address list and the ruleset are
 // not checked then. For a name that matches a policy, a nil error means
 // that every address is in the table of each matching policy and in the
-// saved snapshot, and that the installed ruleset is loaded. The ack is
+// address book on disk, and that the installed ruleset is loaded. The ack is
 // then protected. It returns ErrNotReady in StateStarting, ErrUnenforced
 // when enforcement is not installed, an error that wraps
 // matcher.ErrMalformedName for a name that cannot be classified, and the

@@ -3,7 +3,6 @@ package daemon
 import (
 	"time"
 
-	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
@@ -16,16 +15,16 @@ import (
 // Starting goes to Ready, Degraded, or Unenforced. These three go to each
 // other. Only Ready and Degraded acknowledge reports. A daemon that
 // starts without a stored configuration is in Unenforced; when Apply then
-// gives it a configuration and the snapshot does not load, it goes to
-// Starting.
+// gives it a configuration and the address book does not load, it goes
+// to Starting.
 type State uint8
 
 // The lifecycle states. The zero State is StateStarting.
 const (
-	// StateStarting: the snapshot is not loaded. The daemon acknowledges
-	// no report. With a configuration, it loads the ruleset and adds the
-	// entries that need no snapshot, but it removes no table entry that
-	// blockable.New accepts.
+	// StateStarting: the address book is not loaded. The daemon
+	// acknowledges no report. With a configuration, it loads the ruleset
+	// and adds the entries that need no address book, but it removes no
+	// table entry that blockable.New accepts.
 	StateStarting State = iota
 	// StateReady: the ruleset for the current configuration and
 	// interfaces is installed, and nothing reports a problem.
@@ -151,7 +150,7 @@ type mode interface{ isMode() }
 type unconfiguredMode struct{ phase waitPhase }
 
 // loadingMode: the daemon has a configuration, but no load of the
-// snapshot succeeded yet. It converges add-only: without the book, a
+// address book succeeded yet. It converges add-only: without the book, a
 // removal could unblock an acknowledged address. Its phase does not
 // acknowledge reports.
 type loadingMode struct {
@@ -162,13 +161,13 @@ type loadingMode struct {
 	phase  waitPhase
 }
 
-// runningMode: the daemon has a configuration and the book of the
-// loaded snapshot. It converges, and its phase can acknowledge reports.
+// runningMode: the daemon has a configuration and the loaded address
+// book. It converges, and its phase can acknowledge reports.
 type runningMode struct {
 	conf activeConfig
 	// retain is the retain of book.
 	retain time.Duration
-	book   *addrbook.AddrBook
+	book   addrBook
 	phase  phase
 }
 

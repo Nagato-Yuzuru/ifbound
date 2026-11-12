@@ -7,11 +7,14 @@ import (
 	"strings"
 )
 
+// MaxNameLen is the longest policy name, in bytes. The address book
+// stores each name in a field of this size.
+const MaxNameLen = 24
+
 const (
 	maxDomainLen    = 253
 	maxLabelLen     = 63
 	maxIfaceNameLen = 15 // IFNAMSIZ - 1
-	maxPolicyName   = 24
 	maxAccountLen   = 32 // the Linux login name limit, so one file works on both platforms
 )
 
@@ -179,7 +182,7 @@ func ParseAccount(s string) (Account, error) {
 func isLetter(c byte) bool { return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
 
 func parseName(s string) (Name, error) {
-	if s == "" || len(s) > maxPolicyName || s[0] == '-' || s[0] == '_' {
+	if s == "" || len(s) > MaxNameLen || s[0] == '-' || s[0] == '_' {
 		return "", fmt.Errorf("%w: %q", errBadName, s)
 	}
 	for i := range len(s) {

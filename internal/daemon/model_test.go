@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,10 +28,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/addrstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
@@ -56,13 +57,9 @@ var (
 	omStats = map[string]int{}
 )
 
-const (
-	omRetain = time.Hour
-	// omSlack is the save slack of the addrbook persist rule for omRetain:
-	// min(1h, retain/2). After a restart, an ack is durable only to its
-	// expiry minus this slack.
-	omSlack = 30 * time.Minute
-)
+// omRetain is the retain of the model configurations. Each ack is
+// durable to its full expiry: a record of the book never gives less.
+const omRetain = time.Hour
 
 // ---- configuration model ----
 
@@ -440,17 +437,21 @@ type omRun struct {
 	tracked map[omKey]*omEntry
 	pending map[omKey]*omEntry // entries of removed policies, kept for a revert until a prune is due
 
-	readSeq                 int
-	voidOn, nonvoidOn       bool
-	voidSeq, nonvoidSeq     int
-	rsDamageSeq             int
-	seg, phase              int
-	segFailed               bool
-	resolverFailed          []string // domains of the failed resolver Writes in this convergence
-	failAt, failFrom        int
-	saveFail                bool
+	readSeq             int
+	voidOn, nonvoidOn   bool
+	voidSeq, nonvoidSeq int
+	rsDamageSeq         int
+	seg, phase          int
+	segFailed           bool
+	resolverFailed      []string // domains of the failed resolver Writes in this convergence
+	failAt, failFrom    int
+	saveFail            bool
+	// bookFail fails the writes of the open book while saveFail is set:
+	// an open book does not need its directory to write.
+	bookFail                atomic.Bool
 	block, entered, release chan struct{}
 	adoptPending            bool
+	adoptAt                 time.Time // the restart that expects an adoption
 	adoptExpect             []omKey
 	adoptForbid             []omKey
 	violations              []string
@@ -770,7 +771,7 @@ func (r *omRun) start() {
 	r.d = daemon.New(daemon.Config{
 		ConfigPath: r.store,
 		ConfigGID:  -1,
-		Snapshot:   r.snap,
+		AddrStore:  r.snap,
 		// A missing host file: the tests here do not read the host file of the machine.
 		Hosts: &fakeHosts{},
 		Platform: reconcile.Reconciler{
@@ -781,6 +782,7 @@ func (r *omRun) start() {
 		},
 		Lookup: omLookup{r},
 	})
+	r.d.SetBookFault(&r.bookFail)
 	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel, r.done = cancel, make(chan error, 1)
 	go func() { r.done <- r.d.Run(ctx) }()
@@ -820,7 +822,7 @@ func (r *omRun) deleteSnapshotLocked() {
 	if err := os.Chmod(r.dir, 0o700); err != nil {
 		r.t.Fatal(err)
 	}
-	if err := os.Remove(r.snap); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.RemoveAll(r.snap); err != nil {
 		r.t.Fatal(err)
 	}
 	if r.saveFail {
@@ -832,6 +834,7 @@ func (r *omRun) deleteSnapshotLocked() {
 
 // expectAdoptionLocked updates the model for a start without a snapshot.
 func (r *omRun) expectAdoptionLocked(now time.Time) {
+	r.adoptAt = now
 	clear(r.pending)
 	r.computeAdoption()
 	for k, e := range r.tracked {
@@ -871,30 +874,28 @@ func (r *omRun) computeAdoption() {
 	}
 }
 
-// ---- snapshot reader, written from the file format ----
+// ---- address book reader ----
 
 type omSnapEntry struct {
-	Policy string `json:"policy"`
-	Addr   string `json:"addr"`
-	Expiry int64  `json:"expiry_unix_nano"`
+	Policy string
+	Addr   string
+	Expiry int64
 }
 
+// snapEntries returns the entries that a load of the book gives, also
+// the expired ones and those of a removed policy: the log of the book
+// records no removal. addrstore.Read takes no lock, so it reads the book
+// of the running daemon.
 func (r *omRun) snapEntries() []omSnapEntry {
-	data, err := os.ReadFile(r.snap)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	entries, err := addrstore.Read(r.snap, 0)
 	if err != nil {
-		r.violate("reading snapshot: %v", err)
-		return nil
+		r.violate("reading the book: %v", err)
 	}
-	var f struct {
-		Entries []omSnapEntry `json:"entries"`
+	out := make([]omSnapEntry, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, omSnapEntry{string(e.Policy), e.Addr.String(), e.Expiry.UnixNano()})
 	}
-	if err := json.Unmarshal(data, &f); err != nil {
-		r.violate("snapshot is not JSON: %v", err)
-	}
-	return f.Entries
+	return out
 }
 
 func (r *omRun) snapExpiry(k omKey) (time.Time, bool) {
@@ -977,6 +978,18 @@ func (r *omRun) checkAdoptionLocked() {
 	omStats["adoption checked"]++
 	r.adoptPending = false
 	for _, k := range r.adoptExpect {
+		if !r.cfg.has(k.P) {
+			// The install that left starting prunes the entries of a
+			// removed policy from the book at once.
+			continue
+		}
+		if !time.Now().Before(r.adoptAt.Add(omRetain)) {
+			// The adoption was at the restart or later. From one retain
+			// after the restart, Expire can have removed the entry from
+			// the book.
+			omStats["adoption checked after a possible expiry"]++
+			continue
+		}
 		if _, ok := r.snapExpiry(k); !ok {
 			r.violate("spec5: left starting without %s/%v in the saved snapshot", k.P, k.A)
 		}
@@ -1056,11 +1069,11 @@ func (r *omRun) recordAckLocked(matched []string, addrs []netip.Addr, exp time.T
 			if exp.After(e.mem) {
 				e.mem = exp
 			}
-			if d := exp.Add(-omSlack); d.After(e.disk) {
-				e.disk = d
+			if exp.After(e.disk) {
+				e.disk = exp
 			}
-			if got, ok := r.snapExpiry(k); !ok || got.Before(exp.Add(-omSlack)) {
-				r.violate("spec1: ack of %s/%v, snapshot expiry %v (present %v), want >= %v", p, a, got, ok, exp.Add(-omSlack))
+			if got, ok := r.snapExpiry(k); !ok || got.Before(exp) {
+				r.violate("spec1: ack of %s/%v, snapshot expiry %v (present %v), want >= %v", p, a, got, ok, exp)
 			}
 		}
 	}
@@ -1384,6 +1397,7 @@ func (r *omRun) setSaveFail(on bool) {
 	r.mu.Lock()
 	r.saveFail = on
 	r.mu.Unlock()
+	r.bookFail.Store(on)
 }
 
 func (r *omRun) setProblems(idx int) {
@@ -1533,7 +1547,7 @@ func newOmRun(t *testing.T, initial omCfg) *omRun {
 	dir := t.TempDir()
 	r := &omRun{
 		t: t, world: reconciletest.NewWorld(), inv: reconciletest.NewInventory(omEn0),
-		dir: dir, snap: filepath.Join(dir, "addrbook.json"), store: filepath.Join(t.TempDir(), "config.toml"),
+		dir: dir, snap: filepath.Join(dir, "addrbook"), store: filepath.Join(t.TempDir(), "config.toml"),
 		tracked: map[omKey]*omEntry{}, pending: map[omKey]*omEntry{}, rsDamageSeq: -1,
 	}
 	r.setCfg(initial.clone())
@@ -1567,6 +1581,7 @@ func (r *omRun) recoverAndCheck() {
 	r.mu.Lock()
 	r.failAt, r.failFrom, r.saveFail, r.voidOn, r.nonvoidOn = 0, 0, false, false, false
 	r.mu.Unlock()
+	r.bookFail.Store(false)
 	time.Sleep(daemon.SelfHealInterval)
 	synctest.Wait()
 	r.statusCheck()

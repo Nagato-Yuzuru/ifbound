@@ -39,7 +39,7 @@ import (
 var errRulesetChanged = errors.New("another ruleset is loaded")
 
 // AddrSource gives the learned addresses of a policy.
-// *addrbook.AddrBook implements it.
+// *addrstore.Store implements it.
 type AddrSource interface {
 	Addrs(name policy.Name) []blockable.Addr
 }

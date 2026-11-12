@@ -65,14 +65,14 @@ func TestStartWithABadStoreIsUnenforced(t *testing.T) {
 				}
 				h.stop()
 				tt.damage(t, h.store)
-				before, snap := platformOf(h.world), readFile(t, h.snapshot)
+				before, snap := platformOf(h.world), bookImage(t, bookPath(h.snapshot))
 
 				h = launch(t, h.spec)
 				defer h.stop()
 				wantUnconfigured(h, tt.reason)
 				disturb(h)
 				h.wantPlatform(before, "without a configuration")
-				if !bytes.Equal(readFile(t, h.snapshot), snap) {
+				if !bytes.Equal(bookImage(t, bookPath(h.snapshot)), snap) {
 					t.Error("the snapshot changed without a configuration")
 				}
 				wantUnconfigured(h, tt.reason)

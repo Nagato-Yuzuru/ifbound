@@ -174,9 +174,8 @@ type ackKey struct {
 // must stay blocked. The test goroutine writes it; the after-write hook
 // reads it on the daemon goroutine.
 //
-// The scenario spaces the reports of one address by more than the save
-// slack, so every acknowledgement saves the snapshot and the snapshot
-// expiry equals the acknowledged one.
+// Each acknowledgement is durable before it, so the expiry in the book
+// is at least the acknowledged one.
 type ackLog struct {
 	mu       sync.Mutex
 	retain   time.Duration

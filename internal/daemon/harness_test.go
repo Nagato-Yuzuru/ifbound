@@ -2,19 +2,23 @@ package daemon_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
-	"github.com/Nagato-Yuzuru/ifbound/internal/addrbook"
+	"github.com/Nagato-Yuzuru/ifbound/internal/addrstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
@@ -206,6 +210,7 @@ func launchHook(t *testing.T, s harnessSpec, hook func(*daemon.Daemon)) *harness
 	d := daemon.New(daemon.Config{
 		ConfigPath: s.store,
 		ConfigGID:  -1,
+		AddrStore:  bookPath(s.snapshot),
 		Snapshot:   s.snapshot,
 		Hosts:      hostsReader(s),
 		Logger:     slog.New(logs),
@@ -226,12 +231,14 @@ func launchHook(t *testing.T, s harnessSpec, hook func(*daemon.Daemon)) *harness
 	done := make(chan error, 1)
 	go func() { done <- d.Run(ctx) }()
 	synctest.Wait()
-	stop := func() {
+	// A test that restarts the daemon can stop the first one also in a
+	// deferred call: the second call does nothing.
+	stop := sync.OnceFunc(func() {
 		cancel()
 		if err := <-done; err != nil {
 			t.Errorf("Run: %v", err)
 		}
-	}
+	})
 	return &harness{
 		t: t, world: s.world, inv: s.inv, snapshot: s.snapshot, store: s.store,
 		hosts: s.hosts, logs: logs, d: d, stop: stop, spec: s,
@@ -293,18 +300,77 @@ func (h *harness) references(name policy.Name) bool {
 	return slices.Contains(h.world.Referenced(), name)
 }
 
-// saved returns the addresses of a policy in the snapshot on disk.
+// saved returns the addresses of a policy in the address book on disk.
 func (h *harness) saved(name policy.Name) []netip.Addr {
 	h.t.Helper()
-	b := addrbook.New(time.Hour, time.Now)
-	if err := b.Load(h.snapshot); err != nil {
-		h.t.Fatalf("load snapshot: %v", err)
+	return slices.SortedFunc(maps.Keys(readBook(h.t, bookPath(h.snapshot))[name]), netip.Addr.Compare)
+}
+
+// savedExpiry returns the expiry of an address of a policy in the address
+// book on disk.
+func (h *harness) savedExpiry(name policy.Name, a netip.Addr) (time.Time, bool) {
+	h.t.Helper()
+	exp, ok := readBook(h.t, bookPath(h.snapshot))[name][a]
+	return exp, ok
+}
+
+// bookPath returns the address book of a test whose JSON snapshot path
+// is snapshot: the directory addrbook next to it.
+func bookPath(snapshot string) string { return filepath.Join(filepath.Dir(snapshot), "addrbook") }
+
+// readBook returns the expiry of each address of each policy that a load
+// of the address book at path gives. The log of the book records no
+// removal, so it also returns expired entries and those of a removed
+// policy. A missing book is empty.
+func readBook(t testing.TB, path string) map[policy.Name]map[netip.Addr]time.Time {
+	t.Helper()
+	entries, err := addrstore.Read(path, 0)
+	if err != nil && !errors.Is(err, addrstore.ErrCorrupt) {
+		t.Fatalf("read the address book: %v", err)
 	}
-	var out []netip.Addr
-	for _, a := range b.Addrs(name) {
-		out = append(out, a.Addr())
+	out := map[policy.Name]map[netip.Addr]time.Time{}
+	for _, e := range entries {
+		if out[e.Policy] == nil {
+			out[e.Policy] = map[netip.Addr]time.Time{}
+		}
+		out[e.Policy][e.Addr.Addr()] = e.Expiry
 	}
 	return out
+}
+
+// bookImage returns the names and the bytes of the segments of the book
+// at path, so that a test can see any write. A missing book is empty.
+func bookImage(t testing.TB, path string) []byte {
+	t.Helper()
+	ents, err := os.ReadDir(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []byte
+	for _, e := range ents {
+		if !strings.HasSuffix(e.Name(), ".seg") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(path, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(append(out, e.Name()...), data...)
+	}
+	return out
+}
+
+// tablesHold reports whether any table holds a.
+func (h *harness) tablesHold(a netip.Addr) bool {
+	for _, entries := range h.world.Tables() {
+		if slices.Contains(entries, netip.PrefixFrom(a, a.BitLen())) {
+			return true
+		}
+	}
+	return false
 }
 
 // failWrites makes every write fail until h.world.SetBeforeWrite(nil).
