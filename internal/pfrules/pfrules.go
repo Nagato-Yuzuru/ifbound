@@ -7,9 +7,13 @@
 // entries that the Backend added. The rules come after the tables, one
 // policy after the other in name order. Each policy gets these rules:
 //
-//   - only_via: an anchor rule that only tags the packets on the allowed
-//     interfaces, then a quick block for the packets without that tag.
-//     When no interface is allowed, the block rule only.
+//   - only_via: a quick block on each current interface that the policy
+//     does not allow, except lo0; an anchor rule that only tags the
+//     packets on the allowed interfaces; then a quick block on each
+//     interface except lo0 for the packets without that tag. The first
+//     rule is left out when the policy allows each current interface.
+//     When no interface is allowed, one quick block on each interface
+//     except lo0.
 //   - deny_via: a quick block on the denied interfaces. When no current
 //     interface is denied, no rule.
 //
@@ -26,6 +30,34 @@
 // a policy is set and tested before the next policy sets its own, so the
 // policies combine with AND. No rule is a quick pass and no rule keeps
 // state.
+//
+// The tag alone does not prove that a packet is on an allowed interface.
+// A route rule of another tool (route-to, dup-to, fastroute) sends a
+// packet to a different interface, and pf evaluates it again there with
+// the tag that it got on the first interface (pf_route in XNU pf.c). A
+// rule of another tool can also set the tag of a policy. So the first
+// rule of only_via blocks the packets on each current interface that the
+// policy does not allow, and it does not test the tag. The last rule
+// blocks the untagged packets on an interface that appeared after the
+// last compile. A tagged packet on such an interface passes until the
+// next compile adds the interface to the first rule.
+//
+// No rule blocks lo0. Traffic on lo0 does not leave the host, and
+// ifbound-dns answers on a loopback address, which a destination such as
+// 127.0.0.0/8 or 0.0.0.0/0 can hold.
+//
+// A route rule of another tool that keeps state is out of reach of these
+// rules: pf passes the routed packet on that state and evaluates no rule
+// for it. But the packet passed these rules on its first interface, so a
+// route to an interface that each policy allows cannot leak it. The
+// Backend reads the interface lists of these rules back: the tag anchor
+// rule of only_via lists the allowed interfaces, and the first block rule
+// of only_via and the rule of deny_via list the denied ones. It reports a
+// route rule with state when the rule routes to an interface that a
+// policy does not allow, or when the Backend cannot tell the interface
+// (fastroute). An only_via policy does not allow an interface that is in
+// no list. A change of the form of these rules must keep the Backend able
+// to read the lists.
 //
 // A policy with a scope gets one block rule for its users and one for its
 // groups, with numeric IDs from the account snapshot. pfctl takes no ID
@@ -74,6 +106,9 @@ const (
 	maxTableName    = 31 // PF_TABLE_NAME_SIZE - 1; it also keeps the tag and sub-anchor names short
 	maxTagName      = 63 // PF_TAG_NAME_SIZE - 1
 	maxIfaceName    = 15 // IFNAMSIZ - 1
+	// loopback is the interface that no rule blocks: see the package
+	// documentation.
+	loopback = "lo0"
 	// maxID is the largest uid and gid that pfctl accepts as a number:
 	// it refuses UID_MAX (2^31 - 1) and above, for example nobody (-2).
 	// A larger ID goes into a rule as the range "> maxID".
@@ -156,17 +191,7 @@ func policyRules(p policy.Policy, ifaces []reconcile.Interface, accounts reconci
 		if err != nil {
 			return nil, nil, "", err
 		}
-		match := to
-		if len(allowed) > 0 {
-			tag := quote(tagPrefix + string(p.Name))
-			sub := quote(subAnchorPrefix + string(p.Name))
-			rules = append(rules, "anchor "+sub+" out on "+list(allowed)+to+" tag "+tag)
-			match += " ! tagged " + tag
-		}
-		for _, o := range owners {
-			rules = append(rules, blockOut+match+o)
-		}
-		return rules, allowed, problem, nil
+		return onlyViaRules(p.Name, allowed, ifaces, owners), allowed, problem, nil
 	case policy.DenyVia:
 		sels := c.Selectors()
 		if len(sels) == 0 {
@@ -188,6 +213,34 @@ func policyRules(p policy.Policy, ifaces []reconcile.Interface, accounts reconci
 	default:
 		return nil, nil, "", fmt.Errorf("%w: %T", errConstraint, p.Constraint)
 	}
+}
+
+// onlyViaRules returns the rules of the only_via policy name, which
+// allows the interfaces allowed, with one block rule of each kind for
+// each owner part.
+func onlyViaRules(name policy.Name, allowed []string, ifaces []reconcile.Interface, owners []string) []string {
+	to := " to " + table(name)
+	notLoopback := " on ! " + loopback
+	var rules []string
+	if len(allowed) == 0 {
+		for _, o := range owners {
+			rules = append(rules, blockOut+notLoopback+to+o)
+		}
+		return rules
+	}
+	// pf rejects an empty list, so the rule is left out when the policy
+	// allows each current interface.
+	if denied := others(allowed, ifaces); len(denied) > 0 {
+		for _, o := range owners {
+			rules = append(rules, blockOut+" on "+list(denied)+to+o)
+		}
+	}
+	tag := quote(tagPrefix + string(name))
+	rules = append(rules, "anchor "+quote(subAnchorPrefix+string(name))+" out on "+list(allowed)+to+" tag "+tag)
+	for _, o := range owners {
+		rules = append(rules, blockOut+notLoopback+to+" ! tagged "+tag+o)
+	}
+	return rules
 }
 
 // ownerMatches returns the socket-owner part of each block rule of a
@@ -240,6 +293,22 @@ func resolve(sels []policy.InterfaceSelector, ifaces []reconcile.Interface, inCl
 	}
 	slices.Sort(names)
 	return slices.Compact(names), nil
+}
+
+// others returns the sorted names of the interfaces in ifaces that are
+// not in allowed, except lo0. An uncertain class is not in allowed, so
+// its interface is in the result. A name that pf cannot take is not in
+// the result: the block rule for the packets without the tag still
+// blocks its untagged packets.
+func others(allowed []string, ifaces []reconcile.Interface) []string {
+	var names []string
+	for _, i := range ifaces {
+		if i.Name != loopback && validIface(i.Name) && !slices.Contains(allowed, i.Name) {
+			names = append(names, i.Name)
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
 }
 
 // classTest reports whether a class selector selects an interface.

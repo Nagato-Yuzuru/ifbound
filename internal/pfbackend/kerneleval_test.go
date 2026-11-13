@@ -39,13 +39,20 @@ type modelRule struct {
 	dir       string // "in", "out", or "" for both
 	quick     bool
 	on        []string // nil: each interface
+	notOn     bool     // the rule matches each interface that is not in on
 	to        string   // a table, or "" for each address
 	tagged    string
 	notTagged bool
 	tag       string
-	route     string // "route-to", "reply-to", "dup-to", or ""
-	routeIf   string
+	noState   bool
+	route     string // "route-to", "reply-to", "dup-to", "fastroute", or ""
+	routeIf   string // "" for fastroute: the routing table gives it
 }
+
+// keepsState reports whether pf creates a state when the rule decides a
+// packet. A pass rule keeps state when it does not say "no state"
+// (pf.conf(5)); pf_test_rule creates the state before pf_route runs.
+func (r modelRule) keepsState() bool { return r.action == "pass" && !r.noState }
 
 func parseModelRule(line string) (modelRule, error) {
 	w := &words{f: splitWords(strings.ReplaceAll(line, "return-icmp(port-unr, port-unr)", "return-icmp"))}
@@ -78,6 +85,10 @@ func (r *modelRule) option(w *words) error {
 		r.quick = true
 	case "all", "inet":
 	case "on":
+		if w.peek() == "!" {
+			w.next()
+			r.notOn = true
+		}
 		r.on = w.list()
 	case "from":
 		if src := w.next(); src != "any" {
@@ -96,10 +107,18 @@ func (r *modelRule) option(w *words) error {
 		r.tagged = unquote(w.next())
 	case "tag":
 		r.tag = unquote(w.next())
-	case "label", "flags", "keep", "no":
+	case "label", "flags":
 		w.next()
+	case "round-robin":
+	case "keep", "no":
+		if w.next() != "state" {
+			return fmt.Errorf("cannot evaluate %q", o)
+		}
+		r.noState = o == "no"
 	case "route-to", "reply-to", "dup-to":
 		r.route, r.routeIf = o, w.pool()
+	case "fastroute":
+		r.route = o
 	default:
 		return fmt.Errorf("cannot evaluate %q", o)
 	}
@@ -162,14 +181,22 @@ func (w *words) list() []string {
 	return l
 }
 
-// pool reads the pool of a route option, "(en0 192.0.2.1)" or "en0", and
-// returns its interface.
+// pool reads the pool of a route option, "(en0 192.0.2.1)", "en0", or a
+// list in braces such as "{ (en0 192.0.2.1), (utun4 10.64.0.1) }", and
+// returns the interface of its first member. pf routes the first
+// connection to the first member (round-robin).
 func (w *words) pool() string {
-	first := w.next()
-	for last := first; strings.HasPrefix(first, "(") && !strings.HasSuffix(last, ")") && !w.done(); {
-		last = w.next()
+	braces := w.peek() == "{"
+	if braces {
+		w.next()
 	}
-	return strings.Trim(first, "()")
+	first := w.next()
+	for depth := strings.Count(first, "(") - strings.Count(first, ")"); !w.done() && (depth > 0 || braces); {
+		last := w.next()
+		depth += strings.Count(last, "(") - strings.Count(last, ")")
+		braces = braces && last != "}"
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(first, "("), ",")
 }
 
 func unquote(s string) string { return strings.Trim(s, `"`) }
@@ -177,7 +204,7 @@ func unquote(s string) string { return strings.Trim(s, `"`) }
 // matches reports whether the rule matches the packet.
 func (r modelRule) matches(p packet) bool {
 	return (r.dir == "" || r.dir == p.dir) &&
-		(r.on == nil || slices.Contains(r.on, p.iface)) &&
+		(r.on == nil || slices.Contains(r.on, p.iface) != r.notOn) &&
 		(r.to == "" || r.to == p.dst) &&
 		(r.tagged == "" || (p.tag == r.tagged) != r.notTagged)
 }
@@ -271,19 +298,34 @@ func (k *kernel) call(path string, r modelRule, p *packet, last **modelRule, mat
 
 // send gives an outbound packet to the table dst to pf on the interface
 // iface. It returns each interface that a copy of the packet leaves on.
-// A route-to rule sends the packet out on another interface, and dup-to
-// sends a copy there; pf evaluates the rules again on that interface,
-// and the packet keeps its tag (pf_route). A reply-to rule routes only
-// the packets of the other direction. pf_route counts the routes before
-// it looks at the kind of route or the interface.
+// A route-to rule sends the packet out on another interface, fastroute
+// sends it to the interface of the uplink (the route of the routing table
+// for the destination), and dup-to sends a copy to another interface.
+// pf_route evaluates the packet again on that interface, and the packet
+// keeps its tag. pf_route counts the routes before it looks at the kind
+// of route or the interface. It does not route with reply-to when the
+// packet has the direction of the rule, and with the other kinds when
+// the packet has the other direction.
+//
+// When the rule that decided the packet keeps state, pf_test_rule
+// creates a floating state before pf_route runs. The evaluation on the
+// new interface finds that state (pf_find_state) and passes the packet
+// with the rule of the state, without the rules. The model keeps the
+// state of this one packet only.
 func (k *kernel) send(dst, iface string) ([]string, error) {
 	p := packet{dir: "out", dst: dst, iface: iface}
 	var out []string
+	var state *modelRule
 	for routed := 0; ; routed++ {
-		var last *modelRule
-		var match bool
-		if _, err := k.eval("", &p, &last, &match, 0); err != nil {
-			return nil, err
+		last := state
+		if last == nil {
+			var match bool
+			if _, err := k.eval("", &p, &last, &match, 0); err != nil {
+				return nil, err
+			}
+			if last != nil && last.keepsState() {
+				state = last
+			}
 		}
 		switch {
 		case last != nil && last.action == "block":
@@ -292,12 +334,20 @@ func (k *kernel) send(dst, iface string) ([]string, error) {
 			return append(out, p.iface), nil
 		case routed > maxRoutes:
 			return out, nil
-		case last.route == "reply-to" || last.routeIf == p.iface:
+		}
+		to := last.routeIf
+		if last.route == "fastroute" {
+			to = k.uplink
+		}
+		switch {
+		case last.route != "dup-to" && (last.route == "reply-to") == (last.dir == p.dir):
+			return append(out, p.iface), nil
+		case to == p.iface:
 			return append(out, p.iface), nil
 		case last.route == "dup-to":
 			out = append(out, p.iface)
 		}
-		p.iface = last.routeIf
+		p.iface = to
 	}
 }
 

@@ -340,13 +340,205 @@ func callTarget(from, call string) (path string, wildcard bool) {
 	return strings.TrimSuffix(path, "/"), wildcard
 }
 
-// routes reports whether a rule with the words that ruleWords gives
-// routes packets to an interface: it has a route option (route-to,
-// reply-to, dup-to, fastroute).
-func routes(words []string) bool {
-	return slices.ContainsFunc(words, func(w string) bool {
-		return w == "route-to" || w == "reply-to" || w == "dup-to" || w == "fastroute"
+// routesWithState reports whether a rule with the words that ruleWords
+// gives routes packets to an interface (route-to, dup-to, fastroute) and
+// keeps state: pfctl prints "no state" for a rule without state.
+// reply-to is not in the list: pf routes with it only the packets of the
+// other direction than the rule, and for an outbound packet that is the
+// state of an inbound connection, which passes the packet on each
+// interface also without the route.
+func routesWithState(words []string) bool {
+	routes := slices.ContainsFunc(words, func(w string) bool {
+		return w == "route-to" || w == "dup-to" || w == "fastroute"
 	})
+	for i := 1; routes && i < len(words); i++ {
+		if words[i-1] == "no" && words[i] == "state" {
+			return false
+		}
+	}
+	return routes
+}
+
+// ifaceLists holds the interface lists of the ifbound rules, by table.
+// allowed holds the interfaces of the tag anchor rules of an only_via
+// policy. denied holds the interfaces of the block rules that name them:
+// the first block rule of only_via and the rule of deny_via. problem is
+// not "" when a rule has a form that pfrules does not write.
+type ifaceLists struct {
+	allowed, denied map[string][]string
+	problem         string
+}
+
+// parseIfaceLists reads the rules of the ifbound anchor that pfctl
+// printed. pfctl prints a rule with a list as one rule per item, and it
+// prints names without quotes; the loaded form, with lists in braces and
+// quotes, gives the same result. The block rules without a table (the
+// sentinel and token rules) and the block rules for each interface except
+// one ("on ! lo0") hold no list.
+func parseIfaceLists(rules []string) ifaceLists {
+	l := ifaceLists{allowed: map[string][]string{}, denied: map[string][]string{}}
+	for _, r := range rules {
+		words := ruleWords(r)
+		on, negated := ruleIfaces(words)
+		table := ruleTable(words)
+		switch {
+		case len(words) > 0 && words[0] == "block":
+			if table != "" && on != nil && !negated {
+				l.denied[table] = append(l.denied[table], on...)
+			}
+		case len(words) > 0 && words[0] == "anchor" && slices.Contains(words, "tag"):
+			if table == "" || on == nil || negated {
+				l.problem = fmt.Sprintf("the anchor rule %q has no interface list or no table", r)
+				return l
+			}
+			l.allowed[table] = append(l.allowed[table], on...)
+		default:
+			l.problem = fmt.Sprintf("the rule %q is not a rule that ifbound writes", r)
+			return l
+		}
+	}
+	return l
+}
+
+// ruleIfaces returns the interfaces after "on" in a rule with the words
+// that ruleWords gives, and whether "!" negates them. The result is nil
+// when the rule has no "on".
+func ruleIfaces(words []string) (ifaces []string, negated bool) {
+	i := slices.Index(words, "on")
+	if i < 0 {
+		return nil, false
+	}
+	rest := words[i+1:]
+	if len(rest) > 0 && rest[0] == "!" {
+		negated, rest = true, rest[1:]
+	}
+	if len(rest) == 0 {
+		return nil, negated
+	}
+	if rest[0] != "{" {
+		return []string{strings.Trim(rest[0], `"`)}, negated
+	}
+	for _, w := range rest[1:] {
+		if w == "}" {
+			return ifaces, negated
+		}
+		ifaces = append(ifaces, strings.Trim(w, `"`))
+	}
+	return nil, negated
+}
+
+// ruleTable returns the table after "to" in a rule with the words that
+// ruleWords gives, or "" when the destination is not a table.
+func ruleTable(words []string) string {
+	i := slices.Index(words, "to")
+	if i < 0 || i+1 == len(words) || !strings.HasPrefix(words[i+1], "<") {
+		return ""
+	}
+	return strings.Trim(words[i+1], `<>"`)
+}
+
+// unsafeRoute returns why a route rule with state, with the words that
+// ruleWords gives, can let a protected packet leave on an interface that
+// a policy does not allow, or "" when it cannot.
+//
+// The ifbound rules are quick blocks, and a quick pass before them is a
+// Problem of its own. So a route rule decides only a packet that the
+// ifbound rules passed on its first interface, and a route to an
+// interface that each policy allows cannot leak it. An interface is
+// allowed when it is in the allowed list of each only_via policy with a
+// list, and in no denied list. So an only_via policy with a list does not
+// allow an interface that is in no list: it can be an interface that
+// appeared after the compile. With only deny_via policies, such an
+// interface is not denied, and the ifbound rules pass its packets also
+// without a route. When no policy has a list, unsafeRoute reports no
+// route: an only_via policy without interfaces blocks its packets on each
+// interface except lo0.
+func (l ifaceLists) unsafeRoute(words []string) string {
+	if l.problem != "" {
+		return "Read cannot read the interface lists of the ifbound rules: " + l.problem
+	}
+	if len(l.allowed) == 0 && len(l.denied) == 0 {
+		return ""
+	}
+	targets, ok := routeTargets(words)
+	if !ok {
+		return "Read cannot tell the interface that it routes to"
+	}
+	for _, t := range targets {
+		if !l.safe(t) {
+			return "it routes to " + t + ", which an ifbound policy does not allow"
+		}
+	}
+	return ""
+}
+
+// safe reports whether each policy allows the interface iface.
+func (l ifaceLists) safe(iface string) bool {
+	for _, d := range l.denied {
+		if slices.Contains(d, iface) {
+			return false
+		}
+	}
+	for _, a := range l.allowed {
+		if !slices.Contains(a, iface) {
+			return false
+		}
+	}
+	return true
+}
+
+// routeTargets returns the interfaces of the route-to and dup-to pools of
+// a rule with the words that ruleWords gives. ok is false for fastroute,
+// which takes the interface from the routing table, and for a pool that
+// routeTargets cannot read.
+func routeTargets(words []string) (ifaces []string, ok bool) {
+	for i, w := range words {
+		switch w {
+		case "fastroute":
+			return nil, false
+		case "route-to", "dup-to":
+			pool, ok := poolIfaces(words[i+1:])
+			if !ok {
+				return nil, false
+			}
+			ifaces = append(ifaces, pool...)
+		}
+	}
+	return ifaces, true
+}
+
+// poolIfaces returns the interface of each member of the pool at the
+// start of words, as pfctl prints a pool (print_pool): "en0",
+// "(en0 192.0.2.1)", or a list in braces such as
+// "{ (en0 192.0.2.1), (utun3 10.0.0.1) }". The address of a member can be
+// a table. ok is false when the pool has another form.
+func poolIfaces(words []string) (ifaces []string, ok bool) {
+	braces := len(words) > 0 && words[0] == "{"
+	if braces {
+		words = words[1:]
+	}
+	depth := 0
+	for _, w := range words {
+		switch {
+		case depth > 0:
+		case braces && w == "}":
+			return ifaces, len(ifaces) > 0
+		default:
+			name := strings.TrimSuffix(strings.TrimPrefix(w, "("), ",")
+			if name == "" || strings.ContainsAny(name, `(){}<>,!"`) {
+				return nil, false
+			}
+			ifaces = append(ifaces, name)
+		}
+		depth += strings.Count(w, "(") - strings.Count(w, ")")
+		if depth < 0 {
+			return nil, false
+		}
+		if !braces && depth == 0 {
+			return ifaces, true
+		}
+	}
+	return nil, false
 }
 
 // natPass reports whether a NAT rule that pfctl printed passes the

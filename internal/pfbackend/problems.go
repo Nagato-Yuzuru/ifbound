@@ -29,8 +29,10 @@ const anchorStack = 64
 //   - a filter rule decides packets before the ifbound rules: a rule that
 //     passes packets quick, or a quick anchor rule that calls an anchor
 //     with a pass rule or a wildcard call, or that is a wildcard call;
-//   - a filter rule routes packets to an interface (route-to, reply-to,
-//     dup-to, fastroute), before or after the ifbound anchor;
+//   - a filter rule routes packets to an interface (route-to, dup-to,
+//     fastroute) and keeps state, before or after the ifbound anchor,
+//     and a policy does not allow that interface, or Read cannot tell
+//     the interface (see ifaceLists.unsafeRoute);
 //   - a NAT rule passes the packets that it translates ("nat pass",
 //     "binat pass"), so pf evaluates no filter rule for them;
 //   - "set skip" covers an interface other than a loopback interface, so
@@ -116,11 +118,16 @@ func (b *Backend) ruleProblems(ctx context.Context) ([]reconcile.Problem, error)
 //     call sets that flag from the flag of each anchor below, and pf
 //     keeps the flag of an anchor across packets. So an earlier packet
 //     can end the evaluation, also when no rule matches this packet;
-//   - at each position, a rule that routes packets (route-to, reply-to,
-//     dup-to, fastroute). pf evaluates a routed packet again on the new
-//     interface, and the packet keeps the tag that the ifbound rules gave
-//     it on the first interface (pf.c: pf_route). This also reports a
-//     rule that routes inbound packets only, which is the safe direction.
+//   - at each position, a rule that routes packets (route-to, dup-to,
+//     fastroute) and keeps state, when a policy does not allow an
+//     interface that it routes to. pf creates the state before it routes
+//     the packet, and on the new interface the floating state passes the
+//     packet without the rules (pf.c: pf_test_rule, pf_route,
+//     pf_find_state). Without state, pf evaluates the rules again on the
+//     new interface, and the ifbound rules block the packet there. The
+//     interface lists come from the rules of the ifbound anchor (see
+//     ifaceLists.unsafeRoute). This also reports a rule that routes
+//     inbound packets only, which is the safe direction.
 //
 // The walk reads each anchor one time. It does not go into the ifbound
 // anchor: Read checks its rules through the ruleset ID, and parseRules
@@ -141,6 +148,9 @@ type walk struct {
 	// anchor that the walk reads at the moment can: a call back into it
 	// is a loop, and the safe answer is yes.
 	canPass map[string]bool
+	// lists holds the interface lists of the ifbound rules, or nil until
+	// the walk finds a route rule with state.
+	lists *ifaceLists
 }
 
 // rule checks one rule of the ruleset at path, at the given depth of the
@@ -153,8 +163,17 @@ func (w *walk) rule(ctx context.Context, path, rule string, depth int) (bool, er
 		where = "the anchor " + path
 	}
 	words := ruleWords(rule)
-	if routes(words) {
-		w.ps = append(w.ps, voids(fmt.Sprintf("the rule %q in %s routes packets to an interface; pf evaluates them again there and they keep their tags, so they can go around the ifbound rules", rule, where)))
+	if routesWithState(words) {
+		if w.lists == nil {
+			l, err := w.b.ifaceLists(ctx)
+			if err != nil {
+				return false, err
+			}
+			w.lists = &l
+		}
+		if why := w.lists.unsafeRoute(words); why != "" {
+			w.ps = append(w.ps, voids(fmt.Sprintf("the rule %q in %s routes packets to an interface and keeps state, and %s; pf passes a routed packet on that state and evaluates no ifbound rule for it", rule, where, why)))
+		}
 	}
 	if before && passQuick(words) {
 		w.ps = append(w.ps, voids(fmt.Sprintf("the rule %q in %s comes before the ifbound anchor and passes packets quick", rule, where)))
@@ -249,6 +268,24 @@ func (w *walk) ruleset(ctx context.Context, path string, depth int) (bool, error
 	}
 	w.canPass[path] = canPass
 	return canPass, nil
+}
+
+// ifaceLists reads the interface lists of the rules of the ifbound
+// anchor. A missing anchor holds no rule, so it gives no list.
+func (b *Backend) ifaceLists(ctx context.Context) (ifaceLists, error) {
+	if _, err := b.dev.Rules(pf.Ruleset{Anchor: Anchor}); errors.Is(err, pf.ErrNotFound) {
+		return ifaceLists{}, nil
+	} else if err != nil {
+		return ifaceLists{}, fmt.Errorf("reading the rules of the anchor: %w", err)
+	}
+	out, err := b.pfctl(ctx, nil, "-a", Anchor, "-sr")
+	if err != nil {
+		return ifaceLists{}, err
+	}
+	if complained(out.Stderr) {
+		return ifaceLists{problem: stderrText(out.Stderr)}, nil
+	}
+	return parseIfaceLists(lines(out.Stdout)), nil
 }
 
 // below returns the paths of the anchors directly below the anchor at

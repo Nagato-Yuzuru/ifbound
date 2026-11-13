@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
 	"runtime"
 	"slices"
@@ -287,6 +288,135 @@ func TestPfBackendBlocksOnPhysicalInterface(t *testing.T) {
 	}
 	if got, _ := netip.AddrFromSlice(pkt[ipv4DstOffset : ipv4DstOffset+4]); got != allowed.Addr() {
 		t.Errorf("packet on %s goes to %s, want %s", u.Name, got, allowed.Addr())
+	}
+}
+
+// TestPfBackendRouteRules checks route rules of another tool in an anchor
+// that pf evaluates after the ifbound anchor. The policy allows only one
+// test utun, and the inventory of the compile also holds a second test
+// utun, which the policy denies. The destination is the peer of the
+// allowed utun, so each packet starts on that utun, where the ifbound
+// anchor tags it. Each utun shows the packets that leave through it, so
+// the test sees a packet that a route rule sends to the denied utun.
+func TestPfBackendRouteRules(t *testing.T) {
+	b, _ := newPfBackend(t)
+	u := testnet.NewUTUN(t)
+	denied := testnet.NewUTUN(t)
+	// 198.18.0.0/15 is for benchmark tests (RFC 2544): no real host
+	// answers.
+	u.SetAddr(t, netip.MustParseAddr("198.18.24.1"), netip.MustParseAddr("198.18.24.2"))
+	deniedPeer := netip.MustParseAddr("198.18.25.2")
+	denied.SetAddr(t, netip.MustParseAddr("198.18.25.1"), deniedPeer)
+	dst := netip.MustParseAddrPort("198.18.24.2:9")
+	config := "[[policy]]\nname = \"e2e-route\"\nto = [\"" + dst.Addr().String() + "\"]\nonly_via = [\"" + u.Name + "\"]\n"
+	load(t, b, compilePolicies(t, config,
+		reconcile.Interface{Name: u.Name, Class: policy.ClassTunnel},
+		reconcile.Interface{Name: denied.Name, Class: policy.ClassTunnel}))
+	entry := dst.Addr().String() + "/32"
+	addEntries(t, b, "e2e-route", entry)
+	const other = "com.apple/900.ifbound-e2e"
+	voiding := func(t *testing.T) []reconcile.Problem {
+		t.Helper()
+		return slices.DeleteFunc(readState(t, b).Problems, func(p reconcile.Problem) bool { return !p.Voids })
+	}
+	to := " inet proto udp to " + dst.Addr().String()
+	toDenied := " route-to (" + denied.Name + " " + deniedPeer.String() + ")" + to
+
+	t.Run("route-to the allowed utun, as a VPN client does", func(t *testing.T) {
+		loadAnchor(t, other, "pass out quick route-to ("+u.Name+" "+dst.Addr().String()+")"+to+" no state\n")
+		if ps := voiding(t); len(ps) != 0 {
+			t.Errorf("voiding Problems = %v, want none", ps)
+		}
+		if err := udpExchange(t, dst); !errors.Is(err, errNoAnswer) {
+			t.Fatalf("UDP to %s: %v, want no answer (not blocked)", dst, err)
+		}
+		requireLeftThrough(t, u, dst.Addr())
+	})
+	// The floating state passes the routed packet on the utun without the
+	// rules. The policy allows the utun, so Read reports no Problem.
+	t.Run("route-to the allowed utun with state", func(t *testing.T) {
+		loadAnchor(t, other, "pass out quick route-to ("+u.Name+" "+dst.Addr().String()+")"+to+" keep state\n")
+		if ps := voiding(t); len(ps) != 0 {
+			t.Errorf("voiding Problems = %v, want none", ps)
+		}
+		if err := udpExchange(t, dst); !errors.Is(err, errNoAnswer) {
+			t.Fatalf("UDP to %s: %v, want no answer (not blocked)", dst, err)
+		}
+		requireLeftThrough(t, u, dst.Addr())
+	})
+	// pf_route evaluates the packet again on the denied utun, with the tag
+	// that it got on the allowed utun. The block rule on the denied
+	// interfaces does not test the tag, so it blocks the packet there.
+	// Without the table entry, no ifbound rule applies: the packet leaves
+	// through the denied utun, which shows that the route rule sends it
+	// there.
+	t.Run("route-to the denied utun without state", func(t *testing.T) {
+		loadAnchor(t, other, "pass out"+toDenied+" no state\n")
+		if ps := voiding(t); len(ps) != 0 {
+			t.Errorf("voiding Problems = %v, want none", ps)
+		}
+		if err := b.RemoveEntries(t.Context(), "e2e-route", []netip.Prefix{netip.MustParsePrefix(entry)}); err != nil {
+			t.Fatalf("RemoveEntries: %v", err)
+		}
+		if err := sendUDP(t, dst); err != nil {
+			t.Fatalf("UDP to %s without the table entry: %v", dst, err)
+		}
+		requireLeftThrough(t, denied, dst.Addr())
+
+		addEntries(t, b, "e2e-route", entry)
+		// A block in pf_route can fail the send or not. The packets on the
+		// denied utun decide.
+		if err := sendUDP(t, dst); err != nil {
+			t.Logf("UDP to %s with the table entry: %v", dst, err)
+		}
+		requireNoneLeftThrough(t, denied, dst.Addr())
+	})
+	// pf creates the state before it routes the packet. On the denied utun
+	// the floating state passes the packet without the rules, so the
+	// packet leaves there, and Read reports the rule.
+	t.Run("route-to the denied utun with state", func(t *testing.T) {
+		loadAnchor(t, other, "pass out"+toDenied+" keep state\n")
+		if ps := voiding(t); !slices.ContainsFunc(ps, func(p reconcile.Problem) bool { return strings.Contains(p.Text, "keeps state") }) {
+			t.Errorf("voiding Problems = %v, want one for the route rule with state", ps)
+		}
+		if err := sendUDP(t, dst); err != nil {
+			t.Fatalf("UDP to %s: %v", dst, err)
+		}
+		requireLeftThrough(t, denied, dst.Addr())
+	})
+}
+
+// sendUDP sends one datagram to the address to and does not wait for an
+// answer.
+func sendUDP(t *testing.T, to netip.AddrPort) error {
+	t.Helper()
+	var d net.Dialer
+	conn, err := d.DialContext(t.Context(), "udp4", to.String())
+	if err != nil {
+		t.Fatalf("dial %s: %v", to, err)
+	}
+	defer func() { _ = conn.Close() }() //nolint:errcheck // a UDP close error does not change the result
+	_, err = conn.Write([]byte("ifbound"))
+	return err
+}
+
+// requireNoneLeftThrough reads the packets that leave through u for 2 s,
+// and fails when one goes to dst. A packet that pf blocks causes no
+// event, so only the end of the wait shows that none left.
+func requireNoneLeftThrough(t *testing.T, u *testnet.UTUN, dst netip.Addr) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pkt, err := u.NextPacket(deadline)
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := ipv4Dst(pkt); ok && got == dst {
+			t.Fatalf("a packet to %s left through %s", dst, u.Name)
+		}
 	}
 }
 

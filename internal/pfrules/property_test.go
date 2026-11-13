@@ -24,7 +24,8 @@ import (
 // The pf model follows pf_test_rule and pf_test_fragment: the rules in
 // order; a matching anchor rule sets its tag and does not decide; the
 // first matching quick block decides; with no quick block, the decision
-// of the rules before the ifbound anchor stands. pf finds a socket owner
+// of the rules before the ifbound anchor stands. A rule of another tool
+// before the ifbound anchor can set any tag, also the tag of a policy. pf finds a socket owner
 // for TCP and UDP only, and a range of IDs never matches an unknown
 // owner (pf_match_uid). pf does not tag fragments: a packet with "more
 // fragments" set or a nonzero offset, the first fragment too, gets no tag
@@ -102,7 +103,11 @@ func randomWorld(t testing.TB, r *rand.Rand) world {
 
 // randomInterface returns an interface with a certain class, no class,
 // or one or two possible classes, and the classes that it is built with.
+// lo0 has no class, as the inventory gives it.
 func randomInterface(r *rand.Rand, name string) (reconcile.Interface, ifaceClasses) {
+	if name == "lo0" {
+		return reconcile.Interface{Name: name}, ifaceClasses{}
+	}
 	if r.IntN(3) == 0 {
 		possible := []policy.Class{classPool[r.IntN(len(classPool))], classPool[r.IntN(len(classPool))]}
 		return reconcile.Uncertain(name, possible...), ifaceClasses{possible: possible}
@@ -182,7 +187,8 @@ func randomScope(t testing.TB, r *rand.Rand) policy.Scope {
 // evalRule is one rule of a compiled ruleset, as the pf model reads it.
 type evalRule struct {
 	anchor    bool
-	on        []string // nil: any interface
+	on        []string // nil: each interface except notOn
+	notOn     string
 	table     string
 	tag       string // anchor: the tag that the rule sets
 	notTagged string // block: the rule does not match this tag; "" means no condition
@@ -194,7 +200,7 @@ type evalRule struct {
 var (
 	tableRE  = regexp.MustCompile(`^table <"([^"]+)"> persist$`)
 	anchorRE = regexp.MustCompile(`^anchor "tag\.([^"]+)" out on \{ ((?:"[^"]+" )+)\} to <"([^"]+)"> tag "([^"]+)"$`)
-	blockRE  = regexp.MustCompile(`^block return-icmp\(port-unr, port-unr\) out quick(?: on \{ ((?:"[^"]+" )+)\})? to <"([^"]+)">(?: ! tagged "([^"]+)")?(?: (user|group) \{ ((?:(?:\d+|> \d+) )+)\})?$`)
+	blockRE  = regexp.MustCompile(`^block return-icmp\(port-unr, port-unr\) out quick on (?:\{ ((?:"[^"]+" )+)\}|! (lo0)) to <"([^"]+)">(?: ! tagged "([^"]+)")?(?: (user|group) \{ ((?:(?:\d+|> \d+) )+)\})?$`)
 	quotedRE = regexp.MustCompile(`"([^"]+)"`)
 )
 
@@ -249,8 +255,8 @@ func readRuleset(t testing.TB, text string) ([]string, []evalRule) {
 			continue
 		}
 		if m := blockRE.FindStringSubmatch(line); m != nil {
-			ids, above := idItems(t, m[5])
-			rules = append(rules, evalRule{on: listItems(m[1]), table: m[2], notTagged: m[3], owner: m[4], ids: ids, above: above})
+			ids, above := idItems(t, m[6])
+			rules = append(rules, evalRule{on: listItems(m[1]), notOn: m[2], table: m[3], notTagged: m[4], owner: m[5], ids: ids, above: above})
 			continue
 		}
 		t.Fatalf("line has no known form: %q", line)
@@ -270,9 +276,11 @@ const (
 // inTable. A packet without a socket owner (VM NAT traffic) has owned
 // false. fragment marks any fragment, the first one too. foreign is
 // the decision of the rules before the ifbound anchor: true when another
-// tool's non-quick rule blocks the packet so far.
+// tool's non-quick rule blocks the packet so far. tag is the tag that a
+// rule of another tool set before the ifbound anchor.
 type packet struct {
 	iface    string
+	tag      string
 	inTable  map[string]bool
 	proto    proto
 	fragment bool
@@ -283,9 +291,9 @@ type packet struct {
 
 // pfBlocks is the pf model: it reports whether pf blocks p.
 func pfBlocks(rules []evalRule, p packet) bool {
-	tag := "foreign.tag" // a tag that an earlier rule of another tool set
+	tag := p.tag
 	for _, r := range rules {
-		if !p.inTable[r.table] || r.on != nil && !slices.Contains(r.on, p.iface) {
+		if !p.inTable[r.table] || r.on != nil && !slices.Contains(r.on, p.iface) || p.iface == r.notOn {
 			continue
 		}
 		if r.anchor {
@@ -328,6 +336,12 @@ func pfOwnerMatches(r evalRule, p packet) bool {
 //   - An ID above the pf number limit stands for every ID above it.
 //   - A scope holds only TCP and UDP packets with a socket owner.
 //   - A fragment ignores the scope, and only_via blocks it everywhere.
+//   - only_via never blocks a packet on lo0.
+//
+// The tag that a rule of another tool sets does not change the decision.
+// randomPacket gives such a tag only on an interface of the inventory:
+// on a new interface, the tag of a policy passes its only_via check until
+// the next compile, which is a documented gap.
 func wantBlocks(w world, p packet) bool {
 	if p.foreign {
 		return true
@@ -337,6 +351,9 @@ func wantBlocks(w world, p packet) bool {
 			continue
 		}
 		_, only := pol.Constraint.(policy.OnlyVia)
+		if only && p.iface == "lo0" {
+			continue
+		}
 		var hit bool
 		for _, s := range pol.Constraint.Selectors() {
 			hit = hit || selects(s, p.iface, w.classes, !only)
@@ -427,6 +444,11 @@ func randomPacket(r *rand.Rand, w world) packet {
 			p.inTable[string(pol.Name)] = true
 		}
 	}
+	// pf sets no tag on a fragment.
+	p.tag = "foreign.tag"
+	if _, current := w.classes[p.iface]; current && !p.fragment && len(w.policies) > 0 && r.IntN(3) == 0 {
+		p.tag = tagPrefix + string(w.policies[r.IntN(len(w.policies))].Name)
+	}
 	return p
 }
 
@@ -442,12 +464,30 @@ func TestCompileProperties(t *testing.T) {
 		checkDeterministic(t, seed, r, w, rs)
 		tables, rules := readRuleset(t, text)
 		checkStructure(t, seed, w, rs, tables, rules)
+		checkLoopback(t, seed, rules)
 		checkSelected(t, seed, w, rs)
 		for range 300 {
 			p := randomPacket(r, w)
 			if got, want := pfBlocks(rules, p), wantBlocks(w, p); got != want {
 				t.Fatalf("seed %d: packet %+v: blocked = %v, want %v\nruleset:\n%s", seed, p, got, want, text)
 			}
+		}
+	}
+}
+
+// checkLoopback checks that no block rule can match a packet on lo0:
+// each block rule lists its interfaces without lo0, or excludes lo0.
+// Traffic on lo0 does not leave the host, and ifbound-dns answers on a
+// loopback address. The selector pool selects lo0 for no deny_via, as no
+// real configuration does.
+func checkLoopback(t *testing.T, seed int, rules []evalRule) {
+	t.Helper()
+	for i, r := range rules {
+		if r.anchor {
+			continue
+		}
+		if r.on == nil && r.notOn != "lo0" || slices.Contains(r.on, "lo0") {
+			t.Fatalf("seed %d: block rule %d of table %q can match lo0: on %v, not on %q", seed, i, r.table, r.on, r.notOn)
 		}
 	}
 }

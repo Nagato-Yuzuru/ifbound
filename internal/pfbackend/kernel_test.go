@@ -62,6 +62,9 @@ type kernel struct {
 	states []netip.Addr
 	// ifaces are the lines of "pfctl -sI -v".
 	ifaces []string
+	// uplink is the interface of the route that the routing table gives
+	// for each destination, where fastroute sends a packet.
+	uplink string
 
 	// fail makes a call fail when it returns true.
 	fail func(args []string) bool
@@ -93,6 +96,7 @@ func newKernel() *kernel {
 		now:         time.Now,
 		pid:         4242,
 		ifaces:      []string{"ALL", "en0", "lo0", "utun4"},
+		uplink:      "en0",
 	}
 }
 
@@ -574,6 +578,10 @@ func (k *kernel) flushCmd(p pfctlArgs) (pfbackend.Output, error) {
 func (k *kernel) showCmd(p pfctlArgs) (pfbackend.Output, error) {
 	switch p.show {
 	case "r", "rules":
+		// pf_find_ruleset finds no ruleset, and DIOCGETRULES fails.
+		if p.anchor != "" && !k.exists(p.anchor) {
+			return failure("DIOCGETRULES: Invalid argument")
+		}
 		return stdout(joinLines(k.printed(p.anchor))), nil
 	case "n", "nat":
 		if p.anchor == "" {

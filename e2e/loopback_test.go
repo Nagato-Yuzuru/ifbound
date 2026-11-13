@@ -3,11 +3,9 @@
 package e2e
 
 import (
-	"errors"
 	"net"
 	"net/netip"
 	"slices"
-	"syscall"
 	"testing"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
@@ -17,8 +15,8 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
 )
 
-// loPolicy blocks lo.example on every interface. It has no interface
-// in its block rule, as each unscoped only_via policy.
+// loPolicy allows no interface, so it blocks lo.example on every
+// interface except lo0.
 const loPolicy = "[[policy]]\nname = \"e2e-lo\"\nto = [\"lo.example\"]\nonly_via = []\n"
 
 // fixedBook gives the same learned addresses to every policy.
@@ -54,13 +52,13 @@ func startUDPEcho(t *testing.T) netip.AddrPort {
 	return netip.MustParseAddrPort(pc.LocalAddr().String())
 }
 
-// TestLoopbackAnswerDoesNotBlockLocalService checks that a protected
-// answer with a loopback or unspecified address does not reach the pf
-// table of an unscoped only_via policy. Its block rule has no interface,
-// so a loopback entry blocks lo0 too: mDNSResponder then cannot reach
-// ifbound-dns on 127.0.0.1, and no protected name resolves. The test
-// first puts 127.0.0.1 in the table, as an earlier ifboundd did, to show
-// that the block reaches the echo service on lo0.
+// TestLoopbackAnswerDoesNotBlockLocalService checks the two guards that
+// keep a loopback answer from blocking a local service: no rule blocks
+// lo0, and a loopback or unspecified address does not reach the pf
+// table. Without them, mDNSResponder cannot reach ifbound-dns on
+// 127.0.0.1, and no protected name resolves. The test first puts
+// 127.0.0.1 in the table, as an earlier ifboundd did, to show that the
+// rules pass lo0 also with that entry.
 func TestLoopbackAnswerDoesNotBlockLocalService(t *testing.T) {
 	b, _ := newPfBackend(t)
 	echo := startUDPEcho(t)
@@ -76,19 +74,9 @@ func TestLoopbackAnswerDoesNotBlockLocalService(t *testing.T) {
 	}
 
 	load(t, b, compilePolicies(t, loPolicy))
-	// The answer shows that the echo works and that the rule with an
-	// empty table passes lo0. Thus no answer below comes from the entry.
-	if err := udpExchange(t, echo); err != nil {
-		t.Fatalf("UDP to %s with an empty table: %v, want an answer", echo, err)
-	}
 	addEntries(t, b, "e2e-lo", "127.0.0.1/32")
-	// A blocked exchange gets no answer. On the macOS runners the ICMP
-	// reject from pf on lo0 does not get to the client socket, so the
-	// block shows as the end of the 2 s wait in udpExchange: the kernel
-	// drops the packet and gives no event for the drop. Where the reject
-	// does arrive, ECONNREFUSED shows the same block.
-	if err := udpExchange(t, echo); !errors.Is(err, errNoAnswer) && !errors.Is(err, syscall.ECONNREFUSED) {
-		t.Fatalf("UDP to %s with 127.0.0.1 in the table: %v, want no answer or ECONNREFUSED (does pf skip lo0?)", echo, err)
+	if err := udpExchange(t, echo); err != nil {
+		t.Fatalf("UDP to %s with 127.0.0.1 in the table: %v, want an answer (does a rule block lo0?)", echo, err)
 	}
 
 	local := []netip.Addr{
