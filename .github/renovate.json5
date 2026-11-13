@@ -36,6 +36,15 @@
       enabled: true,
     },
     {
+      // A major version of a Go module has its own module path, and only
+      // the module that imports it can move to the new path. An update of
+      // an indirect module to a new major version gives an empty diff.
+      matchManagers: ["gomod"],
+      matchDepTypes: ["indirect"],
+      matchUpdateTypes: ["major"],
+      enabled: false,
+    },
+    {
       // The DNS plugin depends on the behavior of these modules. A person
       // reviews each update. They have their own group, so that the weekly
       // group can merge without a review.
