@@ -205,12 +205,39 @@ func ttlProblems(reply *dns.Msg, ref chainRef) []string {
 			problems = append(problems, fmt.Sprintf("TTL of %s with a synthetic name above %d", rr, maxSynthTTL))
 		}
 	}
+	problems = append(problems, rrsetTTLProblems(reply)...)
 	if len(reply.Answer) > 0 || ref.links == 0 {
 		return problems
 	}
 	for _, rr := range reply.Ns {
 		if soa, ok := rr.(*dns.SOA); ok && (soa.Hdr.Ttl > ref.linkTTL || soa.Minttl > ref.linkTTL) {
 			problems = append(problems, fmt.Sprintf("negative TTL of %s above the chain TTL %d", soa, ref.linkTTL))
+		}
+	}
+	return problems
+}
+
+// rrsetTTLProblems checks that all records of one RRset, in every section
+// of reply, have one TTL (RFC 2181 section 5.2). The OPT record is no
+// RRset member: its TTL field holds flags.
+func rrsetTTLProblems(reply *dns.Msg) []string {
+	type setKey struct {
+		owner      string
+		class, typ uint16
+	}
+	var problems []string
+	for _, section := range [][]dns.RR{reply.Answer, reply.Ns, reply.Extra} {
+		seen := map[setKey]uint32{}
+		for _, rr := range section {
+			h := rr.Header()
+			if h.Rrtype == dns.TypeOPT {
+				continue
+			}
+			k := setKey{dns.CanonicalName(h.Name), h.Class, h.Rrtype}
+			if ttl, ok := seen[k]; ok && ttl != h.Ttl {
+				problems = append(problems, fmt.Sprintf("RRset of %s has TTLs %d and %d", rr, ttl, h.Ttl))
+			}
+			seen[k] = h.Ttl
 		}
 	}
 	return problems

@@ -237,7 +237,7 @@ func TestFlattenProtectedReply(t *testing.T) {
 			answer: []string{"www.example.com. 300 IN HTTPS 1 www.example.com. alpn=h2"},
 		},
 		{
-			name:  "ServiceMode outside target becomes a synthetic name with all parameters and a TTL of at most 300",
+			name:  "ServiceMode outside target becomes a synthetic name with all parameters and a TTL of at most 300 for the whole RRset",
 			qname: "www.example.com.", qtype: dns.TypeHTTPS,
 			zone: map[string]zoneReply{zkey("www.example.com.", dns.TypeHTTPS): {answer: []string{
 				"www.example.com. 3600 IN HTTPS 1 svc.cdn.net. alpn=h2 port=8443 ipv6hint=2001:db8::5",
@@ -246,8 +246,8 @@ func TestFlattenProtectedReply(t *testing.T) {
 			check: func(t *testing.T, m *dns.Msg) {
 				t.Helper()
 				requireSynthetic(t, m, "www.example.com.", "svc.cdn.net.", 1, "alpn=h2 port=8443 ipv6hint=2001:db8::5")
-				if len(m.Answer) != 2 || m.Answer[0].Header().Ttl != maxSynthTTL || m.Answer[1].Header().Ttl != 3600 {
-					t.Errorf("answer %v, want TTL 300 for the synthetic name and 3600 for the other record", m.Answer)
+				if len(m.Answer) != 2 || m.Answer[0].Header().Ttl != maxSynthTTL || m.Answer[1].Header().Ttl != maxSynthTTL {
+					t.Errorf("answer %v, want TTL 300 for both records of the RRset", m.Answer)
 				}
 			},
 			addrs: []string{"2001:db8::5"},
