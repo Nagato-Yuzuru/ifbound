@@ -156,6 +156,8 @@ func merge(m, sub *dns.Msg) *dns.Msg {
 //   - The additional section keeps only the OPT record.
 //   - Each record that has a synthetic name, as owner or as TargetName,
 //     has a TTL of at most maxSynthTTL.
+//   - Every RRset in the reply has one TTL: the smallest of its records
+//     after all caps (RFC 2181 section 5.2).
 //   - When the reply changes, the AD bit is cleared: the plugin removes
 //     the signatures and changes owners, so nothing in the new reply was
 //     validated.
@@ -205,10 +207,44 @@ func flatten(k *tagKey, owner, start string, qtype uint16, m *dns.Msg) (*dns.Msg
 			out.Extra = append(out.Extra, dns.Copy(rr))
 		}
 	}
+	for _, section := range [][]dns.RR{out.Answer, out.Ns, out.Extra} {
+		uniformTTL(section)
+	}
 	if !sameOnWire(m, out) {
 		out.AuthenticatedData = false
 	}
 	return out, nil
+}
+
+// uniformTTL gives all records of one RRset in rrs the smallest TTL of the
+// set (RFC 2181 section 5.2). An RRset is the records with the same owner,
+// class, and type. The OPT record is not an RRset: its TTL field holds flags.
+// flatten runs this last, so the TTL is the minimum after all caps.
+func uniformTTL(rrs []dns.RR) {
+	type setKey struct {
+		owner string
+		class uint16
+		typ   uint16
+	}
+	key := func(h *dns.RR_Header) setKey {
+		return setKey{dns.CanonicalName(h.Name), h.Class, h.Rrtype}
+	}
+	least := map[setKey]uint32{}
+	for _, rr := range rrs {
+		h := rr.Header()
+		if h.Rrtype == dns.TypeOPT {
+			continue
+		}
+		k := key(h)
+		if cur, ok := least[k]; !ok || h.Ttl < cur {
+			least[k] = h.Ttl
+		}
+	}
+	for _, rr := range rrs {
+		if h := rr.Header(); h.Rrtype != dns.TypeOPT {
+			h.Ttl = least[key(h)]
+		}
+	}
 }
 
 // retarget changes the TargetName of an HTTPS or SVCB record r that moved
