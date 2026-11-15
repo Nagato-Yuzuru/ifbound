@@ -14,11 +14,12 @@ import (
 // drive gives ev to core.Step and runs the effects that it returns, in
 // their order. A sync effect runs on the loop, and runSync gives its
 // result to drive at once, before the next effect runs. So a sync chain
-// ends before drive returns: reconcile reads the host values right after
-// its drive. A Converge does not run a pass here: runSync records it, and
-// Run starts the pass after the current request or event. So a pass
-// never runs inside another pass, and the place of Converge in the list
-// does not change what the pass sees.
+// ends before drive returns: a pass reads the host values and the book
+// state right after its drive. A Converge does not run a pass here:
+// runSync records it, and Run starts the pass after the current request
+// or event. So a pass never runs inside another pass, and the place of
+// Converge in the list does not change what the pass sees. After each
+// Step, the gate is the one of the new state.
 //
 // Each case gives the effect to the function of its sub sum, so the
 // compiler checks the sub sum of each effect. gochecksumtype does not
@@ -26,6 +27,7 @@ import (
 func (l *loop) drive(ctx context.Context, ev core.Event) {
 	var effects []core.Effect
 	l.core, effects = core.Step(l.core, ev)
+	l.gate = core.GateOf(l.core)
 	for _, e := range effects {
 		switch e := e.(type) {
 		case core.Converge:
@@ -33,6 +35,14 @@ func (l *loop) drive(ctx context.Context, ev core.Event) {
 		case core.ReadHosts:
 			l.runSync(ctx, e)
 		case core.ReadKernelHosts:
+			l.runSync(ctx, e)
+		case core.OpenBook:
+			l.runSync(ctx, e)
+		case core.AdoptBook:
+			l.runSync(ctx, e)
+		case core.ExpireBook:
+			l.runSync(ctx, e)
+		case core.PruneBook:
 			l.runSync(ctx, e)
 		case core.ReadAccounts:
 			l.runAsync(ctx, e)
@@ -61,6 +71,14 @@ func (l *loop) runSync(ctx context.Context, e core.SyncEffect) {
 		res = l.readHosts(ctx, e)
 	case core.ReadKernelHosts:
 		res = l.readKernelHosts(ctx, e)
+	case core.OpenBook:
+		res = l.openBookNow(ctx, e)
+	case core.AdoptBook:
+		res = l.adoptBook(ctx, e)
+	case core.ExpireBook:
+		res = l.expireBook(ctx, e)
+	case core.PruneBook:
+		res = l.pruneBook(ctx, e)
 	default:
 		panic(fmt.Sprintf("daemon: unknown sync effect %T", e))
 	}

@@ -24,10 +24,6 @@ type HostFile struct {
 	Hosts hostsfile.Hosts
 }
 
-// HostsWanted asks for a read of the host file. Each convergence asks
-// for it first: adoption and the tables must know the host addresses.
-type HostsWanted struct{ At time.Time }
-
 // HostsRead is the result of the host file read ID. Err is the error of
 // Version or of Read: the reader cannot tell the content of the file. A
 // file that exists and cannot be read keeps the last good content: other
@@ -56,9 +52,8 @@ type KernelRead struct {
 	Err   error
 }
 
-func (e HostsWanted) at() time.Time { return e.At }
-func (e HostsRead) at() time.Time   { return e.At }
-func (e KernelRead) at() time.Time  { return e.At }
+func (e HostsRead) at() time.Time  { return e.At }
+func (e KernelRead) at() time.Time { return e.At }
 
 // ReadHosts starts the read ID of the host file. Its result is a
 // HostsRead with the same ID. When Known is true, Last is the version of
@@ -108,10 +103,10 @@ func (s State) KernelHosts() map[policy.Name][]blockable.Addr {
 	return last.Value
 }
 
-// HostsProblem returns the Problem of a failed host file read, if there
+// hostsProblem returns the Problem of a failed host file read, if there
 // is one. It does not void enforcement: the tables keep the host
 // addresses that they have.
-func HostsProblem(s State) (reconcile.Problem, bool) {
+func hostsProblem(s State) (reconcile.Problem, bool) {
 	f, failing := s.hosts.Failing()
 	if !failing {
 		return reconcile.Problem{}, false

@@ -3,13 +3,9 @@ package daemon
 import (
 	"context"
 	"log/slog"
-	"slices"
-	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
-	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
-	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
 // AccountReadTimeout is the budget of one account read. A lookup in the
@@ -27,17 +23,6 @@ const AccountReadTimeout = core.AccountReadTimeout
 type AccountReader interface {
 	LookupUser(name string) (uid uint32, found bool, err error)
 	LookupGroup(name string) (gid uint32, found bool, err error)
-}
-
-// wantAccounts asks core for a read of the accounts that the scopes of
-// the configuration name. Without a reader it does nothing, and the
-// snapshot stays zero.
-func (l *loop) wantAccounts(ctx context.Context) {
-	if l.accountReader == nil {
-		return
-	}
-	users, groups := scopeNames(l.policies())
-	l.drive(ctx, core.AccountsWanted{At: time.Now(), Users: users, Groups: groups})
 }
 
 // readAccounts runs the read of e on its own goroutine. core starts at
@@ -85,33 +70,4 @@ func (l *loop) logLookupsFailed(ctx context.Context, e core.AccountLookupsFailed
 		attrs = append(attrs, slog.Any(logattr.AccountGroups, e.Groups))
 	}
 	l.log.LogAttrs(ctx, slog.LevelWarn, "account lookups failed", attrs...)
-}
-
-// accountsProblem returns the Problem of the account snapshot, if there
-// is one. It does not void enforcement: a scope that the snapshot cannot
-// resolve is dropped, and the policy then applies to all traffic.
-func (l *loop) accountsProblem(policies []policy.Policy) (reconcile.Problem, bool) {
-	if users, groups := scopeNames(policies); len(users) == 0 && len(groups) == 0 {
-		return reconcile.Problem{}, false
-	}
-	if l.accountReader == nil {
-		return reconcile.Problem{Text: "there is no account reader, so each scoped policy applies to all traffic"}, true
-	}
-	return core.AccountsProblem(l.core)
-}
-
-// scopeNames returns the user names and the group names that the scopes
-// of the policies list, each sorted and without duplicates.
-func scopeNames(policies []policy.Policy) (users, groups []string) {
-	for _, p := range policies {
-		for _, u := range p.Scope.Users() {
-			users = append(users, u.String())
-		}
-		for _, g := range p.Scope.Groups() {
-			groups = append(groups, g.String())
-		}
-	}
-	slices.Sort(users)
-	slices.Sort(groups)
-	return slices.Compact(users), slices.Compact(groups)
 }

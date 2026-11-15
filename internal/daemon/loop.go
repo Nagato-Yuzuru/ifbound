@@ -1,7 +1,6 @@
 package daemon
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -24,30 +23,8 @@ import (
 // configuration.
 var errNoConfig = errors.New("daemon: no configuration")
 
-// reasonNotLoaded is the reason of StateStarting before the first open of
-// the address book.
-const reasonNotLoaded = "the address book is not loaded yet"
-
 // storeFunc stores a configuration as configstore.Store does.
 type storeFunc func(path string, data []byte, gid int) (policy.Config, configstore.Digest, error)
-
-// selfTest is the state of the self-test for one configuration.
-type selfTest uint8
-
-const (
-	// selfTestNone: the configuration lists no name, so no query goes
-	// to ifbound-dns, and there is nothing to test.
-	selfTestNone selfTest = iota
-	// selfTestNotRun: no warm-up pass under the configuration has ended,
-	// and no probe reached ifbound-dns.
-	selfTestNotRun
-	// selfTestFailed: a warm-up pass ended, and no probe reached
-	// ifbound-dns.
-	selfTestFailed
-	// selfTestPassed: a probe reached ifbound-dns under the
-	// configuration.
-	selfTestPassed
-)
 
 // loop is the state that only the Run goroutine touches.
 type loop struct {
@@ -57,7 +34,10 @@ type loop struct {
 	addrStore string
 	snapshot  string
 	openBook  openBookFunc
-	// facts are the latest facts of the book of runningMode.
+	// book is the open address book. It is not nil exactly while core
+	// is core.BookAdopting or core.BookLoaded. facts are the latest facts
+	// that it sent.
+	book     addrBook
 	facts    addrstore.BookFacts
 	store    string // the path of the stored configuration
 	storeGID int
@@ -66,15 +46,13 @@ type loop struct {
 	// pub receives the status that Daemon.Status returns.
 	pub *atomic.Pointer[Status]
 
-	// mode is the lifecycle of the daemon.
-	mode mode
-
-	// selfTest is the self-test of the active configuration. A new
-	// configuration resets it.
-	selfTest selfTest
-
 	// core is the state that core.Step decides on. Only drive changes it.
 	core core.State
+	// gate is core.GateOf(core) after the last Step.
+	gate core.Gate
+	// logged is the phase of the last state changed event, or of the
+	// start.
+	logged core.Phase
 	// hostsReader reads the host file. mapped is the last mapping of a
 	// good read of it.
 	hostsReader HostsReader
@@ -88,10 +66,9 @@ type loop struct {
 	accountResults chan core.AccountsRead
 
 	// pending is the trigger of the convergence that Run starts after the
-	// current request or event, or "" when there is none. A report sets it
-	// when it finds a loaded ruleset that is not the installed one, and a
-	// Converge effect of core sets it. A second trigger before the pass
-	// does not replace the first. Each pass clears it (see reconcile).
+	// current request or event, or "" when there is none. A Converge
+	// effect of core sets it. A second trigger before the pass does not
+	// replace the first. Each pass clears it (see converge).
 	pending string
 	// failed is the error.type and the error text of the last
 	// convergence, or "" when it succeeded. A failure that repeats is
@@ -100,7 +77,8 @@ type loop struct {
 }
 
 func newLoop(c Config, store storeFunc, openBook openBookFunc, pub *atomic.Pointer[Status]) *loop {
-	l := &loop{
+	s := core.New(time.Now(), c.Accounts != nil)
+	return &loop{
 		rec:       c.Platform,
 		addrStore: c.AddrStore,
 		snapshot:  c.Snapshot,
@@ -110,19 +88,40 @@ func newLoop(c Config, store storeFunc, openBook openBookFunc, pub *atomic.Point
 		storeFn:   store,
 		log:       c.Logger,
 		pub:       pub,
-		mode:      unconfiguredMode{phase: startingPhase(reasonNotLoaded)},
+		core:      s,
+		gate:      core.GateOf(s),
+		logged:    core.PhaseOf(s),
 
 		hostsReader:    c.Hosts,
 		accountReader:  c.Accounts,
 		accountResults: make(chan core.AccountsRead, 1),
 	}
-	return l
 }
 
-// publish makes the current status the one that Daemon.Status returns.
-func (l *loop) publish() {
-	st := l.status()
+// publish makes the current status the one that Daemon.Status returns,
+// and logs a change of the phase.
+func (l *loop) publish(ctx context.Context) {
+	l.notePhase(ctx)
+	st := statusOf(l.core)
 	l.pub.Store(&st)
+}
+
+// notePhase logs a change of the phase since the last call. The loop
+// calls it where a step of the daemon ends: at the end of each pass, and
+// at each publish. A phase between them is not logged.
+func (l *loop) notePhase(ctx context.Context) {
+	p := core.PhaseOf(l.core)
+	old := l.logged
+	if p.Lifecycle == old.Lifecycle && p.Installed == old.Installed && slices.Equal(p.Reasons, old.Reasons) {
+		return
+	}
+	l.logged = p
+	level := slog.LevelWarn
+	if p.Lifecycle == StateReady {
+		level = slog.LevelInfo
+	}
+	l.log.LogAttrs(ctx, level, "state changed",
+		slog.String(logattr.EnforcementState, p.Lifecycle.String()), slog.Any(logattr.EnforcementReasons, p.Reasons))
 }
 
 // loadStored loads the stored configuration at start. A configuration
@@ -132,198 +131,86 @@ func (l *loop) publish() {
 // changes the stored file.
 func (l *loop) loadStored(ctx context.Context) {
 	cfg, digest, err := configstore.Load(l.store)
-	if err != nil {
-		l.setPhase(ctx, unconfiguredPhase("the stored configuration did not load: "+err.Error()))
-		return
-	}
-	l.setConfig(cfg, digest)
+	l.drive(ctx, core.ConfigRead{At: time.Now(), Config: cfg, Digest: digest, Err: err})
 }
 
-// setConfig makes cfg the active configuration. digest is the digest of
-// its stored file, or zero when it is not stored. The phase does not
-// change. A daemon without a configuration goes to loadingMode. The
-// first configuration fixes the retain. A runningMode keeps its book: the
-// book keeps the entries of removed policies until reconcile prunes them.
-func (l *loop) setConfig(cfg policy.Config, digest configstore.Digest) {
-	switch m := l.mode.(type) {
-	case unconfiguredMode:
-		l.mode = loadingMode{conf: newActiveConfig(cfg, digest, 1), retain: cfg.AddrBook.Retain, phase: m.phase}
-	case loadingMode:
-		l.mode = loadingMode{conf: newActiveConfig(cfg, digest, m.conf.gen+1), retain: m.retain, phase: m.phase}
-	case runningMode:
-		l.mode = runningMode{conf: newActiveConfig(cfg, digest, m.conf.gen+1), retain: m.retain, book: m.book, phase: m.phase}
-	default:
-		panic(fmt.Sprintf("daemon: setConfig in unknown mode %T", l.mode))
-	}
-	l.selfTest = selfTestNone
-	if len(warmUpNames(cfg)) > 0 {
-		l.selfTest = selfTestNotRun
-	}
+// active returns the active configuration. It reports false when the
+// daemon has no configuration.
+func (l *loop) active() (core.Active, bool) {
+	c, ok := l.core.Config().(core.Configured)
+	return c.Active, ok
 }
 
 // policies returns the policies of the active configuration. It
 // returns nil when the daemon has no configuration.
 func (l *loop) policies() []policy.Policy {
-	switch m := l.mode.(type) {
-	case unconfiguredMode:
-		return nil
-	case loadingMode:
-		return m.conf.cfg.Policies
-	case runningMode:
-		return m.conf.cfg.Policies
-	default:
-		return nil
-	}
+	a, _ := l.active()
+	return a.Config.Policies
 }
 
-// activeDigest returns the digest of the active configuration. It
-// returns false when the daemon has no configuration.
-func (l *loop) activeDigest() (configstore.Digest, bool) {
-	switch m := l.mode.(type) {
-	case unconfiguredMode:
-		return configstore.Digest{}, false
-	case loadingMode:
-		return m.conf.digest, true
-	case runningMode:
-		return m.conf.digest, true
-	default:
-		return configstore.Digest{}, false
-	}
-}
-
-func policyNames(cfg policy.Config) []policy.Name {
-	names := make([]policy.Name, len(cfg.Policies))
-	for i, p := range cfg.Policies {
-		names[i] = p.Name
-	}
-	return names
-}
-
-// reconcile is the one path to the desired state. While the address
-// book does not open, it converges add-only (see
+// converge is the one path to the desired state. While the address book
+// is not loaded, the convergence is add-only (see
 // reconcile.Inputs.AddOnly) with no learned address: the ruleset, the IP
 // and CIDR destinations, and the host addresses need no book, but a
-// removal would unblock every learned address. The phase then stays
-// StateStarting with the open error as the first reason, so no report is
-// acknowledged. The first pass that opens the book is a normal
-// convergence.
+// removal would unblock every learned address. Without a configuration,
+// it does nothing.
 //
-// The host file comes first: adoption must know which kernel entries are
-// host addresses. Without a configuration, it does nothing.
+// The PassStarted drive reads the host file and loads the book first:
+// adoption must know which kernel entries are host addresses.
 //
 // A pass covers each pending convergence: it converges the whole desired
 // state from the inputs that it reads, and the trigger only names the
 // cause in the log. A Converge of core is pending only when its change is
-// in core, and a pending ruleset_changed is in the loaded ruleset that
-// the pass reads. The drive of the host file is the last change to core
-// in the pass, so the pass clears the pending trigger after it.
+// in core, and the PassStarted drive is the last change to core before
+// Converge, so the pass clears the pending trigger after it.
 //
 // Each pass that it starts writes one convergence event (see
 // logConverge), and one more event when it ended pf states.
-func (l *loop) reconcile(ctx context.Context, trigger string) error {
-	var (
-		conf   activeConfig
-		retain time.Duration
-		book   addrBook
-		// src is the source of the learned addresses for Converge: book,
-		// or no address while the book does not open.
-		src   reconcile.AddrSource
-		hosts map[policy.Name][]blockable.Addr
-		// loadErr is the error of the book open in loadingMode.
-		loadErr error
-	)
-	began := time.Now()
-	switch l.mode.(type) {
-	case unconfiguredMode:
-	case loadingMode, runningMode:
-		// The time of the event can make the account read overdue. Step
-		// then asks for a convergence, and this pass covers it.
-		l.drive(ctx, core.HostsWanted{At: began})
+func (l *loop) converge(ctx context.Context, trigger string) error {
+	if _, ok := l.core.Config().(core.Configured); !ok {
+		l.pending = ""
+		return errNoConfig
 	}
+	began := time.Now()
+	l.drive(ctx, core.PassStarted{At: began})
 	l.pending = ""
-	switch m := l.mode.(type) {
-	case unconfiguredMode:
-		return errNoConfig
-	case loadingMode:
-		conf, retain = m.conf, m.retain
-		hosts = l.hostAddrs(ctx, conf)
-		book, loadErr = l.loadBook(ctx, conf, retain)
-		src = book
-		if loadErr != nil {
-			src = emptyBook{}
-		}
-	case runningMode:
-		conf, retain, book = m.conf, m.retain, m.book
-		src = book
-		hosts = l.hostAddrs(ctx, conf)
-	default:
-		return errNoConfig
+	// A drive never takes the configuration away. The book state is the
+	// one of the pass. Only a loaded book is a source: before its
+	// adoption and its first expire, the book can hold entries that
+	// expired while the daemon was down.
+	c, _ := l.core.Config().(core.Configured)
+	var src reconcile.AddrSource = emptyBook{}
+	_, loaded := c.Book.(core.BookLoaded)
+	if loaded {
+		src = l.book
 	}
 	rep, err := l.rec.Converge(ctx, reconcile.Inputs{
-		Policies: conf.cfg.Policies,
+		Policies: c.Active.Config.Policies,
 		Book:     src,
-		Hosts:    hosts,
-		Apexes:   conf.apexes,
-		Listen:   conf.cfg.DNS.Listen,
+		Hosts:    l.hostAddrs(ctx, c.Active),
+		Apexes:   c.Active.Apexes,
+		Listen:   c.Active.Config.DNS.Listen,
 		Accounts: l.core.AccountIDs(),
-		AddOnly:  loadErr != nil,
+		AddOnly:  !loaded,
 	})
-	if rep.Installed != "" && loadErr == nil {
-		// No loaded rule refers to a removed policy now, and its table is
-		// gone. Until this point a revert of the configuration must still
-		// find its addresses. A failed delete keeps them on disk only;
-		// the next Prune after a start removes them again.
-		_, _ = book.Apply(ctx, addrstore.Prune{Keep: policyNames(conf.cfg)}) //nolint:errcheck // see above
-	}
+	l.drive(ctx, core.Converged{At: time.Now(), Report: rep, Err: err})
 	l.logStatesEnded(ctx, logattr.StatesCauseNarrowed, rep.Narrowed)
-	if p, ok := core.HostsProblem(l.core); ok {
-		rep.Problems = append(rep.Problems, p)
-	}
-	if p, ok := l.accountsProblem(conf.cfg.Policies); ok {
-		rep.Problems = append(rep.Problems, p)
-	}
-	if loadErr == nil {
-		if p, ok := bookProblem(book); ok {
-			rep.Problems = append(rep.Problems, p)
+	l.notePhase(ctx)
+	errType := logattr.ErrorTypePlatform
+	if bookErr := bookError(c.Book); bookErr != nil {
+		if err == nil {
+			errType = logattr.ErrorTypeSnapshot
 		}
+		err = errors.Join(bookErr, err)
 	}
-	if conf.upstream != nil {
-		// Only the stored file at start can fail the check: Apply refuses
-		// such a configuration. The check protects only DNS, so the
-		// daemon enforces the file.
-		rep.Problems = append(rep.Problems, reconcile.Problem{Text: "the configuration fails the upstream check: " + conf.upstream.Error()})
-	}
-	if loadErr != nil {
-		// Without the book, the daemon cannot record an address, so the
-		// phase acknowledges nothing, also when the ruleset is installed.
-		rep.Problems = slices.Insert(rep.Problems, 0, reconcile.Problem{Text: loadErr.Error()})
-		l.setPhase(ctx, waitPhase{state: StateStarting, reasons: convergedPhase(rep, err).reasons})
-		errType := logattr.ErrorTypeSnapshot
-		if err != nil {
-			errType = logattr.ErrorTypePlatform
-		}
-		err = errors.Join(loadErr, err)
-		l.logConverge(ctx, trigger, time.Since(began), rep, errType, err)
-		return err
-	}
-	p := convergedPhase(rep, err)
-	if st, ok := l.selfTestProblem(); ok && p.acks() {
-		// The warm-up, and so the self-test, runs only while the phase
-		// acks. In another phase the reason would only repeat that.
-		rep.Problems = append(rep.Problems, st)
-		p = convergedPhase(rep, err)
-	}
-	// The book is loaded, so the daemon runs from now on, also when the
-	// convergence failed.
-	l.setMode(ctx, runningMode{conf: conf, retain: retain, book: book, phase: p})
-	l.logConverge(ctx, trigger, time.Since(began), rep, logattr.ErrorTypePlatform, err)
+	l.logConverge(ctx, trigger, time.Since(began), rep, errType, err)
 	return err
 }
 
 // logConverge writes the event of one convergence pass, after the pass
 // set the phase. A failure is a warning when it starts or changes, and
-// debug while the same failure repeats: the self-heal timer starts one
-// pass every SelfHealInterval, and the state changed event shows the
+// debug while the same failure repeats: the self-heal starts one pass
+// every SelfHealInterval, and the state changed event shows the
 // recovery. A pass that wrote to the kernel is info, and a pass that
 // found nothing to do is debug. errType is the error.type of a non-nil
 // err.
@@ -332,7 +219,7 @@ func (l *loop) logConverge(ctx context.Context, trigger string, took time.Durati
 		slog.String(logattr.ConvergeTrigger, trigger),
 		slog.Int(logattr.ConvergeWrites, rep.Writes),
 		slog.Int64(logattr.ConvergeDurationMS, took.Milliseconds()),
-		slog.String(logattr.EnforcementState, l.phase().state.String()),
+		slog.String(logattr.EnforcementState, core.PhaseOf(l.core).Lifecycle.String()),
 	}
 	level := slog.LevelDebug
 	failed := ""
@@ -365,166 +252,16 @@ func (l *loop) logStatesEnded(ctx context.Context, cause string, policies []poli
 		slog.String(logattr.StatesCause, cause), slog.Any(logattr.PolicyNames, names))
 }
 
-// loadBook opens the address book. A book that can miss a lease that an
-// earlier run acknowledged makes it adopt the learned-looking entries of
-// the kernel tables that the book does not hold, and commit them first:
-// a book with damage, a torn book (see addrstore.Store.Torn: a damaged
-// last record looks like a cut write), and a fresh book (see
-// addrstore.Store.Fresh) without an address of a configured policy. Those addresses then stay
-// blocked for one retain period instead of being unblocked. A book that
-// this version wrote holds each acknowledged lease, because each lease
-// is durable before its ack; an adoption would only keep the entries
-// that the tables hold without a lease, such as the host addresses of a
-// host file entry that went away. A fresh book with an address of a
-// configured policy comes from the JSON snapshot of an earlier version,
-// which also held each acknowledged address.
-//
-// The test of a fresh book looks at the configured policies only, so it
-// also adopts when the snapshot holds addresses only of policies that
-// the configuration removed.
-// Adoption reads every table, also the table of a removed policy: its
-// removal may not be installed yet, and a revert must find its addresses.
-// reconcile prunes them after the install. It fails closed: adoption
-// adds entries that the tables already hold, and each one expires after
-// one retain period. After a good read of the host file, its addresses
-// are not adopted: they leave the tables with their host entries. Before
-// a good read, they are adopted. Entries that expired while the daemon
-// was down leave the book here. After an error, no book is open.
-func (l *loop) loadBook(ctx context.Context, conf activeConfig, retain time.Duration) (addrBook, error) {
-	book, err := l.openBook(l.addrStore, l.snapshot, retain)
-	if err != nil {
-		return nil, fmt.Errorf("loading the address book: %w", err)
-	}
-	if err := book.Damage(); err != nil {
-		// The leases in the damaged places are lost; the adoption below
-		// keeps those that the tables hold.
-		l.log.WarnContext(ctx, "address book damaged",
-			slog.String(logattr.ErrorType, logattr.ErrorTypeSnapshot), slog.String(logattr.ExceptionMessage, err.Error()))
-	}
-	hasConfigured := slices.ContainsFunc(policyNames(conf.cfg), func(n policy.Name) bool { return len(book.Addrs(n)) > 0 })
-	if book.Damage() != nil || book.Torn() || book.Fresh() && !hasConfigured {
-		if err := l.adopt(ctx, book, conf.cfg.Policies); err != nil {
-			_ = book.Close() //nolint:errcheck // the adoption error is the one to report; the next attempt opens the book again
-			return nil, err
-		}
-	}
-	// A failed removal of an old segment leaves it on disk only; the next
-	// Expire removes it again.
-	_, _ = book.Apply(ctx, addrstore.Expire{At: time.Now()}) //nolint:errcheck // see above
-	return book, nil
-}
-
-func (l *loop) adopt(ctx context.Context, book addrBook, policies []policy.Policy) error {
-	found, err := l.rec.Adoptable(ctx, policies)
-	if err != nil {
-		return fmt.Errorf("adopting kernel entries: %w", err)
-	}
-	for name, addrs := range found {
-		if _, read := l.core.HostFile(); read {
-			// The host file is their source of truth, not the book.
-			// reconcile mapped it before it loads the book.
-			hosts := l.mapped.addrs[name] // sorted
-			found[name] = slices.DeleteFunc(addrs, func(a blockable.Addr) bool {
-				_, found := slices.BinarySearchFunc(hosts, a, blockable.Addr.Compare)
-				return found
-			})
-		}
-	}
-	// TTL 0: each entry gets a fresh retain period.
-	if _, err := book.Apply(ctx, addrstore.Adopt{Found: found, At: time.Now()}); err != nil {
-		return fmt.Errorf("saving adopted entries: %w", err)
-	}
-	return nil
-}
-
-// phase returns the phase of the current mode. An unknown mode has an
-// unenforced phase.
-func (l *loop) phase() phase {
-	switch m := l.mode.(type) {
-	case unconfiguredMode:
-		return m.phase.asPhase()
-	case loadingMode:
-		return m.phase.asPhase()
-	case runningMode:
-		return m.phase
-	default:
-		return unenforcedPhase("unknown mode").asPhase()
-	}
-}
-
-// setPhase gives the current mode the phase p. Only reconcile gives a
-// runningMode a phase that acknowledges.
-func (l *loop) setPhase(ctx context.Context, p waitPhase) {
-	switch m := l.mode.(type) {
-	case unconfiguredMode:
-		m.phase = p
-		l.setMode(ctx, m)
-	case loadingMode:
-		m.phase = p
-		l.setMode(ctx, m)
-	case runningMode:
-		m.phase = p.asPhase()
-		l.setMode(ctx, m)
-	default:
-		panic(fmt.Sprintf("daemon: setPhase in unknown mode %T", l.mode))
-	}
-}
-
-// setMode makes m the current mode, and logs a change of the phase.
-func (l *loop) setMode(ctx context.Context, m mode) {
-	old := l.phase()
-	l.mode = m
-	p := l.phase()
-	if p.state == old.state && p.installed == old.installed && slices.Equal(p.reasons, old.reasons) {
-		return
-	}
-	level := slog.LevelWarn
-	if p.state == StateReady {
-		level = slog.LevelInfo
-	}
-	l.log.LogAttrs(ctx, level, "state changed",
-		slog.String(logattr.EnforcementState, p.state.String()), slog.Any(logattr.EnforcementReasons, p.reasons))
-}
-
-func (l *loop) armExpiry(t *time.Timer) {
-	m, ok := l.mode.(runningMode)
-	if !ok {
-		t.Stop()
-		return
-	}
-	next := l.bookFacts(m.book).NextExpiry
-	if next.IsZero() {
-		t.Stop()
-		return
-	}
-	t.Reset(time.Until(next))
-}
-
-// expire removes the expired entries of the book. A removal is final also
-// when its delete fails, so a failed delete does not make the timer
-// fire again at once; the next start removes the entries from disk.
-func (l *loop) expire(ctx context.Context) {
-	m, ok := l.mode.(runningMode)
-	if !ok {
-		return
-	}
-	if n, _ := m.book.Apply(ctx, addrstore.Expire{At: time.Now()}); n > 0 { //nolint:errcheck // see above
-		_ = l.reconcile(ctx, logattr.TriggerExpiry) //nolint:errcheck // the phase holds the outcome
-	}
-}
-
 // reconfigure applies cfg. Until a convergence installs the ruleset of
 // cfg, the phase acknowledges nothing. It publishes this phase with the
 // new digest before the convergence, so that Status tells the
 // configuration of the stored file also while the convergence runs. The
-// book keeps the entries of removed policies until then; reconcile
-// prunes them.
+// book keeps the entries of removed policies until then; the
+// convergence prunes them.
 func (l *loop) reconfigure(ctx context.Context, cfg policy.Config, digest configstore.Digest) error {
-	l.setConfig(cfg, digest)
-	l.setPhase(ctx, unenforcedPhase("the new configuration is not installed yet"))
-	l.publish()
-	l.wantAccounts(ctx)
-	return l.reconcile(ctx, logattr.TriggerConfig)
+	l.drive(ctx, core.ConfigRead{At: time.Now(), Config: cfg, Digest: digest})
+	l.publish(ctx)
+	return l.converge(ctx, l.pending)
 }
 
 // apply stores data and then reconfigures. It does not start the store
@@ -535,7 +272,8 @@ func (l *loop) reconfigure(ctx context.Context, cfg policy.Config, digest config
 // place, so it applies, and its error wraps configstore.ErrNotDurable.
 // Each call writes one apply event.
 func (l *loop) apply(ctx, caller context.Context, data []byte) (Status, error) {
-	previous, hadConfig := l.activeDigest()
+	before, hadConfig := l.active()
+	previous := before.Digest
 	if err := caller.Err(); err != nil {
 		err = fmt.Errorf("apply not started: %w", err)
 		l.logApply(ctx, previous, hadConfig, logattr.ErrorTypeCanceled, err)
@@ -548,7 +286,7 @@ func (l *loop) apply(ctx, caller context.Context, data []byte) (Status, error) {
 	}
 	_ = l.reconfigure(ctx, cfg, digest) //nolint:errcheck // the phase holds the outcome, and Status reports it
 	l.logApply(ctx, previous, hadConfig, logattr.ErrorTypeConfigNotDurable, err)
-	return l.status(), err
+	return statusOf(l.core), err
 }
 
 // storeErrType returns the error.type of an error of configstore.Store
@@ -566,9 +304,9 @@ func storeErrType(err error) string {
 // that ran before, when hadConfig. errType is the error.type of a non-nil
 // err. A caller that left before the start is info: nothing is degraded.
 func (l *loop) logApply(ctx context.Context, previous configstore.Digest, hadConfig bool, errType string, err error) {
-	attrs := []slog.Attr{slog.String(logattr.EnforcementState, l.phase().state.String())}
-	if digest, ok := l.activeDigest(); ok {
-		attrs = append(attrs, slog.String(logattr.ConfigDigest, digest.String()))
+	attrs := []slog.Attr{slog.String(logattr.EnforcementState, core.PhaseOf(l.core).Lifecycle.String())}
+	if a, ok := l.active(); ok {
+		attrs = append(attrs, slog.String(logattr.ConfigDigest, a.Digest.String()))
 	}
 	if hadConfig {
 		attrs = append(attrs, slog.String(logattr.ConfigPreviousDigest, previous.String()))
@@ -583,44 +321,6 @@ func (l *loop) logApply(ctx context.Context, previous configstore.Digest, hadCon
 	l.log.LogAttrs(ctx, level, "apply", attrs...)
 }
 
-// selfTestResult takes the latest results of the warm-up. Only a result
-// for the active configuration counts, and a pass is final for it. It
-// reports whether the self-test changed.
-func (l *loop) selfTestResult(r warmResult) bool {
-	// The warm-up runs only in runningMode, so a result for the active
-	// configuration comes only there.
-	m, ok := l.mode.(runningMode)
-	if !ok {
-		return false
-	}
-	gen := m.conf.gen
-	before := l.selfTest
-	switch {
-	case l.selfTest == selfTestNone || l.selfTest == selfTestPassed:
-	case r.proved == gen:
-		l.selfTest = selfTestPassed
-	case r.missed == gen:
-		l.selfTest = selfTestFailed
-	}
-	return l.selfTest != before
-}
-
-// selfTestProblem returns the Problem of the self-test, if there is one.
-// It does not void enforcement: without ifbound-dns, a protected name
-// does not resolve.
-func (l *loop) selfTestProblem() (reconcile.Problem, bool) {
-	switch l.selfTest {
-	case selfTestNotRun:
-		return reconcile.Problem{Text: "ifbound-dns not connected: no probe reached it yet"}, true
-	case selfTestFailed:
-		return reconcile.Problem{Text: "ifbound-dns not connected: no probe reached it; the self-test tries again at each self-heal"}, true
-	case selfTestNone, selfTestPassed:
-		return reconcile.Problem{}, false
-	default:
-		return reconcile.Problem{Text: "unknown self-test state"}, true
-	}
-}
-
 // observe handles one DNS report. The report is untrusted: only the
 // policies that match its name get its addresses.
 //
@@ -632,14 +332,10 @@ func (l *loop) selfTestProblem() (reconcile.Problem, bool) {
 // ifbound-dns removes the aliases from the reply when the ack is
 // protected.
 func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
-	m, ok := l.mode.(runningMode)
-	switch {
-	case l.phase().state == StateStarting:
-		return ipc.Ack{}, ErrNotReady
-	case !ok || !m.phase.acks():
-		return ipc.Ack{}, ErrUnenforced
+	if c, ok := l.gate.State.(core.Closed); ok {
+		return ipc.Ack{}, c.Err
 	}
-	names, err := m.conf.matcher.Match(o.QName)
+	names, err := l.gate.Matcher.Match(o.QName)
 	if err != nil {
 		return ipc.Ack{}, fmt.Errorf("classifying qname: %w", err)
 	}
@@ -647,7 +343,7 @@ func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) 
 		return ipc.Ack{}, nil
 	}
 	if len(o.Addrs) > 0 {
-		if err := l.record(ctx, m.book, names, o); err != nil {
+		if err := l.record(ctx, names, o); err != nil {
 			return ipc.Ack{}, err
 		}
 	}
@@ -663,10 +359,11 @@ func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) 
 // slice goes to the book and to the tables, so a table entry and its
 // book key cannot differ. An address is in the book only after its
 // commit: after a failure, the book does not have the new addresses, and
-// the report is not acknowledged.
-func (l *loop) record(ctx context.Context, book addrBook, names []policy.Name, o ipc.Observation) error {
+// the report is not acknowledged. The gate is open, so the loop holds
+// the book.
+func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observation) error {
 	addrs := blockable.Filter(o.Addrs)
-	p, err := book.Touch(names, addrs, o.TTL, time.Now())
+	p, err := l.book.Touch(names, addrs, o.TTL, time.Now())
 	if err != nil {
 		return fmt.Errorf("recording addresses: %w", err)
 	}
@@ -675,53 +372,29 @@ func (l *loop) record(ctx context.Context, book addrBook, names []policy.Name, o
 			return err
 		}
 	}
-	if err := book.Commit(ctx, p); err != nil {
+	if err := l.book.Commit(ctx, p); err != nil {
 		return fmt.Errorf("saving the address book: %w", err)
+	}
+	if !p.Empty() {
+		l.drive(ctx, core.BookChanged{At: time.Now(), Facts: l.latestFacts()})
 	}
 	return nil
 }
 
 // checkInstalled returns nil when the Backend has the installed ruleset
-// of the current phase loaded. It reads the phase after the read of the
-// Backend, so it never trusts an older phase. Otherwise something outside
-// ifbound changed the ruleset, or the phase does not acknowledge. The
-// phase then stops acknowledging, and Run converges right after this
-// request. It returns ErrUnenforced in this case.
+// of the gate loaded. It reads the gate after the read of the Backend,
+// so it never trusts an older gate. Otherwise something outside
+// ifbound changed the ruleset, or the gate is closed. The phase then
+// stops acknowledging, and Run converges right after this request. It
+// returns ErrUnenforced in this case.
 func (l *loop) checkInstalled(ctx context.Context) error {
 	id, err := l.rec.Backend.LoadedID(ctx)
 	if err != nil {
 		return fmt.Errorf("reading the loaded ruleset: %w", err)
 	}
-	if m, ok := l.mode.(runningMode); !ok || !m.phase.acks() || id != m.phase.installed {
-		l.setPhase(ctx, unenforcedPhase("the loaded ruleset changed outside ifbound"))
-		l.pending = cmp.Or(l.pending, logattr.TriggerRulesetChanged)
+	if g, ok := l.gate.State.(core.Open); !ok || id != g.Installed {
+		l.drive(ctx, core.RulesetMismatch{At: time.Now()})
 		return ErrUnenforced
 	}
 	return nil
-}
-
-// status costs one map lookup per policy, so the loop can publish it at
-// each pass.
-func (l *loop) status() Status {
-	p := l.phase()
-	st := Status{State: p.state, Reasons: slices.Clone(p.reasons)}
-	withConf := func(conf activeConfig, retain time.Duration) {
-		st.Policies = len(conf.cfg.Policies)
-		st.RetainRestart = conf.cfg.AddrBook.Retain != retain
-		st.Config = conf.digest
-		st.Warnings = slices.Clone(conf.warnings)
-	}
-	switch m := l.mode.(type) {
-	case unconfiguredMode:
-	case loadingMode:
-		withConf(m.conf, m.retain)
-	case runningMode:
-		withConf(m.conf, m.retain)
-		counts := l.bookFacts(m.book).Counts
-		for _, pol := range m.conf.cfg.Policies {
-			st.Addrs += counts[pol.Name]
-		}
-	default:
-	}
-	return st
 }

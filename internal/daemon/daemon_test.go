@@ -316,7 +316,7 @@ func TestAdoptionSaveFailureKeepsStarting(t *testing.T) {
 				h.world.Tables(), h.world.Referenced())
 		}
 
-		// A later attempt opens the book again and completes.
+		// The next pass adopts again with the open book, and completes.
 		fail.Store(false)
 		heal()
 		h.wantState(daemon.StateReady)
