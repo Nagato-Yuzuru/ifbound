@@ -72,7 +72,6 @@ func TestClassify(t *testing.T) {
 		{"utun is a tunnel", link{"utun3", flagsUTUN, unix.IFT_OTHER, familyUTUN}, tunnel},
 		{"utun that is down is a tunnel", link{"utun4", unix.IFF_POINTOPOINT, unix.IFT_OTHER, familyUTUN}, tunnel},
 		{"ipsec is a tunnel", link{"ipsec0", flagsUTUN, unix.IFT_OTHER, familyIPSEC}, tunnel},
-		{"gif is a tunnel", link{"gif0", flagsGIF, unix.IFT_GIF, familyGIF}, tunnel},
 		{"Wi-Fi is hardware", link{"en0", flagsEther, unix.IFT_ETHER, familyEthernet}, hardware},
 		{"Ethernet that is down is hardware", link{"en7", unix.IFF_BROADCAST, unix.IFT_ETHER, familyEthernet}, hardware},
 		{"VLAN is hardware", link{"vlan0", flagsEther, unix.IFT_L2VLAN, 5}, hardware},
@@ -89,6 +88,7 @@ func TestClassify(t *testing.T) {
 		{"ppp family with an Ethernet type", link{"x5", flagsEther, unix.IFT_ETHER, familyPPP}, uncertain},
 		{"ppp type with a tunnel family", link{"x6", flagsPPP, unix.IFT_PPP, familyUTUN}, uncertain},
 		// Every other interface is uncertain.
+		{"gif", link{"gif0", flagsGIF, unix.IFT_GIF, familyGIF}, uncertain},
 		{"stf", link{"stf0", 0, unix.IFT_STF, familySTF}, uncertain},
 		{"cellular", link{"pdp_ip0", flagsCellular, unix.IFT_CELLULAR, familyCellular}, uncertain},
 		{"redirect in cellular mode", link{"rd0", flagsCellular, unix.IFT_CELLULAR, familyCellular}, uncertain},
