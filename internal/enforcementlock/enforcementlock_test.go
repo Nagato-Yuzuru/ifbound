@@ -96,20 +96,85 @@ func TestHeldInTheSameProcess(t *testing.T) {
 	}
 }
 
-// A symbolic link at the path is refused: Acquire neither creates nor
-// locks its target.
+// Both entry points refuse a symbolic link at the lock name with ErrSymlink.
+// The link is dangling or points to a file that exists, also inside the
+// root, which os.Root alone follows. Neither call creates or locks the
+// target.
 func TestSymlinkIsRefused(t *testing.T) {
+	for _, tt := range []struct {
+		name           string
+		targetExists   bool
+		acquireThrough func(dir, name string) (*enforcementlock.Lock, error)
+	}{
+		{"Acquire, dangling link", false, func(dir, name string) (*enforcementlock.Lock, error) {
+			return enforcementlock.Acquire(filepath.Join(dir, name))
+		}},
+		{"Acquire, link to a file", true, func(dir, name string) (*enforcementlock.Lock, error) {
+			return enforcementlock.Acquire(filepath.Join(dir, name))
+		}},
+		{"AcquireIn, dangling link", false, acquireIn},
+		{"AcquireIn, link to a file", true, acquireIn},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			target := filepath.Join(dir, "target")
+			if tt.targetExists {
+				if err := os.WriteFile(target, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink("target", filepath.Join(dir, "lock")); err != nil {
+				t.Fatal(err)
+			}
+			l, err := tt.acquireThrough(dir, "lock")
+			if err == nil {
+				_ = l.Close() //nolint:errcheck // the test fails already
+			}
+			if !errors.Is(err, enforcementlock.ErrSymlink) {
+				t.Errorf("error = %v, want ErrSymlink", err)
+			}
+			if _, err := os.Lstat(target); tt.targetExists == errors.Is(err, os.ErrNotExist) {
+				t.Errorf("target exists = %v after the call, want %v: %v", !errors.Is(err, os.ErrNotExist), tt.targetExists, err)
+			}
+		})
+	}
+}
+
+func acquireIn(dir, name string) (*enforcementlock.Lock, error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close() //nolint:errcheck // a read-only handle in a test
+	return enforcementlock.AcquireIn(root, name)
+}
+
+// AcquireIn takes one file name. A path could pass through a link.
+func TestAcquireInRefusesPath(t *testing.T) {
 	dir := t.TempDir()
-	target := filepath.Join(dir, "target")
-	path := filepath.Join(dir, "enforcement.lock")
-	if err := os.Symlink(target, path); err != nil {
+	if err := os.Mkdir(filepath.Join(dir, "sub"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if l, err := enforcementlock.Acquire(path); err == nil {
-		_ = l.Close() //nolint:errcheck // the test fails already
-		t.Fatal("Acquire through a symbolic link = nil, want an error")
+	for _, name := range []string{"", ".", "..", "sub/lock", "../lock"} {
+		if l, err := acquireIn(dir, name); err == nil {
+			_ = l.Close() //nolint:errcheck // the test fails already
+			t.Errorf("AcquireIn(%q) = nil, want an error", name)
+		}
 	}
-	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("the target of the link exists after Acquire: %v", err)
+}
+
+func TestAcquireInHeldInTheSameProcess(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close() //nolint:errcheck // a read-only handle in a test
+	first, err := enforcementlock.AcquireIn(root, "lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close() //nolint:errcheck // the test ends next
+	if _, err := enforcementlock.AcquireIn(root, "lock"); !errors.Is(err, enforcementlock.ErrHeld) {
+		t.Errorf("second AcquireIn = %v, want ErrHeld", err)
 	}
 }

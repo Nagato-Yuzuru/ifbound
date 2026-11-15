@@ -15,10 +15,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
+	"github.com/Nagato-Yuzuru/ifbound/internal/enforcementlock"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
 
@@ -309,7 +309,7 @@ func nameBound(name string, retain time.Duration) int64 {
 // Open.
 type segDir struct {
 	root *os.Root
-	lock *os.File
+	lock *enforcementlock.Lock
 	// sync makes a file durable: F_FULLFSYNC on darwin. A test replaces it.
 	sync func(*os.File) error
 
@@ -342,15 +342,10 @@ func openDir(path string) (*segDir, error) {
 	if err != nil {
 		return nil, err
 	}
-	lock, err := root.OpenFile(lockName, os.O_RDWR|os.O_CREATE, 0o600)
+	lock, err := enforcementlock.AcquireIn(root, lockName)
 	if err != nil {
-		_ = root.Close() //nolint:errcheck // the open error is the one to report
-		return nil, err
-	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = lock.Close() //nolint:errcheck // the lock error is the one to report
 		_ = root.Close() //nolint:errcheck // the lock error is the one to report
-		if errors.Is(err, syscall.EWOULDBLOCK) {
+		if errors.Is(err, enforcementlock.ErrHeld) {
 			return nil, fmt.Errorf("%w: %s", ErrLocked, path)
 		}
 		return nil, err

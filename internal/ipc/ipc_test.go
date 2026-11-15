@@ -836,6 +836,27 @@ func TestOldServerCloseKeepsNewerSocket(t *testing.T) {
 	}
 }
 
+// A symbolic link at the lock path makes Listen fail, and Listen does not
+// create or lock the target.
+func TestListenRefusesLockSymlink(t *testing.T) {
+	path := shortPath(t)
+	target := path + ".target"
+	if err := os.Symlink(target, path+".lock"); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := Listen(ServerConfig{Path: path, Handler: handlerFunc(ack)})
+	if err == nil {
+		_ = srv.Close() //nolint:errcheck // the test fails already
+		t.Fatal("Listen with a symbolic link as lock file = nil, want an error")
+	}
+	if errors.Is(err, ErrAlreadyRunning) {
+		t.Errorf("err = %v, want an error that is not ErrAlreadyRunning", err)
+	}
+	if _, err := os.Lstat(target); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the target of the link exists after Listen: %v", err)
+	}
+}
+
 func TestLockReleasedOnCloseAndLockFileKept(t *testing.T) {
 	path := shortPath(t)
 	srv, err := Listen(ServerConfig{Path: path, Handler: handlerFunc(ack)})

@@ -13,8 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sys/unix"
-
+	"github.com/Nagato-Yuzuru/ifbound/internal/enforcementlock"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 )
 
@@ -32,7 +31,6 @@ const (
 
 	acceptBackoffMin = 5 * time.Millisecond
 	acceptBackoffMax = time.Second
-	lockFileMode     = 0o600
 )
 
 var (
@@ -101,9 +99,9 @@ type Server struct {
 	// connTimeout is the one deadline for a connection.
 	connTimeout time.Duration
 
-	path string      // empty when the server does not own a file
-	sock os.FileInfo // the socket file that this server created
-	lock *os.File    // holds the flock for the server lifetime
+	path string                // empty when the server does not own a file
+	sock os.FileInfo           // the socket file that this server created
+	lock *enforcementlock.Lock // holds the flock for the server lifetime
 
 	mu      sync.Mutex
 	closed  bool
@@ -206,21 +204,14 @@ func listenSpec(path string, sp spec) (*Server, error) {
 	return s, nil
 }
 
-// lockPath takes the exclusive lock for path and returns the lock file.
-func lockPath(path string) (*os.File, error) {
-	name := path + ".lock"
-	f, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, lockFileMode)
-	if err != nil {
-		return nil, fmt.Errorf("opening lock file %s: %w", name, err)
+// lockPath takes the exclusive lock for path. A symbolic link at the lock
+// path is an error.
+func lockPath(path string) (*enforcementlock.Lock, error) {
+	l, err := enforcementlock.Acquire(path + ".lock")
+	if errors.Is(err, enforcementlock.ErrHeld) {
+		return nil, fmt.Errorf("%w: %s", ErrAlreadyRunning, path)
 	}
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		_ = f.Close() //nolint:errcheck // the lock error is the one to report
-		if errors.Is(err, unix.EWOULDBLOCK) {
-			return nil, fmt.Errorf("%w: %s", ErrAlreadyRunning, path)
-		}
-		return nil, fmt.Errorf("locking %s: %w", name, err)
-	}
-	return f, nil
+	return l, err
 }
 
 // bind removes a stale socket at path, binds, and sets the mode of sp.
