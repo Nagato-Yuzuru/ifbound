@@ -86,13 +86,13 @@ func (l *loop) readKernelHosts(ctx context.Context, e core.ReadKernelHosts) core
 // under conf. Before the first good read of the host file, they are the
 // kernel host entries. It maps the file again only when the read or the
 // configuration changed, so the warnings of mapHosts do not repeat.
-func (l *loop) hostAddrs(ctx context.Context, conf activeConfig) map[policy.Name][]blockable.Addr {
+func (l *loop) hostAddrs(ctx context.Context, conf core.Active) map[policy.Name][]blockable.Addr {
 	file, read := l.core.HostFile()
 	if !read {
 		return l.core.KernelHosts()
 	}
-	if m := l.mapped; m.file != file.ID || m.gen != conf.gen {
-		l.mapped = mappedHosts{file: file.ID, gen: conf.gen, addrs: l.mapHosts(ctx, conf, file.Hosts)}
+	if m := l.mapped; m.file != file.ID || m.gen != conf.Gen {
+		l.mapped = mappedHosts{file: file.ID, gen: conf.Gen, addrs: l.mapHosts(ctx, conf, file.Hosts)}
 	}
 	return l.mapped.addrs
 }
@@ -107,13 +107,13 @@ func (l *loop) hostAddrs(ctx context.Context, conf activeConfig) map[policy.Name
 // It also logs, in one event, the lines with a name that the entries
 // cannot show, when the name is at or below an apex. Such a line can hold
 // a protected address that no table has.
-func (l *loop) mapHosts(ctx context.Context, conf activeConfig, hosts hostsfile.Hosts) map[policy.Name][]blockable.Addr {
+func (l *loop) mapHosts(ctx context.Context, conf core.Active, hosts hostsfile.Hosts) map[policy.Name][]blockable.Addr {
 	g := newHostGraph(hosts.Entries)
 	out := make(map[policy.Name][]blockable.Addr)
 	var bad []string
 	var badErrs []error
 	for name := range g.names() {
-		policies, err := conf.matcher.Match(name)
+		policies, err := conf.Matcher.Match(name)
 		if err != nil {
 			bad, badErrs = append(bad, name), append(badErrs, err)
 			continue
@@ -137,7 +137,7 @@ func (l *loop) mapHosts(ctx context.Context, conf activeConfig, hosts hostsfile.
 	}
 	var lines []string
 	for _, line := range hosts.Unrepresentable {
-		if below := belowApex(conf.apexes, line.Names); len(below) > 0 {
+		if below := belowApex(conf.Apexes, line.Names); len(below) > 0 {
 			lines = append(lines, fmt.Sprintf("line %d: %s", line.Number, strings.Join(below, " ")))
 		}
 	}

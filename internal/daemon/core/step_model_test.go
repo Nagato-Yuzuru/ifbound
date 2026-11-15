@@ -30,12 +30,12 @@ type accountModel struct {
 	rng   *rand.Rand
 	s     State
 	now   time.Time
-	scope ReadAccounts // the names of the last AccountsWanted
+	scope ReadAccounts // the names of the last configuration
 	// flight is the read that Step started and that has no result yet.
 	flight  ReadAccounts
 	started time.Time
 	busy    bool
-	// again is true when an AccountsWanted came during the flight.
+	// again is true when a configuration came during the flight.
 	again bool
 }
 
@@ -58,19 +58,20 @@ func (m *accountModel) next() error {
 }
 
 func (m *accountModel) want() error {
-	ev := AccountsWanted{At: m.now, Users: m.names("alice", "bob", "carol"), Groups: m.names("staff", "admin")}
+	users, groups := m.names("alice", "bob", "carol"), m.names("admin", "staff")
+	ev := ConfigRead{At: m.now, Config: scoped(users, groups)}
 	wasBusy := m.busy
-	m.scope = ReadAccounts{Users: ev.Users, Groups: ev.Groups}
+	m.scope = ReadAccounts{Users: users, Groups: groups}
 	reads, err := m.step(ev)
 	switch {
 	case err != nil:
 		return err
 	case wasBusy && len(reads) > 0:
-		return fmt.Errorf("AccountsWanted during a flight started %v", reads)
+		return fmt.Errorf("ConfigRead during a flight started %v", reads)
 	case wasBusy:
 		m.again = true
 	case len(reads) != 1:
-		return fmt.Errorf("AccountsWanted without a flight started %d reads, want 1", len(reads))
+		return fmt.Errorf("ConfigRead without a flight started %d reads, want 1", len(reads))
 	}
 	return nil
 }
@@ -123,7 +124,8 @@ func (m *accountModel) step(ev Event) ([]ReadAccounts, error) {
 			reads = append(reads, e)
 		case Converge:
 			converges++
-		case AccountsOverdue, AccountLookupsFailed, ReadHosts, ReadKernelHosts, HostsReadFailed, KernelHostsFailed:
+		case AccountsOverdue, AccountLookupsFailed, ReadHosts, ReadKernelHosts, HostsReadFailed, KernelHostsFailed,
+			OpenBook, AdoptBook, ExpireBook, PruneBook:
 		}
 	}
 	switch {

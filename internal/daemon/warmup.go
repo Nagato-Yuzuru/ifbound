@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/syslookup"
@@ -87,20 +88,20 @@ func newWarmUp(lookup SystemResolver, prove func(context.Context, policy.Domain)
 // acking. A warm-up starts again from its first name when the phase acks
 // again: the reports of its lookups were not acked meanwhile.
 func (w *warmUp) sync(ctx context.Context, l *loop) {
-	m, ok := l.mode.(runningMode)
-	acks := ok && m.phase.acks()
-	if w.cancel != nil && (!acks || w.gen != m.conf.gen) {
+	_, open := l.gate.State.(core.Open)
+	a, _ := l.active()
+	if w.cancel != nil && (!open || w.gen != a.Gen) {
 		w.cancel()
 		w.cancel = nil
 	}
-	if w.cancel != nil || !acks {
+	if w.cancel != nil || !open {
 		return
 	}
-	names := warmUpNames(m.conf.cfg)
+	names := core.WarmUpNames(a.Config)
 	var wctx context.Context
 	wctx, w.cancel = context.WithCancel(ctx)
-	w.gen = m.conf.gen
-	gen := m.conf.gen
+	w.gen = a.Gen
+	gen := a.Gen
 	w.wg.Go(func() { w.run(wctx, ctx, names, gen) })
 }
 
@@ -296,29 +297,3 @@ func (w *warmUp) result() warmResult {
 
 // wait returns when every lookup of every warm-up has returned.
 func (w *warmUp) wait() { w.wg.Wait() }
-
-// warmUpNames returns the names that the warm-up resolves: each exact
-// destination and the domain of each suffix destination, in file order
-// and without duplicates.
-func warmUpNames(cfg policy.Config) []policy.Domain {
-	var out []policy.Domain
-	seen := make(map[policy.Domain]bool)
-	for _, p := range cfg.Policies {
-		for _, dest := range p.To {
-			var name policy.Domain
-			switch d := dest.(type) {
-			case policy.ExactDomain:
-				name = d.Domain()
-			case policy.DomainSuffix:
-				name = d.Domain()
-			case policy.IPAddr, policy.CIDR:
-				continue // not a name
-			}
-			if !seen[name] {
-				seen[name] = true
-				out = append(out, name)
-			}
-		}
-	}
-	return out
-}

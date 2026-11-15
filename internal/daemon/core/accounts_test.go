@@ -6,17 +6,17 @@ import (
 	"time"
 )
 
-// startAccounts gives Step an AccountsWanted for alice at start, and
-// returns the state and the read that it started.
+// startAccounts gives Step a configuration whose scope names alice at
+// start, and returns the state and the read that it started.
 func startAccounts(t *testing.T, s State, start time.Time) (State, ReadAccounts) {
 	t.Helper()
-	s, effects := Step(s, AccountsWanted{At: start, Users: []string{"alice"}})
+	s, effects := Step(s, ConfigRead{At: start, Config: scoped([]string{"alice"}, nil)})
 	for _, e := range effects {
 		if r, ok := e.(ReadAccounts); ok {
 			return s, r
 		}
 	}
-	t.Fatalf("AccountsWanted started no read: %v", effects)
+	t.Fatalf("ConfigRead started no read: %v", effects)
 	return s, ReadAccounts{}
 }
 
@@ -32,7 +32,7 @@ func endAccounts(s State, r ReadAccounts, end time.Time, fail bool) State {
 }
 
 func lateProblem(s State) bool {
-	p, ok := AccountsProblem(s)
+	p, ok := accountsProblem(s)
 	return ok && strings.Contains(p.Text, "takes longer than")
 }
 
@@ -92,11 +92,11 @@ func TestAccountReadIsLateWhenItEndsAtOrAfterItsDeadline(t *testing.T) {
 	}
 }
 
-// When the time of HostsWanted makes the account read overdue, Step asks
+// When the time of PassStarted makes the account read overdue, Step asks
 // for the host file read first and for the convergence last.
-func TestHostsWantedPastTheAccountDeadlineReadsTheHostsBeforeItConverges(t *testing.T) {
+func TestPassStartedPastTheAccountDeadlineReadsTheHostsBeforeItConverges(t *testing.T) {
 	s, _ := startAccounts(t, State{}, t0)
-	_, effects := Step(s, HostsWanted{At: at(AccountReadTimeout)})
+	_, effects := Step(s, PassStarted{At: at(AccountReadTimeout)})
 	read, conv := -1, -1
 	for i, e := range effects {
 		switch e.(type) {
@@ -104,7 +104,8 @@ func TestHostsWantedPastTheAccountDeadlineReadsTheHostsBeforeItConverges(t *test
 			read = i
 		case Converge:
 			conv = i
-		case ReadAccounts, AccountsOverdue, AccountLookupsFailed, ReadKernelHosts, HostsReadFailed, KernelHostsFailed:
+		case ReadAccounts, AccountsOverdue, AccountLookupsFailed, ReadKernelHosts, HostsReadFailed, KernelHostsFailed,
+			OpenBook, AdoptBook, ExpireBook, PruneBook:
 		}
 	}
 	if read < 0 || conv != len(effects)-1 {

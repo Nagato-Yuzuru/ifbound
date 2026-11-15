@@ -68,12 +68,12 @@ func (m *hostModel) next() error {
 }
 
 func (m *hostModel) want() error {
-	effects, err := m.step(HostsWanted{At: m.now})
+	effects, err := m.step(PassStarted{At: m.now})
 	if err != nil {
 		return err
 	}
 	if m.hosts == nil {
-		return fmt.Errorf("HostsWanted without a read in flight started no host read: %v", effects)
+		return fmt.Errorf("PassStarted without a read in flight started no host read: %v", effects)
 	}
 	if want := m.read && !m.failing; m.hosts.Known != want || (want && m.hosts.Last != m.file.Version) {
 		return fmt.Errorf("ReadHosts = %+v; want Known %v with the version %v of the last good read", *m.hosts, want, m.file.Version)
@@ -128,8 +128,8 @@ func (m *hostModel) hostsResult() error {
 	if got, want := countOf[HostsReadFailed](effects), m.failing && !wasFailing; got != b2i(want) {
 		return fmt.Errorf("%d HostsReadFailed for a read with err %v after a failing %v, want %v", got, ev.Err, wasFailing, want)
 	}
-	if p, ok := HostsProblem(m.s); ok != m.failing || (ok && p.Text == "") {
-		return fmt.Errorf("HostsProblem = %+v, %v; want a problem %v", p, ok, m.failing)
+	if p, ok := hostsProblem(m.s); ok != m.failing || (ok && p.Text == "") {
+		return fmt.Errorf("hostsProblem = %+v, %v; want a problem %v", p, ok, m.failing)
 	}
 	if m.read != (m.kernel == nil) {
 		return fmt.Errorf("after a host read with a good read %v, the kernel read in flight is %v; want one exactly before the first good read", m.read, m.kernel)
@@ -204,7 +204,8 @@ func (m *hostModel) step(ev Event) ([]Effect, error) {
 				return nil, fmt.Errorf("a second kernel read %v started while %v is in flight", e, *m.kernel)
 			}
 			m.kernel = &e
-		case Converge, ReadAccounts, AccountsOverdue, AccountLookupsFailed, HostsReadFailed, KernelHostsFailed:
+		case Converge, ReadAccounts, AccountsOverdue, AccountLookupsFailed, HostsReadFailed, KernelHostsFailed,
+			OpenBook, AdoptBook, ExpireBook, PruneBook:
 		}
 	}
 	return effects, nil

@@ -51,13 +51,6 @@ type Lookup struct {
 	Err   error
 }
 
-// AccountsWanted asks for a read of the accounts that the scopes of the
-// configuration name. During a read it asks for one more read after it.
-type AccountsWanted struct {
-	At            time.Time
-	Users, Groups []string
-}
-
 // AccountsRead is the result of the read ID: a lookup for each name
 // that the read asked for.
 type AccountsRead struct {
@@ -66,8 +59,7 @@ type AccountsRead struct {
 	Users, Groups map[string]Lookup
 }
 
-func (e AccountsWanted) at() time.Time { return e.At }
-func (e AccountsRead) at() time.Time   { return e.At }
+func (e AccountsRead) at() time.Time { return e.At }
 
 // ReadAccounts starts the read ID of the users and groups. Its result
 // is an AccountsRead with the same ID.
@@ -100,12 +92,21 @@ func (s State) AccountIDs() reconcile.Accounts {
 	return last.Value.IDs
 }
 
-// AccountsProblem returns the Problem of the account reads, if there is
-// one. The caller checks first that a scope names an account and that
-// there is a reader. It does not void enforcement: a scope that the
-// snapshot cannot resolve is dropped, and the policy then applies to all
-// traffic.
-func AccountsProblem(s State) (reconcile.Problem, bool) {
+// accountsProblem returns the Problem of the account snapshot, if there
+// is one: only when a scope of the configuration names an account. It
+// does not void enforcement: a scope that the snapshot cannot resolve is
+// dropped, and the policy then applies to all traffic.
+func accountsProblem(s State) (reconcile.Problem, bool) {
+	c, ok := s.Config().(Configured)
+	if !ok {
+		return reconcile.Problem{}, false
+	}
+	if users, groups := scopeNames(c.Active.Config.Policies); len(users) == 0 && len(groups) == 0 {
+		return reconcile.Problem{}, false
+	}
+	if s.noAccountReader {
+		return reconcile.Problem{Text: "there is no account reader, so each scoped policy applies to all traffic"}, true
+	}
 	last, done := s.accounts.Last()
 	overdue := s.accounts.overdue(s.now)
 	var text string
@@ -125,10 +126,16 @@ func AccountsProblem(s State) (reconcile.Problem, bool) {
 	return reconcile.Problem{Text: text}, true
 }
 
-// readAccounts starts a read of the names of the last AccountsWanted.
-// During a read it starts nothing: the next read starts when the read in
-// flight ends.
+// readAccounts starts a read of the accounts that the scopes of the
+// configuration name, also when they name none. Without a reader or a
+// configuration it starts nothing. During a read it starts nothing: the
+// next read starts when the read in flight ends, with the names of the
+// configuration at that time.
 func (s State) readAccounts(out []Effect) (State, []Effect) {
+	c, ok := s.Config().(Configured)
+	if !ok || s.noAccountReader {
+		return s, out
+	}
 	id := s.nextID + 1
 	o, started := s.accounts.Start(id)
 	s.accounts.Observed = o
@@ -136,7 +143,8 @@ func (s State) readAccounts(out []Effect) (State, []Effect) {
 		return s, out
 	}
 	s.nextID, s.accounts.deadline = id, s.now.Add(AccountReadTimeout)
-	return s, append(out, ReadAccounts{ID: id, Users: s.scope.users, Groups: s.scope.groups})
+	users, groups := scopeNames(c.Active.Config.Policies)
+	return s, append(out, ReadAccounts{ID: id, Users: users, Groups: groups})
 }
 
 // accountsOverdue tells that the read in flight passed its budget. A

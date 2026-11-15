@@ -1,61 +1,24 @@
 package daemon
 
 import (
-	"time"
+	"slices"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
-	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
-	"github.com/Nagato-Yuzuru/ifbound/internal/matcher"
+	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
-	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
-// State is the lifecycle state of the daemon.
-//
-// Starting goes to Ready, Degraded, or Unenforced. These three go to each
-// other. Only Ready and Degraded acknowledge reports. A daemon that
-// starts without a stored configuration is in Unenforced; when Apply then
-// gives it a configuration and the address book does not load, it goes
-// to Starting.
-type State uint8
+// State is the lifecycle state of the daemon. See core.Lifecycle for the
+// states and their moves.
+type State = core.Lifecycle
 
 // The lifecycle states. The zero State is StateStarting.
 const (
-	// StateStarting: the address book is not loaded. The daemon
-	// acknowledges no report. With a configuration, it loads the ruleset
-	// and adds the entries that need no address book, but it removes no
-	// table entry that blockable.New accepts.
-	StateStarting State = iota
-	// StateReady: the ruleset for the current configuration and
-	// interfaces is installed, and nothing reports a problem.
-	StateReady
-	// StateDegraded: the ruleset is installed, but a problem that does
-	// not void enforcement exists, such as a resolver conflict or a
-	// failed resolver write. Reports are acknowledged.
-	StateDegraded
-	// StateUnenforced: the ruleset for the current configuration and
-	// interfaces is not installed, or a problem voids it, such as a
-	// disabled firewall, or the daemon has no configuration. No report is
-	// acknowledged.
-	StateUnenforced
+	StateStarting   = core.Starting
+	StateReady      = core.Ready
+	StateDegraded   = core.Degraded
+	StateUnenforced = core.Unenforced
 )
-
-// String returns the lower-case state name: the value of the log
-// attribute logattr.EnforcementState.
-func (s State) String() string {
-	switch s {
-	case StateStarting:
-		return logattr.StateStarting
-	case StateReady:
-		return logattr.StateReady
-	case StateDegraded:
-		return logattr.StateDegraded
-	case StateUnenforced:
-		return logattr.StateUnenforced
-	default:
-		return logattr.StateUnknown
-	}
-}
 
 // Status is a read-only copy of the daemon state for a client such as
 // the CLI.
@@ -78,129 +41,23 @@ type Status struct {
 	Warnings []policy.Warning
 }
 
-// phase is the lifecycle state together with the facts it rests on. It
-// is one value, built only by the functions below, so the facts cannot
-// disagree: installed is set exactly in StateReady and StateDegraded.
-type phase struct {
-	state State
-	// installed is the ruleset ID that the last convergence installed for
-	// the current configuration and interfaces. A report is acknowledged
-	// only while the Backend still has this ruleset loaded.
-	installed string
-	reasons   []string
-}
-
-// waitPhase is a phase that does not acknowledge reports: it has no
-// installed ruleset. It is the phase of a mode without a book.
-type waitPhase struct {
-	state   State
-	reasons []string
-}
-
-// asPhase returns w as a phase without an installed ruleset.
-func (w waitPhase) asPhase() phase { return phase{state: w.state, reasons: w.reasons} }
-
-func startingPhase(reason string) waitPhase {
-	return waitPhase{state: StateStarting, reasons: []string{reason}}
-}
-
-// unconfiguredPhase is the phase of a daemon that has no configuration.
-// It does not converge, so it keeps the platform state that it found.
-func unconfiguredPhase(reason string) waitPhase {
-	return waitPhase{state: StateUnenforced, reasons: []string{reason}}
-}
-
-func unenforcedPhase(reason string) waitPhase {
-	return waitPhase{state: StateUnenforced, reasons: []string{reason}}
-}
-
-// convergedPhase is the phase after a convergence attempt.
-func convergedPhase(rep reconcile.Report, err error) phase {
-	var reasons []string
-	voids := false
-	for _, p := range rep.Problems {
-		reasons = append(reasons, p.Text)
-		voids = voids || p.Voids
+// statusOf returns the status of s. It costs one map lookup per policy,
+// so the loop can publish it at each pass.
+func statusOf(s core.State) Status {
+	p := core.PhaseOf(s)
+	st := Status{State: p.Lifecycle, Reasons: slices.Clone(p.Reasons)}
+	c, ok := s.Config().(core.Configured)
+	if !ok {
+		return st
 	}
-	if err != nil {
-		reasons = append(reasons, "convergence failed: "+err.Error())
+	st.Policies = len(c.Active.Config.Policies)
+	st.RetainRestart = c.Active.Config.AddrBook.Retain != s.Retain()
+	st.Config = c.Active.Digest
+	st.Warnings = slices.Clone(c.Active.Warnings)
+	if b, ok := c.Book.(core.BookLoaded); ok {
+		for _, pol := range c.Active.Config.Policies {
+			st.Addrs += b.Facts.Counts[pol.Name]
+		}
 	}
-	switch {
-	case rep.Installed == "" || voids:
-		return phase{state: StateUnenforced, reasons: reasons}
-	case len(reasons) > 0:
-		return phase{state: StateDegraded, installed: rep.Installed, reasons: reasons}
-	default:
-		return phase{state: StateReady, installed: rep.Installed}
-	}
-}
-
-// acks reports whether the phase acknowledges reports.
-func (p phase) acks() bool { return p.installed != "" }
-
-// mode is the lifecycle of the loop: exactly one of unconfiguredMode,
-// loadingMode, and runningMode. Only runningMode has a book, and only its
-// phase can have an installed ruleset.
-//
-//sumtype:decl
-type mode interface{ isMode() }
-
-// unconfiguredMode: the daemon has no configuration. It does not
-// converge, so it keeps the platform state that it found.
-type unconfiguredMode struct{ phase waitPhase }
-
-// loadingMode: the daemon has a configuration, but no load of the
-// address book succeeded yet. It converges add-only: without the book, a
-// removal could unblock an acknowledged address. Its phase does not
-// acknowledge reports.
-type loadingMode struct {
-	conf activeConfig
-	// retain is the retain of the book to load. The first configuration
-	// fixes it for the life of the daemon.
-	retain time.Duration
-	phase  waitPhase
-}
-
-// runningMode: the daemon has a configuration and the loaded address
-// book. It converges, and its phase can acknowledge reports.
-type runningMode struct {
-	conf activeConfig
-	// retain is the retain of book.
-	retain time.Duration
-	book   addrBook
-	phase  phase
-}
-
-func (unconfiguredMode) isMode() {}
-func (loadingMode) isMode()      {}
-func (runningMode) isMode()      {}
-
-// activeConfig is the configuration that the daemon uses, with what the
-// daemon derives from it. newActiveConfig builds it, and a new
-// configuration replaces it as a whole.
-type activeConfig struct {
-	cfg policy.Config
-	// digest is the digest of the stored file of cfg, or zero.
-	digest  configstore.Digest
-	matcher *matcher.Matcher
-	apexes  []policy.Domain
-	// upstream is the error of the upstream check for cfg, or nil.
-	upstream error
-	warnings []policy.Warning
-	// gen counts the configurations. A warm-up runs only under the
-	// configuration that it started with.
-	gen uint64
-}
-
-func newActiveConfig(cfg policy.Config, digest configstore.Digest, gen uint64) activeConfig {
-	m := matcher.New(cfg.Policies)
-	return activeConfig{
-		cfg:      cfg,
-		digest:   digest,
-		matcher:  m,
-		apexes:   m.Apexes(),
-		upstream: cfg.CheckUpstreams(),
-		warnings: cfg.Warnings(),
-		gen:      gen,
-	}
+	return st
 }

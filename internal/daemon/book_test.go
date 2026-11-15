@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
@@ -105,6 +107,67 @@ func TestDamagedLastRecordStaysBlocked(t *testing.T) {
 		heal()
 		if !h.hasEntry("web", netip.PrefixFrom(acked, 32)) {
 			t.Errorf("web table = %v, want the acked %v kept", h.world.Tables()["web"], acked)
+		}
+		if got := h.saved("web"); !slices.Contains(got, acked) {
+			t.Errorf("web in the book = %v, want %v adopted", got, acked)
+		}
+	})
+}
+
+// A torn book whose entries expired while the daemon was down, and an
+// adoption whose save fails: the daemon stays Starting with the save
+// error, and does not expire the book before the adoption. The next pass
+// adopts, and the daemon gets Ready.
+func TestFailedAdoptionOfABookWithExpiredEntriesKeepsStarting(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, configV1)
+		mustDo(t, h.observe(obs("www.example.net", "203.0.113.1")))
+		mustDo(t, h.observe(obs("www.example.net", "203.0.113.2")))
+		h.stop()
+		damageLastRecord(t, bookPath(h.snapshot))
+		time.Sleep(72 * time.Hour) // the fake clock of the bubble: the daemon is down for longer than the retain
+
+		var fail atomic.Bool
+		fail.Store(true)
+		h = launchHook(t, h.spec, func(d *daemon.Daemon) { d.SetBookFault(&fail) })
+		defer h.stop()
+		st := h.wantState(daemon.StateStarting)
+		if len(st.Reasons) != 1 || !strings.Contains(st.Reasons[0], "saving adopted entries") {
+			t.Errorf("reasons = %q, want the save error", st.Reasons)
+		}
+
+		fail.Store(false)
+		heal()
+		h.wantState(daemon.StateReady)
+	})
+}
+
+// The first open of a torn book repairs the cut write on disk, so a
+// later open of the book is not torn. After one failed adoption, the
+// next pass must still adopt: else the full convergence removes the
+// acknowledged address that the cut write held.
+func TestTornBookAdoptionRetryKeepsTheAckedAddress(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, configV1)
+		acked := netip.MustParseAddr("203.0.113.1")
+		mustDo(t, h.observe(obs("www.example.net", acked.String())))
+		h.stop()
+		damageLastRecord(t, bookPath(h.snapshot))
+
+		var fail atomic.Bool
+		fail.Store(true)
+		h = launchHook(t, h.spec, func(d *daemon.Daemon) { d.SetBookFault(&fail) })
+		defer h.stop()
+		h.wantState(daemon.StateStarting)
+		if !h.hasEntry("web", netip.PrefixFrom(acked, 32)) {
+			t.Fatalf("web table = %v: the add-only pass removed the acked %v", h.world.Tables()["web"], acked)
+		}
+
+		fail.Store(false)
+		heal()
+		h.wantState(daemon.StateReady)
+		if !h.hasEntry("web", netip.PrefixFrom(acked, 32)) {
+			t.Errorf("web table = %v: the acked %v left the table after the retry", h.world.Tables()["web"], acked)
 		}
 		if got := h.saved("web"); !slices.Contains(got, acked) {
 			t.Errorf("web in the book = %v, want %v adopted", got, acked)

@@ -6,7 +6,8 @@
 // change. Other goroutines talk to it only through requests with a reply
 // channel, so its state needs no lock. It holds the address book (see
 // addrstore) and calls it synchronously; the committer goroutine of the
-// book writes it.
+// book writes it. The decisions, the phase, and the timers are in
+// core.Step and core.PhaseOf; the loop runs their effects (see drive).
 //
 // Every event that can change the desired state ends in the same
 // convergence. Crash recovery, an external flush, and a configuration
@@ -61,20 +62,20 @@ import (
 const (
 	// SelfHealInterval is the period of the convergence that repairs
 	// external changes, such as a flushed table.
-	SelfHealInterval = 5 * time.Second
+	SelfHealInterval = core.SelfHealInterval
 	// InterfaceDebounce is the delay from the first interface change to
 	// the convergence. Changes inside the delay share that convergence.
-	InterfaceDebounce = 500 * time.Millisecond
+	InterfaceDebounce = core.InterfaceDebounce
 )
 
 // Errors of the request methods.
 var (
 	// ErrNotReady rejects a report while the daemon is in StateStarting.
-	ErrNotReady = errors.New("daemon: not ready")
+	ErrNotReady = core.ErrNotReady
 	// ErrUnenforced rejects a report while the installed enforcement is
 	// missing or void: in StateUnenforced, or when the loaded ruleset is
 	// not the installed one.
-	ErrUnenforced = errors.New("daemon: enforcement not installed")
+	ErrUnenforced = core.ErrUnenforced
 	// ErrStopped means Run has returned.
 	ErrStopped = errors.New("daemon: stopped")
 	// ErrAlreadyRunning is the error of a second Run call.
@@ -199,7 +200,7 @@ func New(cfg Config) *Daemon {
 		done:     make(chan struct{}),
 		probes:   make(map[string]*probeWait),
 	}
-	d.status.Store(&Status{State: StateStarting, Reasons: []string{reasonNotLoaded}})
+	d.status.Store(&Status{State: StateStarting, Reasons: []string{core.ReasonNotLoaded}})
 	return d
 }
 
@@ -315,51 +316,32 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Before done closes, so that a new daemon can open the book.
 	defer l.closeBook()
 	l.loadStored(ctx)
-	heal := time.NewTicker(SelfHealInterval)
-	defer heal.Stop()
-	expiry := time.NewTimer(0) // armExpiry sets it before the first select
-	defer expiry.Stop()
 	wake := time.NewTimer(0) // armWake sets it before the first select
 	defer wake.Stop()
-	var debounce <-chan time.Time
 	changes := d.cfg.Platform.Inventory.Changes()
 
-	_ = l.reconcile(ctx, logattr.TriggerStart) //nolint:errcheck // the phase holds the outcome
-	l.wantAccounts(ctx)
 	for {
 		if l.pending != "" {
-			_ = l.reconcile(ctx, l.pending) //nolint:errcheck // the phase holds the outcome
+			_ = l.converge(ctx, l.pending) //nolint:errcheck // the phase holds the outcome
 		}
-		l.armExpiry(expiry)
 		l.armWake(wake)
 		warm.sync(ctx, l)
-		l.publish()
+		l.publish(ctx)
 		select {
 		case <-ctx.Done():
 			return nil
 		case req := <-d.requests:
 			req(ctx, l)
 		case <-changes:
-			if debounce == nil {
-				debounce = time.After(InterfaceDebounce)
-			}
-		case <-debounce:
-			debounce = nil
-			_ = l.reconcile(ctx, logattr.TriggerInterfaces) //nolint:errcheck // the phase holds the outcome
-		case <-heal.C:
-			l.wantAccounts(ctx)
-			_ = l.reconcile(ctx, logattr.TriggerSelfHeal) //nolint:errcheck // the phase holds the outcome
-		case <-expiry.C:
-			l.expire(ctx)
+			l.drive(ctx, core.InterfacesChanged{At: time.Now()})
 		case r := <-l.accountResults:
 			r.At = time.Now()
 			l.drive(ctx, r)
 		case now := <-wake.C:
 			l.drive(ctx, core.Tick{At: now})
 		case <-warm.results:
-			if l.selfTestResult(warm.result()) {
-				_ = l.reconcile(ctx, logattr.TriggerSelfTest) //nolint:errcheck // the phase holds the outcome
-			}
+			r := warm.result()
+			l.drive(ctx, core.SelfTestResult{At: time.Now(), Proved: r.proved, Missed: r.missed})
 		}
 	}
 }
@@ -489,7 +471,7 @@ func call[R any](ctx context.Context, d *Daemon, f func(context.Context, *loop) 
 	reply := make(chan R, 1)
 	req := func(loopCtx context.Context, l *loop) {
 		r := f(loopCtx, l)
-		l.publish()
+		l.publish(loopCtx)
 		reply <- r
 	}
 	var zero R
