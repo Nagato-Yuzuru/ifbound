@@ -16,7 +16,16 @@ IFBOUND_VM_IMAGE = "ghcr.io/cirruslabs/macos-golden-gate-base@sha256:5302a9ea6cd
 [tasks."e2e:build"]
 description = "Compile the end-to-end test binary for darwin, on the architecture of this host"
 env = { GOOS = "darwin", CGO_ENABLED = "0" }
-run = "go test -c -tags e2e -o bin/e2e.test ./e2e"
+# The binary name holds the first 16 hex digits of its sha256. Each build has a
+# new path, so a cache of the guest share cannot serve old content for it.
+# The task removes older binaries, so that exactly one bin/e2e-*.test exists.
+run = '''
+set -eu
+go test -c -tags e2e -o bin/e2e.tmp ./e2e
+sum=$(shasum -a 256 bin/e2e.tmp | cut -c1-16)
+rm -f bin/e2e-*.test
+mv -f bin/e2e.tmp "bin/e2e-$sum.test"
+'''
 
 [tasks.e2e]
 description = "Run end-to-end tests as root on this host. They run only where /var/db/ifbound-e2e-disposable exists (CI, VM)"
@@ -26,9 +35,10 @@ depends = ["e2e:build"]
 # job. Thus a test that hangs fails with the stacks of all goroutines, and
 # the job keeps the log.
 run = '''
+set -eu
 sudo env \
   IFBOUND_E2E_STRICT="${IFBOUND_E2E_STRICT:-}" \
-  ./bin/e2e.test -test.v -test.timeout=10m
+  bin/e2e-*.test -test.v -test.timeout=10m
 '''
 
 [tasks."vm:e2e"]
@@ -39,7 +49,16 @@ usage = 'arg "[vm]" help="Name of the tart guest" default="ifbound-e2e"'
 # `tart exec` needs. The guest sees the repository read-only at /Volumes/My
 # Shared Files/ifbound.
 run = '''
+set -eu
 vm="${usage_vm}"
+set -- bin/e2e-*.test
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+  echo "want exactly one bin/e2e-*.test, found: $*. Run: mise run e2e:build" >&2
+  exit 1
+fi
+bin=$1
+want=$(shasum -a 256 < "$bin")
+want=${want%% *}
 if ! tart list --quiet --source local | grep -qx "$vm"; then
   tart clone "$IFBOUND_VM_IMAGE" "$vm"
 fi
@@ -58,11 +77,25 @@ if ! tart exec "$vm" true 2>/dev/null; then
 fi
 # The marker tells the tests that this guest is disposable.
 tart exec "$vm" sudo touch /var/db/ifbound-e2e-disposable
+# The guest reads the binary through a share that can serve old content. A
+# stale read gives another hash: stop before the run.
+guest_bin="/Volumes/My Shared Files/ifbound/$bin"
+if ! got=$(tart exec "$vm" shasum -a 256 "$guest_bin" 2>&1); then
+  echo "guest cannot read $bin through its share: $got" >&2
+  echo "The guest may run from another worktree. Stop it and run this task again." >&2
+  exit 1
+fi
+got=${got%% *}
+if [ "$got" != "$want" ]; then
+  echo "guest reads $bin with sha256 $got, host built $want" >&2
+  exit 1
+fi
+echo "guest runs $bin (sha256 $want)"
 # The guest agent's PATH does not include /sbin, where ifconfig and pfctl are.
 tart exec "$vm" sudo env \
   PATH=/usr/bin:/bin:/usr/sbin:/sbin \
   IFBOUND_E2E_STRICT=1 \
-  "/Volumes/My Shared Files/ifbound/bin/e2e.test" -test.v -test.timeout=10m
+  "$guest_bin" -test.v -test.timeout=10m
 '''
 
 # The semconv version lives in telemetry/manifest.yaml only. The task reads

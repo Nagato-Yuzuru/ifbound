@@ -227,7 +227,7 @@ const rulesAnchor = "com.apple/900.ifbound-e2e-pf"
 // The benchmarks compare each operation with the pfctl command that it
 // replaces. Run them in the guest:
 //
-//	e2e.test -test.run '^$' -test.bench 'Pf' -test.benchmem
+//	bin/e2e-*.test -test.run '^$' -test.bench 'Pf' -test.benchmem
 
 func BenchmarkPfAddAddrs(b *testing.B) {
 	h := openPf(b)
