@@ -509,6 +509,27 @@ func TestRequestAfterCloseFails(t *testing.T) {
 	}
 }
 
+// A symbolic link at the lock name makes Open fail, also when the link
+// points to a file inside the book directory.
+func TestOpenRefusesLockSymlink(t *testing.T) {
+	path := bookDir(t)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "target"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("target", filepath.Join(path, lockName)); err != nil {
+		t.Fatal(err)
+	}
+	if s, err := Open(path, "", retain); err == nil {
+		_ = s.Close() //nolint:errcheck // the test fails already
+		t.Fatal("Open with a symbolic link as lock file = nil, want an error")
+	} else if errors.Is(err, ErrLocked) {
+		t.Errorf("Open = %v, want an error that is not ErrLocked", err)
+	}
+}
+
 // Only one Store at a time holds a book.
 func TestSecondOpenIsLocked(t *testing.T) {
 	path := bookDir(t)
