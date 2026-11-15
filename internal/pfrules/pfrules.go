@@ -61,10 +61,11 @@
 //
 // A policy with a scope gets one block rule for its users and one for its
 // groups, with numeric IDs from the account snapshot. pfctl takes no ID
-// above maxID as a number, so an account with such an ID (for example
-// nobody, -2) becomes the range "> maxID". The range also matches the
-// other IDs in it, which is stricter than the scope. When the snapshot
-// does not know a name, the policy loses its scope: it then applies to
+// above maxID as a number, so an account with an ID above noOwnerID (for
+// example nobody, -2) becomes the range "> maxID". The range also matches
+// the other IDs in it, which is stricter than the scope. No rule can
+// match noOwnerID itself. When the snapshot does not know a name, or an
+// account has noOwnerID, the policy loses its scope: it then applies to
 // all traffic (fail closed), and the ruleset reports it as a problem. pf
 // finds the socket owner of TCP and UDP packets only, so a
 // scoped policy does not apply to other protocols, such as ICMP, and not
@@ -111,8 +112,13 @@ const (
 	loopback = "lo0"
 	// maxID is the largest uid and gid that pfctl accepts as a number:
 	// it refuses UID_MAX (2^31 - 1) and above, for example nobody (-2).
-	// A larger ID goes into a rule as the range "> maxID".
+	// An ID above noOwnerID goes into a rule as the range "> maxID".
 	maxID = 1<<31 - 2
+	// noOwnerID is UID_MAX. pf uses it as the owner of a socket that has
+	// no owner, and its match function never matches it against a range
+	// (pf_match_uid and pf_match_gid in bsd/net/pf.c of xnu). No rule can
+	// match this ID, so a scope that lists it cannot work.
+	noOwnerID = maxID + 1
 )
 
 var (
@@ -177,11 +183,17 @@ func policyRules(p policy.Policy, ifaces []reconcile.Interface, accounts reconci
 	if !validName(p.Name) {
 		return nil, nil, "", errName
 	}
-	owners, unresolved := ownerMatches(p.Scope, accounts)
+	owners, unknown, unmatchable := ownerMatches(p.Scope, accounts)
 	var problem string
-	if len(unresolved) > 0 {
-		problem = fmt.Sprintf("policy %s applies to all traffic: its scope is dropped, because these accounts are unknown: %s",
-			p.Name, strings.Join(unresolved, ", "))
+	if len(unknown) > 0 || len(unmatchable) > 0 {
+		var reasons []string
+		if len(unknown) > 0 {
+			reasons = append(reasons, "these accounts are unknown: "+strings.Join(unknown, ", "))
+		}
+		if len(unmatchable) > 0 {
+			reasons = append(reasons, "pf cannot match the ID 2147483647 of these accounts: "+strings.Join(unmatchable, ", "))
+		}
+		problem = fmt.Sprintf("policy %s applies to all traffic: its scope is dropped, because %s", p.Name, strings.Join(reasons, "; "))
 	}
 	to := " to " + table(p.Name)
 	var rules []string
@@ -248,13 +260,15 @@ func onlyViaRules(name policy.Name, allowed []string, ifaces []reconcile.Interfa
 // one part for its users and one for its groups, so a socket is in the
 // scope when its owner or the primary group of its owner is listed.
 //
-// When the accounts do not know a name, ownerMatches returns one empty
-// part, as for an unlimited scope, and the unknown names, sorted.
-func ownerMatches(s policy.Scope, accounts reconcile.Accounts) ([]string, []string) {
+// When the accounts do not know a name, or a name has the ID noOwnerID,
+// ownerMatches returns one empty part, as for an unlimited scope. It also
+// returns the unknown names and the names with noOwnerID, each list
+// sorted. A scope without those names would block the sockets of the
+// other accounts only, so the whole scope goes (fail closed).
+func ownerMatches(s policy.Scope, accounts reconcile.Accounts) (parts, unknown, unmatchable []string) {
 	if !s.Limited() {
-		return []string{""}, nil
+		return []string{""}, nil, nil
 	}
-	var parts, unresolved []string
 	for _, kind := range []struct {
 		keyword string
 		names   []policy.Account
@@ -263,21 +277,25 @@ func ownerMatches(s policy.Scope, accounts reconcile.Accounts) ([]string, []stri
 		var ids []uint32
 		for _, a := range kind.names {
 			id, ok := kind.ids[a.String()]
-			if !ok {
-				unresolved = append(unresolved, fmt.Sprintf("%s %q", kind.keyword, a))
-				continue
+			switch {
+			case !ok:
+				unknown = append(unknown, fmt.Sprintf("%s %q", kind.keyword, a))
+			case id == noOwnerID:
+				unmatchable = append(unmatchable, fmt.Sprintf("%s %q", kind.keyword, a))
+			default:
+				ids = append(ids, id)
 			}
-			ids = append(ids, id)
 		}
 		if len(ids) > 0 {
 			parts = append(parts, " "+kind.keyword+" "+idList(ids))
 		}
 	}
-	if len(unresolved) > 0 {
-		slices.Sort(unresolved)
-		return []string{""}, unresolved
+	if len(unknown) > 0 || len(unmatchable) > 0 {
+		slices.Sort(unknown)
+		slices.Sort(unmatchable)
+		return []string{""}, unknown, unmatchable
 	}
-	return parts, nil
+	return parts, nil, nil
 }
 
 // resolve returns the sorted names of the interfaces that sels select.

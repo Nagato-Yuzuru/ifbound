@@ -32,10 +32,11 @@ var pppHost = append(slices.Clone(hostIfaces), reconcile.Uncertain("ppp0", polic
 
 // hostAccounts is the account snapshot of the tests. nobody has the ID
 // -2, as on macOS, which pfctl does not take as a number. alias shares the
-// uid of _buildbot.
+// uid of _buildbot. uidmax and gidmax have UID_MAX, which no pf range
+// matches.
 var hostAccounts = reconcile.Accounts{
-	Users:  map[string]uint32{"root": 0, "daemon": 1, "_www": 70, "_buildbot": 299, "alias": 299, "nobody": 4294967294},
-	Groups: map[string]uint32{"wheel": 0, "daemon": 1, "staff": 20, "nobody": 4294967294},
+	Users:  map[string]uint32{"root": 0, "daemon": 1, "_www": 70, "_buildbot": 299, "alias": 299, "nobody": 4294967294, "uidmax": 2147483647},
+	Groups: map[string]uint32{"wheel": 0, "daemon": 1, "staff": 20, "nobody": 4294967294, "gidmax": 2147483647},
 }
 
 // rfcExample is the policy part of the RFC example configuration.
@@ -173,6 +174,45 @@ anchor "tag.p" out on { "utun4" "utun5" } to <"p"> tag "ifbound.p"
 block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p" user { > 2147483646 }
 block return-icmp(port-unr, port-unr) out quick on ! lo0 to <"p"> ! tagged "ifbound.p" group { 20 > 2147483646 }
 `,
+	},
+	{
+		name: "the ID UID_MAX drops the scope, as an unknown name does",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\ndeny_via = [\"en0\"]\nscope = { users = [\"root\", \"uidmax\"], groups = [\"gidmax\", \"ghost\"] }\n" +
+			"[[policy]]\nname = \"q\"\nto = [\"b.com\"]\ndeny_via = [\"en0\"]\nscope = { users = [\"root\"] }\n",
+		ifaces: hostIfaces,
+		want: `table <"p"> persist
+table <"q"> persist
+block return-icmp(port-unr, port-unr) out quick on { "en0" } to <"p">
+block return-icmp(port-unr, port-unr) out quick on { "en0" } to <"q"> user { 0 }
+`,
+		problems: []string{`policy p applies to all traffic: its scope is dropped, because these accounts are unknown: group "ghost"; pf cannot match the ID 2147483647 of these accounts: group "gidmax", user "uidmax"`},
+	},
+	{
+		name:   "the ID UID_MAX of a user alone drops the scope",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\ndeny_via = [\"en0\"]\nscope = { users = [\"uidmax\"] }\n",
+		ifaces: hostIfaces,
+		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "en0" } to <"p">
+`,
+		problems: []string{`policy p applies to all traffic: its scope is dropped, because pf cannot match the ID 2147483647 of these accounts: user "uidmax"`},
+	},
+	{
+		name:   "the ID UID_MAX of a user next to a known user drops the scope",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\ndeny_via = [\"en0\"]\nscope = { users = [\"root\", \"uidmax\"] }\n",
+		ifaces: hostIfaces,
+		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "en0" } to <"p">
+`,
+		problems: []string{`policy p applies to all traffic: its scope is dropped, because pf cannot match the ID 2147483647 of these accounts: user "uidmax"`},
+	},
+	{
+		name:   "the ID UID_MAX of a group alone drops the scope",
+		config: "[[policy]]\nname = \"p\"\nto = [\"a.com\"]\ndeny_via = [\"en0\"]\nscope = { groups = [\"gidmax\"] }\n",
+		ifaces: hostIfaces,
+		want: `table <"p"> persist
+block return-icmp(port-unr, port-unr) out quick on { "en0" } to <"p">
+`,
+		problems: []string{`policy p applies to all traffic: its scope is dropped, because pf cannot match the ID 2147483647 of these accounts: group "gidmax"`},
 	},
 	{
 		name:   "dropped scope on deny_via without a denied interface: no rule, still reported",

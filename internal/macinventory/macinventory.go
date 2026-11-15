@@ -9,8 +9,8 @@
 // that the kernel gives for SIOCGIFTYPE. The driver that makes the
 // interface sets the family:
 //
-//   - @tunnel: a point-to-point interface of the family utun, ipsec, or
-//     gif. utun carries VPN clients and WireGuard. A packet that goes into
+//   - @tunnel: a point-to-point interface of the family utun or ipsec.
+//     utun carries VPN clients and WireGuard. A packet that goes into
 //     such an interface leaves the host only inside a new packet, and pf
 //     checks that new packet on its own interface. The type is not
 //     enough: utun has the type IFT_OTHER, and the kernel gives IFT_OTHER
@@ -42,10 +42,14 @@
 //   - stf (6to4) sends IPv6 packets inside IPv4 packets to a public relay.
 //     That is a tunnel but not a VPN, so only_via = ["@tunnel"] must not
 //     allow it.
-//   - The cellular interface pdp_ip, and the redirect interface rd. rd
-//     sends its packets to a delegate interface, which can be a cellular,
-//     Ethernet, utun, or ipsec interface (bsd/net/if_redirect.c), and pf
-//     sees only rd.
+//   - gif (generic tunnel) carries the same cleartext tunnel traffic as
+//     stf. It is not a VPN, so only_via = ["@tunnel"] must not allow it.
+//     gif0 exists on macOS by default.
+//   - The cellular interface pdp_ip, and the redirect interface rd in
+//     cellular mode. rd sends its packets to a delegate interface, which
+//     can be a cellular, Ethernet, utun, or ipsec interface
+//     (bsd/net/if_redirect.c), and pf sees only rd. In Ethernet mode, rd
+//     is @hardware.
 //   - An interface with a combination of the properties above that this
 //     package does not know, or with an unknown type or family, for
 //     example FireWire or an interface of a driver outside xnu. A block
@@ -300,7 +304,7 @@ func classify(l link) reconcile.Interface {
 	// of a certain class stays uncertain.
 	case l.family == familyPPP || l.typ == unix.IFT_PPP:
 		return reconcile.Uncertain(l.name, policy.ClassHardware, policy.ClassTunnel)
-	case p2p && slices.Contains([]int{familyUTUN, familyIPSEC, familyGIF}, l.family):
+	case p2p && slices.Contains([]int{familyUTUN, familyIPSEC}, l.family):
 		return reconcile.Interface{Name: l.name, Class: policy.ClassTunnel}
 	case !p2p && slices.Contains([]int{unix.IFT_ETHER, unix.IFT_L2VLAN, unix.IFT_IEEE8023ADLAG, unix.IFT_BRIDGE}, l.typ):
 		return reconcile.Interface{Name: l.name, Class: policy.ClassHardware}
