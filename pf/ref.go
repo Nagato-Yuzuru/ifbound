@@ -4,13 +4,22 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
 )
 
 var errStartRef = errors.New("the kernel returned no token")
+
+// pfiocTokens is struct pfioc_tokens. cgo cannot name its union of
+// pointers, so this struct is by hand. Buf is a typed pointer: the compiler
+// sees the reference, keeps the buffer alive, and a stack move updates the
+// pointer. The test TestLayout checks the layout against the C struct.
+type pfiocTokens struct {
+	Size int32
+	_    [4]byte
+	Buf  *byte
+}
 
 // Ref is a reference to pf. While a Ref exists, pf stays enabled.
 type Ref struct {
@@ -96,14 +105,8 @@ func (h *Handle) refsSize() (int, error) {
 // readRefs fills buf with the list of references and returns the number
 // of bytes that it wrote.
 func (h *Handle) readRefs(buf []byte) (int, error) {
-	io := pfiocTokens{Size: int32(len(buf))}
-	// The union of the struct holds a pointer. The pointer is in a byte
-	// array, so KeepAlive holds buf for the GC. Go does not move heap
-	// memory.
-	binary.NativeEndian.PutUint64(io.U[:], uint64(uintptr(unsafe.Pointer(&buf[0]))))
-	err := h.ioctl(diocGetStarters, unsafe.Pointer(&io))
-	runtime.KeepAlive(buf)
-	if err != nil {
+	io := pfiocTokens{Size: int32(len(buf)), Buf: &buf[0]}
+	if err := h.ioctl(diocGetStarters, unsafe.Pointer(&io)); err != nil {
 		return 0, refsErr(err)
 	}
 	return int(io.Size), nil

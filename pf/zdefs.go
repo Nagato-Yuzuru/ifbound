@@ -80,11 +80,6 @@ type pfiocRemoveToken struct {
 	Value    uint64
 	Refcount uint64
 }
-type pfiocTokens struct {
-	Size      int32
-	Pad_cgo_0 [4]byte
-	U         [8]byte
-}
 
 const (
 	sizeofPfRule         = 0x410
@@ -104,6 +99,10 @@ const (
 	offTokenPid       = 0x10
 	offTokenProcName  = 0x14
 	tokenProcNameSize = 0x40
+
+	sizeofPfiocTokens = 0x10
+	offTokensSize     = 0x0
+	offTokensBuf      = 0x8
 )
 
 const (
