@@ -32,6 +32,12 @@ enum {
 	offTokenTimestamp = offsetof(struct pfioc_token, timestamp),
 	offTokenPid = offsetof(struct pfioc_token, pid),
 	offTokenProcName = offsetof(struct pfioc_token, proc_name),
+
+	// struct pfioc_tokens holds a union of pointers, which -godefs turns
+	// into bytes. ref.go declares the struct by hand with a typed pointer.
+	sizeofPfiocTokens = sizeof(struct pfioc_tokens),
+	offTokensSize = offsetof(struct pfioc_tokens, size),
+	offTokensBuf = offsetof(struct pfioc_tokens, pgt_buf),
 };
 */
 import "C"
@@ -45,7 +51,6 @@ type pfiocStateAddrKill C.struct_pfioc_state_addr_kill
 type pfiocStateKill C.struct_pfioc_state_kill
 type pfStatus C.struct_pf_status
 type pfiocRemoveToken C.struct_pfioc_remove_token
-type pfiocTokens C.struct_pfioc_tokens
 
 const (
 	sizeofPfRule         = C.sizeofPfRule
@@ -65,6 +70,10 @@ const (
 	offTokenPid       = C.offTokenPid
 	offTokenProcName  = C.offTokenProcName
 	tokenProcNameSize = C.PFTOK_PROCNAME_LEN
+
+	sizeofPfiocTokens = C.sizeofPfiocTokens
+	offTokensSize     = C.offTokensSize
+	offTokensBuf      = C.offTokensBuf
 )
 
 const (

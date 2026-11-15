@@ -49,6 +49,15 @@ func TestLayout(t *testing.T) {
 	if got := unsafe.Sizeof(pfiocRule{}); got != sizeofPfiocRule {
 		t.Errorf("pfiocRule has size %d, C has %d", got, sizeofPfiocRule)
 	}
+	if got := unsafe.Sizeof(pfiocTokens{}); got != sizeofPfiocTokens {
+		t.Errorf("pfiocTokens has size %d, C has %d", got, sizeofPfiocTokens)
+	}
+	if got := unsafe.Offsetof(pfiocTokens{}.Size); got != offTokensSize {
+		t.Errorf("pfiocTokens.Size is at %d, C has %d", got, offTokensSize)
+	}
+	if got := unsafe.Offsetof(pfiocTokens{}.Buf); got != offTokensBuf {
+		t.Errorf("pfiocTokens.Buf is at %d, C has %d", got, offTokensBuf)
+	}
 	if offIocRuleRule+sizeofPfRule != sizeofPfiocRule {
 		t.Errorf("struct pf_rule is not the last field of struct pfioc_rule")
 	}
