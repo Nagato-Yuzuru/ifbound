@@ -19,7 +19,10 @@ import (
 // of a compiled ruleset refer to.
 //
 // Every call that takes a context honors it and finishes in bounded time.
-// The daemon calls them from one goroutine and waits for each one.
+// The daemon calls the Backend through a Guard: the methods of Adder run
+// concurrently with each other, and every other call runs alone. The
+// daemon calls the other parts from one goroutine and waits for each
+// one.
 
 // Interface is one network interface in an inventory snapshot. Its class
 // is certain, uncertain, or absent:
@@ -219,18 +222,13 @@ type BackendState struct {
 //   - AddEntries and RemoveEntries refuse a batch with an invalid entry,
 //     for example the zero netip.Prefix. They return an error and change
 //     nothing.
+//   - The methods of Adder are safe for concurrent use with each other.
 type Backend interface {
+	Adder
 	// Read returns the actual state. It writes nothing.
 	Read(ctx context.Context) (BackendState, error)
-	// LoadedID returns the ID of the loaded ruleset, or "" when none is
-	// loaded. It is the cheap part of Read: the daemon calls it for every
-	// report that matches a policy.
-	LoadedID(ctx context.Context) (string, error)
 	// Load installs the ruleset.
 	Load(ctx context.Context, rs Ruleset) error
-	// AddEntries adds entries to the table of a policy. It creates the
-	// table when it is missing.
-	AddEntries(ctx context.Context, table policy.Name, entries []netip.Prefix) error
 	// RemoveEntries removes entries from the table of a policy.
 	RemoveEntries(ctx context.Context, table policy.Name, entries []netip.Prefix) error
 	// DropTable removes the table of a policy and all its entries.

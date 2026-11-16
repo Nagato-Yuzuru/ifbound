@@ -80,7 +80,7 @@ only_via = ["en0"]
 `)
 
 	for pass := range 2 {
-		if _, err := f.rec.Converge(t.Context(), f.inputs()); !errors.Is(err, errUnmanaged) {
+		if _, _, err := f.rec.Converge(t.Context(), f.inputs()); !errors.Is(err, errUnmanaged) {
 			t.Fatalf("pass %d: err = %v, want errUnmanaged", pass, err)
 		}
 		checkResolver(t, f.world, f.cfg.DNS.Listen, canary, "vpn.test", "zzz.provider.test")
@@ -174,7 +174,7 @@ only_via = ["en0"]
 	var last string
 	for i, s := range steps {
 		s.do(t)
-		rep, err := f.rec.Converge(t.Context(), f.inputs())
+		rep, _, err := f.rec.Converge(t.Context(), f.inputs())
 		if !errors.Is(err, s.wantErr) {
 			t.Fatalf("%s: err = %v, want %v", s.name, err, s.wantErr)
 		}
@@ -221,7 +221,7 @@ func TestConvergeReportsNoResolverDigestWhenTheReadFails(t *testing.T) {
 	f := installV1(t)
 	f.rec.Resolver = &seenResolver{SysResolver: f.world.Resolver(), shadowed: []policy.Domain{mustDomain(t, "www.example.com")}, fail: true}
 
-	rep, err := f.rec.Converge(t.Context(), f.inputs())
+	rep, _, err := f.rec.Converge(t.Context(), f.inputs())
 
 	if !errors.Is(err, errRead) {
 		t.Fatalf("err = %v, want errRead", err)

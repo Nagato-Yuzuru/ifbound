@@ -116,7 +116,7 @@ func enforce(t *testing.T) {
 	b := pfbackend.New(pfbackend.Exec{Path: pfbackend.Path}, dev, time.Now, slog.New(slog.DiscardHandler))
 	rec := reconcile.Reconciler{
 		Compiler:  pfrules.Compiler{},
-		Backend:   b,
+		Guard:     reconcile.NewGuard(b),
 		Resolver:  hostResolver(),
 		Inventory: reconciletest.NewInventory(),
 	}
@@ -126,7 +126,7 @@ func enforce(t *testing.T) {
 		Apexes:   []policy.Domain{apex},
 		Listen:   netip.MustParseAddrPort("127.0.0.1:10053"),
 	}
-	if _, err := rec.Converge(t.Context(), in); err != nil {
+	if _, _, err := rec.Converge(t.Context(), in); err != nil {
 		t.Fatalf("Converge: %v", err)
 	}
 	if got := pfctlStdout(t, "-a", pfbackend.Anchor, "-sT"); !strings.Contains(got, "e2e-td") {

@@ -245,7 +245,7 @@ func newResolverModel(t *testing.T, seed uint64) *resolverModel {
 	w.SetResolverDelay(m.delay)
 	m.rec = reconcile.Reconciler{
 		Compiler:  reconciletest.Compiler{},
-		Backend:   w.Backend(),
+		Guard:     reconcile.NewGuard(w.Backend()),
 		Resolver:  m.probe,
 		Inventory: reconciletest.NewInventory(en0),
 	}
@@ -341,7 +341,7 @@ func (m *resolverModel) step(t *testing.T, failP float64) bool {
 	m.probe.reset(failP, settleP)
 	worldBefore := m.world.Writes()
 
-	c.report, c.err = m.rec.Converge(t.Context(), m.inputs())
+	c.report, _, c.err = m.rec.Converge(t.Context(), m.inputs())
 
 	c.worldWrites = m.world.Writes() - worldBefore
 	c.after = servers(m.world)

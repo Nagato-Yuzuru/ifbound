@@ -188,7 +188,7 @@ func pvStack(t *testing.T, timeout time.Duration) (*handler, *pvCounter, *reconc
 		// A missing host file: the test does not read the host file of the machine.
 		Hosts: hostsfs.Reader{Path: filepath.Join(t.TempDir(), "hosts")},
 		Platform: reconcile.Reconciler{
-			Compiler: reconciletest.Compiler{}, Backend: world.Backend(), Resolver: world.Resolver(),
+			Compiler: reconciletest.Compiler{}, Guard: reconcile.NewGuard(world.Backend()), Resolver: world.Resolver(),
 			Inventory: reconciletest.NewInventory(reconcile.Interface{Name: "en0", Class: policy.ClassHardware}),
 		},
 		Lookup: mdns,

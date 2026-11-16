@@ -658,13 +658,13 @@ func TestPfBackendRepairsNegatedEntryInsideAPrefix(t *testing.T) {
 	}
 	rec := reconcile.Reconciler{
 		Compiler:  pfrules.Compiler{},
-		Backend:   b,
+		Guard:     reconcile.NewGuard(b),
 		Resolver:  reconciletest.NewWorld().Resolver(),
 		Inventory: reconciletest.NewInventory(),
 	}
 	converge := func() {
 		t.Helper()
-		if _, err := rec.Converge(t.Context(), reconcile.Inputs{Policies: cfg.Policies, Book: noAddrs{}}); err != nil {
+		if _, _, err := rec.Converge(t.Context(), reconcile.Inputs{Policies: cfg.Policies, Book: noAddrs{}}); err != nil {
 			t.Fatalf("Converge: %v", err)
 		}
 	}

@@ -44,14 +44,14 @@ func TestReconcileEndsStatesWhenAllowedUTUNGoesAway(t *testing.T) {
 
 	rec := reconcile.Reconciler{
 		Compiler:  pfrules.Compiler{},
-		Backend:   b,
+		Guard:     reconcile.NewGuard(b),
 		Resolver:  reconciletest.NewWorld().Resolver(),
 		Inventory: inv,
 	}
 	var in reconcile.Inputs
 	converge := func(t *testing.T) reconcile.Report {
 		t.Helper()
-		rep, err := rec.Converge(t.Context(), in)
+		rep, _, err := rec.Converge(t.Context(), in)
 		if err != nil {
 			t.Fatalf("Converge: %v", err)
 		}

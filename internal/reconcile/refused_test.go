@@ -41,9 +41,9 @@ func TestConvergeRemovesRefusedKernelEntryWhenLoadFails(t *testing.T) {
 		"ads":  {"::1/128", "::/128"},
 		"gone": {"127.0.0.53/32", "203.0.113.9/32"},
 	})
-	f.rec.Backend = failingLoad{f.world.Backend()}
+	f.rec.Guard = reconcile.NewGuard(failingLoad{f.world.Backend()})
 
-	_, err := f.rec.Converge(t.Context(), f.inputs())
+	_, _, err := f.rec.Converge(t.Context(), f.inputs())
 
 	if !errors.Is(err, reconciletest.ErrInjected) {
 		t.Fatalf("Converge = %v, want ErrInjected", err)
@@ -133,7 +133,7 @@ func TestConvergeRefusesZeroAddrBeforeAnyBackendWrite(t *testing.T) {
 			in := f.inputs()
 			tt.set(&in)
 
-			rep, err := f.rec.Converge(t.Context(), in)
+			rep, _, err := f.rec.Converge(t.Context(), in)
 
 			if !errors.Is(err, blockable.ErrZero) {
 				t.Fatalf("Converge = %v, want ErrZero", err)
@@ -155,7 +155,7 @@ func TestAddObservedRefusesZeroAddr(t *testing.T) {
 	f := newFixture(t, configV1)
 	before := f.world.Writes()
 
-	err := f.rec.AddObserved(t.Context(), "web", zeroBook{}.Addrs("web"))
+	err := reconcile.AddObserved(t.Context(), f.world.Backend(), "web", zeroBook{}.Addrs("web"))
 
 	if !errors.Is(err, blockable.ErrZero) {
 		t.Fatalf("AddObserved = %v, want ErrZero", err)

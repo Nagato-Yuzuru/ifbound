@@ -322,7 +322,7 @@ func TestWarmUpWaitsForTheProbeAndRetriesLater(t *testing.T) {
 			// A missing host file: the tests here do not read the host file of the machine.
 			Hosts: &fakeHosts{},
 			Platform: reconcile.Reconciler{
-				Compiler: reconciletest.Compiler{}, Backend: w.Backend(), Resolver: w.Resolver(),
+				Compiler: reconciletest.Compiler{}, Guard: reconcile.NewGuard(w.Backend()), Resolver: w.Resolver(),
 				Inventory: reconciletest.NewInventory(rigEn0),
 			},
 			Lookup: lookup,

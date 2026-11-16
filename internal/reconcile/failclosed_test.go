@@ -142,7 +142,7 @@ func failClosedAt(t *testing.T, tr transition, failAt int) {
 		return nil
 	})
 
-	if _, err := f.rec.Converge(t.Context(), f.inputs()); !errors.Is(err, reconciletest.ErrInjected) {
+	if _, _, err := f.rec.Converge(t.Context(), f.inputs()); !errors.Is(err, reconciletest.ErrInjected) {
 		t.Fatalf("err = %v, want ErrInjected", err)
 	}
 	f.world.SetBeforeWrite(nil)

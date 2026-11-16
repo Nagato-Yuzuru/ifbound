@@ -192,7 +192,7 @@ func startWarm(t *testing.T, world *reconciletest.World, snapshot, cfgText strin
 		Hosts: &fakeHosts{},
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
-			Backend:   world.Backend(),
+			Guard:     reconcile.NewGuard(world.Backend()),
 			Resolver:  world.Resolver(),
 			Inventory: inv,
 		},

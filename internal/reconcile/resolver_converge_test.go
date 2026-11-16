@@ -299,7 +299,7 @@ func runResolverConvergence(t *testing.T, seed uint64, world resolverWorld, with
 	fr := &faultResolver{SysResolver: world.resolver()}
 	rec := reconcile.Reconciler{
 		Compiler:  reconciletest.Compiler{},
-		Backend:   reconciletest.NewWorld().Backend(),
+		Guard:     reconcile.NewGuard(reconciletest.NewWorld().Backend()),
 		Resolver:  fr,
 		Inventory: reconciletest.NewInventory(),
 	}
@@ -312,7 +312,7 @@ func runResolverConvergence(t *testing.T, seed uint64, world resolverWorld, with
 		clean := fr.setFaults(r)
 		in := apexInputs(t, apexes, listen)
 		st := convergeStep{before: world.managed(t), want: wantDomains(apexes), failRemove: fr.failRemove, listen: listen}
-		_, err := rec.Converge(t.Context(), in)
+		_, _, err := rec.Converge(t.Context(), in)
 		st.after = world.managed(t)
 		for _, d := range fr.writes {
 			if fr.failWrite[d] || foreignAtStart[d] != "" {
@@ -356,7 +356,7 @@ func checkCleanConvergence(t *testing.T, ctx string, rec reconcile.Reconciler, f
 		t.Fatalf("%s\nclean convergence: entries %v, want exactly %v", ctx, slices.Sorted(maps.Keys(st.after)), slices.Sorted(maps.Keys(st.want)))
 	}
 	fr.writes, fr.removes = nil, nil
-	if _, err := rec.Converge(t.Context(), in); err != nil || len(fr.writes)+len(fr.removes) > 0 {
+	if _, _, err := rec.Converge(t.Context(), in); err != nil || len(fr.writes)+len(fr.removes) > 0 {
 		t.Fatalf("%s\nsecond pass: err %v, writes %v, removes %v; want none", ctx, err, fr.writes, fr.removes)
 	}
 }
@@ -398,12 +398,12 @@ func TestResolverCanaryBoundaries(t *testing.T) {
 		fw := fakeWorld{w: w}
 		fw.seed(t, "edge.example.org", listenA) // an old entry that is not desired
 		fw.seed(t, canary, listenA)
-		rec := reconcile.Reconciler{Compiler: reconciletest.Compiler{}, Backend: w.Backend(), Resolver: w.Resolver(), Inventory: reconciletest.NewInventory()}
+		rec := reconcile.Reconciler{Compiler: reconciletest.Compiler{}, Guard: reconcile.NewGuard(w.Backend()), Resolver: w.Resolver(), Inventory: reconciletest.NewInventory()}
 		in := reconcile.Inputs{Book: noAddrs{}, Listen: listenA}
 		for _, a := range tc.apexes {
 			in.Apexes = append(in.Apexes, mustDomain(t, a))
 		}
-		if _, err := rec.Converge(t.Context(), in); err != nil {
+		if _, _, err := rec.Converge(t.Context(), in); err != nil {
 			t.Fatal(err)
 		}
 		got := slices.Sorted(maps.Keys(fw.managed(t)))
