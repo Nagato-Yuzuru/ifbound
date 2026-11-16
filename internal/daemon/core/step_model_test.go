@@ -125,7 +125,7 @@ func (m *accountModel) step(ev Event) ([]ReadAccounts, error) {
 		case Converge:
 			converges++
 		case AccountsOverdue, AccountLookupsFailed, ReadHosts, ReadKernelHosts, HostsReadFailed, KernelHostsFailed,
-			OpenBook, AdoptBook, ExpireBook, PruneBook:
+			OpenBook, AdoptBook, ExpireBook, PruneBook, ReportPathFailed:
 		}
 	}
 	switch {

@@ -51,6 +51,7 @@ type State struct {
 	// retain of the book for the life of the daemon.
 	retain   time.Duration
 	enf      enforcement
+	reports  reports
 	selfTest selfTest
 
 	// healAt is the time of the next self-heal, or zero for none.
@@ -165,10 +166,10 @@ func Step(s State, ev Event) (State, []Effect) {
 		s, out, trigger = s.applyConfig(ev, out)
 	case Converged:
 		s, out = s.applyConverged(ev, out)
-	case RulesetMismatch:
-		if _, ok := s.Config().(Configured); ok {
-			s.enf.mismatch, trigger = true, logattr.TriggerRulesetChanged
-		}
+	case ReportFailed:
+		s, out, trigger = s.applyReportFailed(ev, out)
+	case ReportSucceeded:
+		s = s.applyReportSucceeded()
 	case SelfTestResult:
 		s, trigger = s.applySelfTest(ev)
 	case AccountsRead:

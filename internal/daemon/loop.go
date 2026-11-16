@@ -70,6 +70,10 @@ type loop struct {
 	// effect of core sets it. A second trigger before the pass does not
 	// replace the first. Each pass clears it (see converge).
 	pending string
+	// reportFailed is true after a report failure that core got, until a
+	// report succeeds. Only then does a success go to core.
+	reportFailed bool
+
 	// failed is the error.type and the error text of the last
 	// convergence, or "" when it succeeded. A failure that repeats is
 	// logged at debug.
@@ -350,7 +354,19 @@ func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) 
 	if err := l.checkInstalled(ctx); err != nil {
 		return ipc.Ack{}, err
 	}
+	if l.reportFailed {
+		l.reportFailed = false
+		l.drive(ctx, core.ReportSucceeded{At: time.Now()})
+	}
 	return ipc.Ack{Protected: true}, nil
+}
+
+// reportFailure gives a failure of the report path to core, and returns
+// err.
+func (l *loop) reportFailure(ctx context.Context, step reconcile.ReportStep, err error) error {
+	l.reportFailed = true
+	l.drive(ctx, core.ReportFailed{At: time.Now(), Step: step, Err: err})
+	return err
 }
 
 // record puts the addresses of o in the tables and the book of each
@@ -376,10 +392,10 @@ func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observatio
 		return nil
 	})
 	if err != nil {
-		return err
+		return l.reportFailure(ctx, reconcile.StepTableAdd, err)
 	}
 	if err := l.book.Commit(ctx, p); err != nil {
-		return fmt.Errorf("saving the address book: %w", err)
+		return l.reportFailure(ctx, reconcile.StepCommit, fmt.Errorf("saving the address book: %w", err))
 	}
 	if !p.Empty() {
 		l.drive(ctx, core.BookChanged{At: time.Now(), Facts: l.latestFacts()})
@@ -389,10 +405,10 @@ func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observatio
 
 // checkInstalled returns nil when the Backend has the installed ruleset
 // of the gate loaded. It reads the gate after the read of the Backend,
-// so it never trusts an older gate. Otherwise something outside
-// ifbound changed the ruleset, or the gate is closed. The phase then
-// stops acknowledging, and Run converges right after this request. It
-// returns ErrUnenforced in this case.
+// so it never trusts an older gate. When the gate is closed, it returns
+// the error of the gate. When another ruleset is loaded, something
+// outside ifbound changed it: the phase then stops acknowledging, Run
+// converges right after this request, and it returns ErrUnenforced.
 func (l *loop) checkInstalled(ctx context.Context) error {
 	var id string
 	err := l.rec.Guard.Shared(func(a reconcile.Adder) (err error) {
@@ -400,11 +416,17 @@ func (l *loop) checkInstalled(ctx context.Context) error {
 		return err
 	})
 	if err != nil {
-		return fmt.Errorf("reading the loaded ruleset: %w", err)
+		return l.reportFailure(ctx, reconcile.StepLoadedID, fmt.Errorf("reading the loaded ruleset: %w", err))
 	}
-	if g, ok := l.gate.State.(core.Open); !ok || id != g.Installed {
-		l.drive(ctx, core.RulesetMismatch{At: time.Now()})
-		return ErrUnenforced
+	switch g := l.gate.State.(type) {
+	case core.Closed:
+		return g.Err
+	case core.Open:
+		if id != g.Installed {
+			return l.reportFailure(ctx, reconcile.StepRuleset, ErrUnenforced)
+		}
+		return nil
+	default:
+		panic(fmt.Sprintf("daemon: unknown gate state %T", g))
 	}
-	return nil
 }

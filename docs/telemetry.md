@@ -50,7 +50,8 @@ OpenTelemetry semantic conventions do not define these attributes.
 | Value | Description |
 | --- | --- |
 | `start` | The daemon started. |
-| `ruleset_changed` | A request left a recheck of the ruleset pending. |
+| `ruleset_changed` | A DNS report found another loaded ruleset than the installed one. |
+| `report_failed` | A DNS report failed at a step that a load of the ruleset repairs. |
 | `interfaces` | The network interfaces changed and the debounce ended. |
 | `self_heal` | The self-heal timer ticked, after a new read of the accounts. |
 | `accounts` | An account read ended, or its time budget ended. |
@@ -107,6 +108,7 @@ These attributes come from
 
 | Value | Description |
 | --- | --- |
+| `address_book` | A write of the address book failed. A DNS report with a new address gets no ack until a write succeeds. Check the disk and the free space. |
 | `canceled` | The caller ended before the work started. Nothing changed. No action is needed. |
 | `config_file` | The stored configuration file cannot be read or written. Check the file, its directory, their owners and modes, and the free space. |
 | `config_invalid` | The configuration does not pass its checks. Nothing changed. Correct the configuration and apply it again. |

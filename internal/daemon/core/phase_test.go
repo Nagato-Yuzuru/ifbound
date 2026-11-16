@@ -195,7 +195,7 @@ func TestPhaseOfEachConfigurationAndBookState(t *testing.T) {
 			return s
 		}, Degraded, "address book is damaged"},
 		{"installed, then a ruleset mismatch", func() State {
-			s, _ := shell{}.drain(installed(reconcile.Report{Installed: "r1"}, nil)(), RulesetMismatch{At: t0})
+			s, _ := shell{}.drain(installed(reconcile.Report{Installed: "r1"}, nil)(), ReportFailed{At: t0, Step: reconcile.StepRuleset, Err: ErrUnenforced})
 			return s
 		}, Unenforced, "changed outside ifbound"},
 		{"installed, then a new configuration", func() State {

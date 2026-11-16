@@ -98,7 +98,8 @@ func (m *enfModel) next() error {
 	case k < 6 && m.pending:
 		return m.pass()
 	case k < 7:
-		return m.outside(RulesetMismatch{At: m.now})
+		steps := []reconcile.ReportStep{reconcile.StepTableAdd, reconcile.StepCommit, reconcile.StepLoadedID, reconcile.StepRuleset}
+		return m.outside(ReportFailed{At: m.now, Step: steps[m.rng.IntN(len(steps))], Err: errModel})
 	case k < 8:
 		g := uint64(m.rng.IntN(int(m.gen) + 2))
 		return m.outside(SelfTestResult{At: m.now, Proved: g * uint64(m.rng.IntN(2)), Missed: g})
@@ -183,12 +184,15 @@ func (m *enfModel) pass() error {
 
 // outside gives one outside event and drains it.
 func (m *enfModel) outside(ev Event) error {
-	if _, ok := ev.(RulesetMismatch); ok && m.configured {
+	if f, ok := ev.(ReportFailed); ok && f.Step == reconcile.StepRuleset && m.configured {
 		m.mismatch = true
 	}
 	m.drain = nil
 	if err := m.step(ev); err != nil {
 		return err
+	}
+	if _, ok := ev.(ReportFailed); ok && m.configured && PhaseOf(m.s).Lifecycle == Ready {
+		return fmt.Errorf("phase Ready right after the report failure %+v", ev)
 	}
 	_, adopting := m.book().(BookAdopting)
 	_, loaded := m.book().(BookLoaded)
@@ -305,7 +309,7 @@ func (m *enfModel) answer(e Effect) (Event, error) {
 			return nil, fmt.Errorf("a second account read %v while %v is in flight", e, *m.flight)
 		}
 		m.flight = &e
-	case AccountsOverdue, AccountLookupsFailed, HostsReadFailed, KernelHostsFailed:
+	case AccountsOverdue, AccountLookupsFailed, HostsReadFailed, KernelHostsFailed, ReportPathFailed:
 	}
 	return nil, nil
 }

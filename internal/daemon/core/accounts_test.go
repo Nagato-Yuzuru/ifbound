@@ -105,7 +105,7 @@ func TestPassStartedPastTheAccountDeadlineReadsTheHostsBeforeItConverges(t *test
 		case Converge:
 			conv = i
 		case ReadAccounts, AccountsOverdue, AccountLookupsFailed, ReadKernelHosts, HostsReadFailed, KernelHostsFailed,
-			OpenBook, AdoptBook, ExpireBook, PruneBook:
+			OpenBook, AdoptBook, ExpireBook, PruneBook, ReportPathFailed:
 		}
 	}
 	if read < 0 || conv != len(effects)-1 {

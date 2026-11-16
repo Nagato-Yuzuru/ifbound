@@ -470,3 +470,33 @@ func TestReportWaitsBehindConvergence(t *testing.T) {
 		}
 	})
 }
+
+// A report that fails at the table add gives one warning, also when it
+// repeats, and asks for a convergence with the trigger report_failed.
+func TestReportFailureEvent(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := newHarness(t, configV1)
+		defer h.stop()
+		h.failWrites()
+		for _, a := range []string{"203.0.113.1", "203.0.113.2"} {
+			if err := h.observe(obs("www.example.net", a)); !errors.Is(err, reconciletest.ErrInjected) {
+				t.Fatalf("Observe = %v, want ErrInjected", err)
+			}
+			synctest.Wait()
+		}
+		warns := h.logs.events("DNS report got no ack")
+		if len(warns) != 1 {
+			t.Fatalf("%d report warnings, want 1: %v", len(warns), warns)
+		}
+		wantAttrs(t, warns[0], map[string]any{logattr.ErrorType: logattr.ErrorTypePlatform})
+		if warns[0].level != slog.LevelWarn {
+			t.Errorf("level = %v, want warn", warns[0].level)
+		}
+		passes := slices.DeleteFunc(h.logs.events("convergence"), func(e event) bool {
+			return e.attrs[logattr.ConvergeTrigger].String() != logattr.TriggerReportFailed
+		})
+		if len(passes) != 2 {
+			t.Errorf("%d convergences with trigger %s, want 2", len(passes), logattr.TriggerReportFailed)
+		}
+	})
+}
