@@ -65,6 +65,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
@@ -121,20 +122,27 @@ type Device interface {
 var _ Device = (*pf.Handle)(nil)
 
 // Backend implements reconcile.Backend with pfctl and with ioctl calls
-// on /dev/pf. It is not safe for concurrent use. Build one with New.
+// on /dev/pf. Build one with New.
+//
+// AddEntries and LoadedID are the methods of the ack path. They are safe
+// for concurrent use with each other: they call only the Device, and
+// they change no field of the Backend except unfinished, which is
+// atomic. Each other method needs exclusive use: no other call of the
+// Backend may run at the same time.
 type Backend struct {
 	run Runner
 	dev Device
 	now func() time.Time
 	log *slog.Logger
 	// tokens are the pf references that ifbound holds, or none when it
-	// holds none or does not know them yet.
+	// holds none or does not know them yet. Only the methods with
+	// exclusive use read or write it.
 	tokens []token
 	// enabledAt is the time of the last enable of a disabled pf.
 	enabledAt time.Time
 	// unfinished is true from the start of a Load until it finishes, and
 	// after an AddEntries that did not end the states.
-	unfinished bool
+	unfinished atomic.Bool
 }
 
 var _ reconcile.Backend = (*Backend)(nil)
@@ -154,7 +162,7 @@ func New(run Runner, dev Device, now func() time.Time, log *slog.Logger) *Backen
 // the enforcement, and it leaves the entry out of Tables: the Reconciler
 // adds the entry again, and AddEntries deletes the negated entry.
 func (b *Backend) Read(ctx context.Context) (reconcile.BackendState, error) {
-	enabled, id, err := b.loaded()
+	enabled, id, err := b.adopt()
 	if err != nil {
 		return reconcile.BackendState{}, err
 	}
@@ -177,30 +185,38 @@ func (b *Backend) Read(ctx context.Context) (reconcile.BackendState, error) {
 // LoadedID implements reconcile.Backend. It starts no pfctl process: it
 // reads the pf status and the rules through ioctl.
 func (b *Backend) LoadedID(context.Context) (string, error) {
-	_, id, err := b.loaded()
+	_, id, _, err := b.loaded()
 	return id, err
 }
 
-// loaded reads whether pf is enabled and the ID of the loaded ruleset.
-// The ID is "" when pf is disabled: no rule is in effect then. When the
-// Backend knows no token, it takes the tokens from the anchor, where an
-// earlier process of ifbound wrote them.
-func (b *Backend) loaded() (enabled bool, id string, err error) {
+// loaded reads whether pf is enabled, the ID of the loaded ruleset, and
+// the tokens in the labels of the anchor. The ID is "" when pf is
+// disabled: no rule is in effect then.
+func (b *Backend) loaded() (enabled bool, id string, tokens []token, err error) {
 	enabled, err = b.enabled()
 	if err != nil || !enabled {
-		return false, "", err
+		return false, "", nil, err
 	}
-	id, tokens, err := b.readAnchor()
+	id, tokens, err = b.readAnchor()
 	if err != nil {
-		return true, "", err
+		return true, "", tokens, err
 	}
-	if len(b.tokens) == 0 {
+	if b.unfinished.Load() {
+		return true, "", tokens, nil
+	}
+	return true, id, tokens, nil
+}
+
+// adopt is loaded for a method with exclusive use. When the Backend
+// knows no token, it takes the tokens from the anchor, where an earlier
+// process of ifbound wrote them. LoadedID does not adopt: it runs
+// concurrently with AddEntries, and the tokens need exclusive use.
+func (b *Backend) adopt() (enabled bool, id string, err error) {
+	enabled, id, tokens, err := b.loaded()
+	if err == nil && len(b.tokens) == 0 {
 		b.tokens = tokens
 	}
-	if b.unfinished {
-		return true, "", nil
-	}
-	return true, id, nil
+	return enabled, id, err
 }
 
 // otherKinds returns the rulesets besides the filter rules that Load
@@ -314,8 +330,8 @@ func (b *Backend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 	if err != nil {
 		return err
 	}
-	b.unfinished = true
-	enabled, _, err := b.loaded()
+	b.unfinished.Store(true)
+	enabled, _, err := b.adopt()
 	if err != nil {
 		return err
 	}
@@ -355,7 +371,7 @@ func (b *Backend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 	if err := b.killStates(slices.Concat(slices.Collect(maps.Values(tables))...)); err != nil {
 		return err
 	}
-	b.unfinished = false
+	b.unfinished.Store(false)
 	return nil
 }
 
@@ -457,7 +473,7 @@ func (b *Backend) abandon(ctx context.Context, t token) {
 func (b *Backend) Unload(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupWait)
 	defer cancel()
-	if _, _, err := b.loaded(); err != nil {
+	if _, _, err := b.adopt(); err != nil {
 		return err
 	}
 	if err := b.release(); err != nil {
@@ -531,7 +547,7 @@ func (b *Backend) AddEntries(_ context.Context, table policy.Name, entries []net
 	// the work as not finished, so that a Load follows.
 	defer func() {
 		if err != nil {
-			b.unfinished = true
+			b.unfinished.Store(true)
 		}
 	}()
 	if len(conflicts) > 0 {
