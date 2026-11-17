@@ -371,9 +371,9 @@ func (h *harness) lastReport(o ipc.Observation) event {
 	return evs[before]
 }
 
-// Each report writes one debug event with its result, the wait for the
-// loop, and the time on the loop. A report that the loop did not take has
-// no time on the loop.
+// Each report writes one debug event with its result, the wait for a
+// new gate, and the time of the whole report. A report after the stop
+// has them too.
 func TestReportEvent(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, configV1)
@@ -412,13 +412,16 @@ func TestReportEvent(t *testing.T) {
 		h.stop()
 		e = h.lastReport(obs("www.example.net", "203.0.113.1"))
 		wantAttrs(t, e, map[string]any{logattr.ReportResult: logattr.ReportNotAcknowledged})
-		wantNoAttrs(t, e, logattr.ReportObserveUS)
+		if _, ok := e.attrs[logattr.ReportObserveUS]; !ok {
+			t.Errorf("report after the stop has no %s", logattr.ReportObserveUS)
+		}
 	})
 }
 
-// A report that arrives during a convergence waits for its end. Its wait
-// is the rest of the convergence, and its time on the loop excludes the
-// wait. The bubble clock makes both exact.
+// A report that arrives during a convergence that loads the ruleset
+// waits for its end, then runs again under the new gate and gets a
+// protected ack: the load made its first gate stale. The bubble clock
+// makes the times exact.
 func TestReportWaitsBehindConvergence(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const perWrite = 40 * time.Millisecond
@@ -443,7 +446,7 @@ func TestReportWaitsBehindConvergence(t *testing.T) {
 		}()
 		heal()
 		if err := <-done; err != nil {
-			t.Fatalf("Observe: %v", err)
+			t.Fatalf("Observe = %v, want a protected ack after the convergence", err)
 		}
 
 		conv := h.last("convergence")
@@ -457,16 +460,16 @@ func TestReportWaitsBehindConvergence(t *testing.T) {
 			t.Fatalf("report events = %d, want %d", len(evs), before+1)
 		}
 		e := evs[before]
-		wantAttrs(t, e, map[string]any{
-			logattr.ReportResult: logattr.ReportProtected,
-			logattr.ReportWaitUS: int(convMS*1000 - time.Millisecond.Microseconds()),
-		})
-		wait, onLoop := e.attrs[logattr.ReportWaitUS].Int64(), e.attrs[logattr.ReportObserveUS].Int64()
-		if onLoop < perWrite.Microseconds() {
-			t.Errorf("%s = %d, want at least one write of %v", logattr.ReportObserveUS, onLoop, perWrite)
+		wantAttrs(t, e, map[string]any{logattr.ReportResult: logattr.ReportProtected})
+		wait, took := e.attrs[logattr.ReportWaitUS].Int64(), e.attrs[logattr.ReportObserveUS].Int64()
+		if took != total.Microseconds() {
+			t.Errorf("%s = %d, want the time of Observe, %d", logattr.ReportObserveUS, took, total.Microseconds())
 		}
-		if wait+onLoop != total.Microseconds() {
-			t.Errorf("%s + %s = %d, want the time of Observe, %d", logattr.ReportWaitUS, logattr.ReportObserveUS, wait+onLoop, total.Microseconds())
+		if rest := convMS*1000 - time.Millisecond.Microseconds(); took < rest {
+			t.Errorf("%s = %d, want at least the rest of the convergence, %d", logattr.ReportObserveUS, took, rest)
+		}
+		if wait > took {
+			t.Errorf("%s = %d is more than %s = %d", logattr.ReportWaitUS, wait, logattr.ReportObserveUS, took)
 		}
 	})
 }

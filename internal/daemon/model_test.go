@@ -1173,8 +1173,10 @@ func (r *omRun) observeCancelled(obs ipc.Observation) error {
 	return err
 }
 
-// observeCancelMidway ends the context of a report while the loop works
-// on it, if the report reaches a write.
+// observeCancelMidway ends the context of a report while it waits in a
+// write, if the report reaches one. spec6: such a report never gets a
+// protected ack. It can return ctx.Err(), and the addresses that it
+// added stay in the tables or the book: they only block more.
 func (r *omRun) observeCancelMidway(obs ipc.Observation) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1182,10 +1184,14 @@ func (r *omRun) observeCancelMidway(obs ipc.Observation) error {
 	r.mu.Lock()
 	r.block, r.entered, r.release = entered, entered, release
 	r.mu.Unlock()
-	res := make(chan error, 1)
+	type result struct {
+		ack ipc.Ack
+		err error
+	}
+	res := make(chan result, 1)
 	go func() {
-		_, err := r.d.Observe(ctx, obs)
-		res <- err
+		ack, err := r.d.Observe(ctx, obs)
+		res <- result{ack, err}
 	}()
 	synctest.Wait()
 	taken := false
@@ -1199,14 +1205,14 @@ func (r *omRun) observeCancelMidway(obs ipc.Observation) error {
 		close(release)
 	default:
 	}
-	err := <-res
+	got := <-res
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.block = nil
-	if taken && errors.Is(err, context.Canceled) {
-		r.violate("spec6: a request the loop took returned ctx.Err instead of its reply")
+	if taken && got.err == nil && got.ack.Protected {
+		r.violate("spec6: a report whose ctx ended in a write got a protected ack")
 	}
-	return err
+	return got.err
 }
 
 func (r *omRun) checkObserveResultLocked(pre daemon.State, o omOp, matched, armed bool, err error) {

@@ -77,33 +77,65 @@ func (c Checked) Mismatch(epoch uint64, installed string) bool {
 // after its commit: after a failure the book does not have it.
 //
 // It returns a Checked only when every step succeeded. A failure at a
-// step returns a *ReportError. A stale epoch returns ErrStale.
+// step returns a *ReportError. A stale epoch returns ErrStale. When ctx
+// ends, it returns ctx.Err() and no Checked, also when the steps
+// succeeded: the caller left, so no answer uses the check. A step that
+// fails after ctx ended is no *ReportError, so the failure of the
+// caller is not a fact of the report path.
 func Record(ctx context.Context, g *Guard, l Ledger, s Sighting) (Checked, error) {
 	var c Checked
-	err := g.Shared(func(a Adder) error {
+	err := g.Shared(ctx, func(a Adder) error {
+		if err := ctx.Err(); err != nil {
+			// Shared can enter with an ended ctx when the lock is free
+			// too: a report whose caller left writes nothing.
+			return fmt.Errorf("report: %w", err)
+		}
 		if g.epoch != s.Epoch {
 			return ErrStale
 		}
-		if len(s.Addrs) > 0 {
-			p, err := l.Touch(s.Names, s.Addrs, s.TTL, s.At)
-			if err != nil {
-				return fmt.Errorf("recording addresses: %w", err)
-			}
-			for _, name := range s.Names {
-				if err := AddObserved(ctx, a, name, s.Addrs); err != nil {
-					return &ReportError{Step: StepTableAdd, Err: err}
-				}
-			}
-			if err := l.Commit(ctx, p); err != nil {
-				return &ReportError{Step: StepCommit, Err: fmt.Errorf("saving the address book: %w", err)}
-			}
+		if err := write(ctx, a, l, s); err != nil {
+			return err
 		}
 		id, err := a.LoadedID(ctx)
 		if err != nil {
-			return &ReportError{Step: StepLoadedID, Err: fmt.Errorf("reading the loaded ruleset: %w", err)}
+			return stepError(ctx, StepLoadedID, fmt.Errorf("reading the loaded ruleset: %w", err))
+		}
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("report: %w", err)
 		}
 		c = Checked{ok: true, epoch: s.Epoch, loaded: id}
 		return nil
 	})
 	return c, err
+}
+
+// write adds the addresses of s to the table of each policy and commits
+// them to l. A report without an address writes nothing.
+func write(ctx context.Context, a Adder, l Ledger, s Sighting) error {
+	if len(s.Addrs) == 0 {
+		return nil
+	}
+	p, err := l.Touch(s.Names, s.Addrs, s.TTL, s.At)
+	if err != nil {
+		return fmt.Errorf("recording addresses: %w", err)
+	}
+	for _, name := range s.Names {
+		if err := AddObserved(ctx, a, name, s.Addrs); err != nil {
+			return stepError(ctx, StepTableAdd, err)
+		}
+	}
+	if err := l.Commit(ctx, p); err != nil {
+		return stepError(ctx, StepCommit, fmt.Errorf("saving the address book: %w", err))
+	}
+	return nil
+}
+
+// stepError is the error of a failure at step. After ctx ended, it is
+// the error of ctx: the failure of the caller is not a fact of the
+// report path.
+func stepError(ctx context.Context, step ReportStep, err error) error {
+	if ctx.Err() != nil {
+		return fmt.Errorf("report: %w", ctx.Err())
+	}
+	return &ReportError{Step: step, Err: err}
 }

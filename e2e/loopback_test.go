@@ -93,7 +93,7 @@ func TestLoopbackAnswerDoesNotBlockLocalService(t *testing.T) {
 	// reaches the table.
 	reported := netip.MustParseAddr("192.0.2.11")
 	addrs := blockable.Filter([]netip.Addr{netip.MustParseAddr("127.0.0.53"), reported})
-	err = rec.Guard.Shared(func(a reconcile.Adder) error { return reconcile.AddObserved(t.Context(), a, "e2e-lo", addrs) })
+	err = rec.Guard.Shared(t.Context(), func(a reconcile.Adder) error { return reconcile.AddObserved(t.Context(), a, "e2e-lo", addrs) })
 	if err != nil {
 		t.Fatalf("AddObserved: %v", err)
 	}

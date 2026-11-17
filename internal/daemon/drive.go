@@ -29,6 +29,7 @@ func (l *loop) drive(ctx context.Context, ev core.Event) {
 	var effects []core.Effect
 	l.core, effects = core.Step(l.core, ev)
 	l.gate = core.GateOf(l.core)
+	l.publishView()
 	for _, e := range effects {
 		switch e := e.(type) {
 		case core.Converge:
