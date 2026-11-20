@@ -107,8 +107,11 @@ const (
 	// The daemon started.
 	TriggerStart = "start"
 
-	// A request left a recheck of the ruleset pending.
+	// A DNS report found another loaded ruleset than the installed one.
 	TriggerRulesetChanged = "ruleset_changed"
+
+	// A DNS report failed at a step that a load of the ruleset repairs.
+	TriggerReportFailed = "report_failed"
 
 	// The network interfaces changed and the debounce ended.
 	TriggerInterfaces = "interfaces"
@@ -179,6 +182,9 @@ const (
 
 // Values of ErrorType.
 const (
+	// A write of the address book failed. A DNS report with a new address gets no ack until a write succeeds. Check the disk and the free space.
+	ErrorTypeAddressBook = "address_book"
+
 	// The caller ended before the work started. Nothing changed. No action is needed.
 	ErrorTypeCanceled = "canceled"
 

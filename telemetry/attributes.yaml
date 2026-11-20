@@ -21,9 +21,14 @@ attributes:
           annotations: {go: {name: TriggerStart}}
         - id: ruleset_changed
           value: "ruleset_changed"
-          brief: A request left a recheck of the ruleset pending.
+          brief: A DNS report found another loaded ruleset than the installed one.
           stability: development
           annotations: {go: {name: TriggerRulesetChanged}}
+        - id: report_failed
+          value: "report_failed"
+          brief: A DNS report failed at a step that a load of the ruleset repairs.
+          stability: development
+          annotations: {go: {name: TriggerReportFailed}}
         - id: interfaces
           value: "interfaces"
           brief: The network interfaces changed and the debounce ended.
@@ -313,6 +318,10 @@ attribute_groups:
         annotations:
           go:
             members:
+              - value: address_book
+                name: ErrorTypeAddressBook
+                brief: >-
+                  A write of the address book failed. A DNS report with a new address gets no ack until a write succeeds. Check the disk and the free space.
               - value: canceled
                 name: ErrorTypeCanceled
                 brief: >-

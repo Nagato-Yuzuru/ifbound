@@ -107,22 +107,13 @@ type Converged struct {
 	Epoch  uint64
 }
 
-// RulesetMismatch tells that a report found a loaded ruleset that is not
-// the installed one. It exists only while the report path is in the
-// shell. The phase stops acknowledging until the next convergence.
-type RulesetMismatch struct{ At time.Time }
-
-func (e Converged) at() time.Time       { return e.At }
-func (e RulesetMismatch) at() time.Time { return e.At }
+func (e Converged) at() time.Time { return e.At }
 
 // enforcement is what Step knows of the enforcement on the platform.
 type enforcement struct {
 	// last is the outcome of the latest convergence, or nil before the
 	// first one.
 	last *outcome
-	// mismatch is true when a report found another loaded ruleset after
-	// the last convergence.
-	mismatch bool
 }
 
 // outcome is one convergence and the state that it ran under.
@@ -147,7 +138,7 @@ func (s State) applyConverged(ev Converged, out []Effect) (State, []Effect) {
 	}
 	_, loaded := c.Book.(BookLoaded)
 	s.enf.last = &outcome{gen: c.Active.Gen, epoch: ev.Epoch, addOnly: !loaded, report: ev.Report, err: ev.Err}
-	s.enf.mismatch = false
+	s = s.clearReports()
 	if ev.Report.Installed != "" && loaded {
 		out = append(out, PruneBook{Keep: policyNames(c.Active.Config.Policies)})
 	}
@@ -188,14 +179,18 @@ func (s State) configuredPhase(c Configured) Phase {
 	switch {
 	case o == nil || o.gen != c.Active.Gen:
 		return Phase{Lifecycle: Unenforced, Reasons: []string{"the new configuration is not installed yet"}}
-	case s.enf.mismatch:
-		return Phase{Lifecycle: Unenforced, Reasons: []string{"the loaded ruleset changed outside ifbound"}}
+	}
+	if reason, ok := rulesetReason(s); ok {
+		return Phase{Lifecycle: Unenforced, Reasons: []string{reason}}
 	}
 	problems := slices.Clone(o.report.Problems)
 	if p, ok := hostsProblem(s); ok {
 		problems = append(problems, p)
 	}
 	if p, ok := accountsProblem(s); ok {
+		problems = append(problems, p)
+	}
+	if p, ok := reportProblem(s); ok {
 		problems = append(problems, p)
 	}
 	b, loaded := c.Book.(BookLoaded)

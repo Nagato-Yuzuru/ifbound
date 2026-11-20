@@ -9,6 +9,7 @@ import (
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
+	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
 // drive gives ev to core.Step and runs the effects that it returns, in
@@ -53,6 +54,8 @@ func (l *loop) drive(ctx context.Context, ev core.Event) {
 		case core.HostsReadFailed:
 			l.emit(ctx, e)
 		case core.KernelHostsFailed:
+			l.emit(ctx, e)
+		case core.ReportPathFailed:
 			l.emit(ctx, e)
 		default:
 			panic(fmt.Sprintf("daemon: unknown effect %T", e))
@@ -106,6 +109,13 @@ func (l *loop) emit(ctx context.Context, e core.OutEffect) {
 	case core.KernelHostsFailed:
 		l.log.WarnContext(ctx, "reading the kernel entries for the host file failed",
 			slog.String(logattr.ErrorType, logattr.ErrorTypePlatform), slog.String(logattr.ExceptionMessage, e.Err.Error()))
+	case core.ReportPathFailed:
+		errType := logattr.ErrorTypePlatform
+		if e.Step == reconcile.StepCommit {
+			errType = logattr.ErrorTypeAddressBook
+		}
+		l.log.WarnContext(ctx, "DNS report got no ack",
+			slog.String(logattr.ErrorType, errType), slog.String(logattr.ExceptionMessage, e.Err.Error()))
 	default:
 		panic(fmt.Sprintf("daemon: unknown out effect %T", e))
 	}

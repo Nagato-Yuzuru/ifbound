@@ -205,7 +205,7 @@ func (m *hostModel) step(ev Event) ([]Effect, error) {
 			}
 			m.kernel = &e
 		case Converge, ReadAccounts, AccountsOverdue, AccountLookupsFailed, HostsReadFailed, KernelHostsFailed,
-			OpenBook, AdoptBook, ExpireBook, PruneBook:
+			OpenBook, AdoptBook, ExpireBook, PruneBook, ReportPathFailed:
 		}
 	}
 	return effects, nil
