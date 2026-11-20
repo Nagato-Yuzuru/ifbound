@@ -6,6 +6,8 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
@@ -100,7 +102,7 @@ func TestGuardExclusiveWaitsForShared(t *testing.T) {
 	var ev events
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		_ = g.Shared(func(a reconcile.Adder) error { //nolint:errcheck // the test checks the order
+		_ = g.Shared(t.Context(), func(a reconcile.Adder) error { //nolint:errcheck // the test checks the order
 			ev.add("shared in")
 			err := a.AddEntries(t.Context(), "web", host7)
 			ev.add("shared out")
@@ -133,7 +135,7 @@ func TestGuardSharedWaitsForExclusive(t *testing.T) {
 	})
 	<-entered
 	wg.Go(func() {
-		_ = g.Shared(func(reconcile.Adder) error { ev.add("shared"); return nil }) //nolint:errcheck // f returns nil
+		_ = g.Shared(t.Context(), func(reconcile.Adder) error { ev.add("shared"); return nil }) //nolint:errcheck // f returns nil
 	})
 	close(release)
 	wg.Wait()
@@ -149,10 +151,10 @@ func TestGuardSharedSectionsOverlap(t *testing.T) {
 	second := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
-		_ = g.Shared(func(reconcile.Adder) error { <-second; return nil }) //nolint:errcheck // f returns nil
+		_ = g.Shared(t.Context(), func(reconcile.Adder) error { <-second; return nil }) //nolint:errcheck // f returns nil
 	})
 	wg.Go(func() {
-		_ = g.Shared(func(reconcile.Adder) error { close(second); return nil }) //nolint:errcheck // f returns nil
+		_ = g.Shared(t.Context(), func(reconcile.Adder) error { close(second); return nil }) //nolint:errcheck // f returns nil
 	})
 	wg.Wait()
 }
@@ -186,4 +188,26 @@ func TestConvergeReturnsTheEpoch(t *testing.T) {
 	if last <= first {
 		t.Errorf("epoch after a repair pass = %d, want > %d", last, first)
 	}
+}
+
+// In a synctest bubble, a convergence that waits for a report must not
+// stop the fake clock: the report sleeps in its shared section, and the
+// sleep must end. A Guard on a sync.RWMutex fails here, because a
+// goroutine that waits on a mutex is not durably blocked.
+func TestGuardWaitKeepsTheFakeClock(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := reconcile.NewGuard(reconciletest.NewWorld().Backend())
+		in := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_ = g.Shared(t.Context(), func(reconcile.Adder) error { //nolint:errcheck // f returns nil
+				close(in)
+				time.Sleep(time.Minute) // in the bubble: moves the fake clock
+				return nil
+			})
+		})
+		<-in
+		wg.Go(func() { g.Exclusive(func(reconcile.Backend) {}) })
+		wg.Wait()
+	})
 }

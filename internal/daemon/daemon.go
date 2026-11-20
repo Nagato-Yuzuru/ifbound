@@ -1,13 +1,19 @@
 // Package daemon runs the ifboundd event loop.
 //
 // One goroutine, started by Run, drives the platform through a
-// reconcile.Reconciler. Every event goes to it: a DNS report, an
+// reconcile.Reconciler. Every event but a DNS report goes to it: an
 // interface change, the self-heal and expiry timers, and a configuration
 // change. Other goroutines talk to it only through requests with a reply
 // channel, so its state needs no lock. It holds the address book (see
-// addrstore) and calls it synchronously; the committer goroutine of the
-// book writes it. The decisions, the phase, and the timers are in
-// core.Step and core.PhaseOf; the loop runs their effects (see drive).
+// addrstore); the committer goroutine of the book writes it. The
+// decisions, the phase, and the timers are in core.Step and
+// core.PhaseOf; the loop runs their effects (see drive).
+//
+// A DNS report runs on the goroutine of its caller (see Daemon.Observe).
+// It reads the gate and the book that the loop publishes, and it uses
+// the Backend in a shared section of the reconcile.Guard, while each
+// convergence holds an exclusive section. Its outcome goes to the loop
+// later, and the book tells the loop its new facts.
 //
 // Every event that can change the desired state ends in the same
 // convergence. Crash recovery, an external flush, and a configuration
@@ -55,7 +61,6 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
 	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
-	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
@@ -175,6 +180,11 @@ type Daemon struct {
 	// openBook opens the address book. A test can replace it before Run.
 	openBook openBookFunc
 
+	// view is what a report reads of the loop. The loop publishes it.
+	view atomic.Pointer[reportView]
+	// reports carries the outcomes of the reports to the loop.
+	reports *reportCell
+
 	// probes are the probe names that a probe waits for. The probe
 	// reports do not go through the loop: a probe report must never wait
 	// for anything.
@@ -199,7 +209,9 @@ func New(cfg Config) *Daemon {
 		requests: make(chan request),
 		done:     make(chan struct{}),
 		probes:   make(map[string]*probeWait),
+		reports:  newReportCell(),
 	}
+	d.view.Store(newView(core.Gate{State: core.Closed{Err: ErrNotReady}}, nil))
 	d.status.Store(&Status{State: StateStarting, Reasons: []string{core.ReasonNotLoaded}})
 	return d
 }
@@ -216,6 +228,8 @@ func (c Config) check() error {
 		return fmt.Errorf("%w: ConfigGID is zero", ErrBadConfig)
 	case c.Hosts == nil:
 		return fmt.Errorf("%w: Hosts is nil", ErrBadConfig)
+	case c.Platform.Guard == nil:
+		return fmt.Errorf("%w: Platform.Guard is nil", ErrBadConfig)
 	default:
 		return nil
 	}
@@ -312,9 +326,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer warm.wait()
 	defer close(d.done)
 
-	l := newLoop(d.cfg, d.store, d.openBook, &d.status)
-	// Before done closes, so that a new daemon can open the book.
-	defer l.closeBook()
+	l := newLoop(d.cfg, d.store, d.openBook, &d.status, &d.view)
+	// Before done closes, so that a new daemon can open the book. The
+	// reports stop first: a closed gate turns away each new report, and
+	// the exclusive section waits for each report that runs.
+	defer d.cfg.Platform.Guard.Exclusive(func(reconcile.Backend) { l.closeBook() })
+	defer publishView(&d.view, core.Gate{State: core.Closed{Err: ErrStopped}}, nil)
 	l.loadStored(ctx)
 	wake := time.NewTimer(0) // armWake sets it before the first select
 	defer wake.Stop()
@@ -332,6 +349,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return nil
 		case req := <-d.requests:
 			req(ctx, l)
+		case <-d.reports.ready:
+			for _, ev := range d.reports.drain() {
+				l.drive(ctx, ev)
+			}
+			// Before the convergence that a failure asks for: Status
+			// tells the failure while the repair runs.
+			l.publish(ctx)
+		case f := <-l.factsChan():
+			l.facts = f
+			l.drive(ctx, core.BookChanged{At: time.Now(), Facts: f})
 		case <-changes:
 			l.drive(ctx, core.InterfacesChanged{At: time.Now()})
 		case r := <-l.accountResults:
@@ -344,62 +371,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 			l.drive(ctx, core.SelfTestResult{At: time.Now(), Proved: r.proved, Missed: r.missed})
 		}
 	}
-}
-
-// Observe implements ipc.Handler. A name that matches no policy gets a
-// nil error and an unprotected ack. The address list and the ruleset are
-// not checked then. For a name that matches a policy, a nil error means
-// that every address is in the table of each matching policy and in the
-// address book on disk, and that the installed ruleset is loaded. The ack is
-// then protected. It returns ErrNotReady in StateStarting, ErrUnenforced
-// when enforcement is not installed, an error that wraps
-// matcher.ErrMalformedName for a name that cannot be classified, and the
-// platform error otherwise. See call for ctx.Err() and ErrStopped.
-func (d *Daemon) Observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
-	type result struct {
-		ack  ipc.Ack
-		err  error
-		wait time.Duration
-		took time.Duration
-	}
-	queued := time.Now()
-	r, cerr := call(ctx, d, func(ctx context.Context, l *loop) result {
-		began := time.Now()
-		ack, err := l.observe(ctx, o)
-		return result{ack, err, began.Sub(queued), time.Since(began)}
-	})
-	if cerr != nil {
-		d.logReport(ctx, logattr.ReportNotAcknowledged, time.Since(queued), -1)
-		return ipc.Ack{}, cerr
-	}
-	outcome := logattr.ReportUnprotected
-	switch {
-	case r.err != nil:
-		outcome = logattr.ReportNotAcknowledged
-	case r.ack.Protected:
-		outcome = logattr.ReportProtected
-	}
-	d.logReport(ctx, outcome, r.wait, r.took)
-	return r.ack, r.err
-}
-
-// logReport writes the debug event of one Observe call. wait is the time
-// before the loop took the report, and took is the time that the loop
-// spent on it. A negative took means that the loop did not take the
-// report. The call writes the event after the reply, on the goroutine of
-// the caller, so the event adds no time to the loop.
-//
-// The event is debug because each report from ifbound-dns makes one. A convergence on the loop shows as a long wait of the reports
-// that arrive during it.
-func (d *Daemon) logReport(ctx context.Context, outcome string, wait, took time.Duration) {
-	attrs := []slog.Attr{
-		slog.String(logattr.ReportResult, outcome),
-		slog.Int64(logattr.ReportWaitUS, wait.Microseconds()),
-	}
-	if took >= 0 {
-		attrs = append(attrs, slog.Int64(logattr.ReportObserveUS, took.Microseconds()))
-	}
-	d.cfg.Logger.LogAttrs(ctx, slog.LevelDebug, "report", attrs...)
 }
 
 // Apply checks, stores, and applies the configuration in data. It runs
@@ -444,7 +415,9 @@ func (d *Daemon) Apply(ctx context.Context, data []byte) (Status, error) {
 // Status returns a copy of the daemon state that the loop published
 // last. It does not wait for the loop, so it answers also during a slow
 // convergence. The copy is never older than the last request that
-// returned, and than the last loop pass that ended. Before Run starts,
+// returned, and than the last loop pass that ended. A report is no
+// request: its failure shows in the copy once the loop takes it, before
+// the convergence that the failure asks for. Before Run starts,
 // it is the status of StateStarting. It returns ErrStopped when Run has
 // returned. ctx is not used: Status does not block.
 func (d *Daemon) Status(context.Context) (Status, error) {
@@ -461,7 +434,9 @@ func (d *Daemon) Status(context.Context) (Status, error) {
 
 // call runs f on the loop goroutine and returns its result. The loop
 // publishes its status before the reply, so a Status call after call
-// returns sees the effect of f. Its error is
+// returns sees the effect of f. A report is no request: its outcome
+// reaches Status when the loop takes it, after Observe returned. Its
+// error is
 // ctx.Err() when ctx ends before the loop takes the request, and
 // ErrStopped when Run has returned; f then did not run. Once the loop
 // takes the request, call waits for the result and ignores ctx, so the

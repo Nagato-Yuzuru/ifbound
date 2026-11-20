@@ -870,22 +870,20 @@ func TestDisabledFirewallStopsTheNextAck(t *testing.T) {
 	})
 }
 
-func TestObserveReturnsContextErrorWhileLoopIsBusy(t *testing.T) {
+// A report that waits for a convergence that holds the enforcement
+// gives up when its ctx ends, and stores nothing.
+func TestObserveReturnsContextErrorWhileAConvergenceRuns(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := newHarness(t, configV1)
 		defer h.stop()
+		h.wantState(daemon.StateReady)
 		release := make(chan struct{})
+		h.world.FlushTable("web")
 		h.world.SetBeforeWrite(func(int) error {
 			<-release
 			return nil
 		})
-		var wg sync.WaitGroup
-		wg.Go(func() {
-			if err := h.d.Reconfigure(t.Context(), parse(t, configV2)); err != nil {
-				t.Errorf("Reconfigure = %v", err)
-			}
-		})
-		synctest.Wait() // the loop is now inside the Reconfigure write
+		heal() // the self-heal now waits inside its first write
 
 		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 		defer cancel()
@@ -894,10 +892,11 @@ func TestObserveReturnsContextErrorWhileLoopIsBusy(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Errorf("Observe = %v, want DeadlineExceeded", err)
 		}
+		h.world.SetBeforeWrite(nil)
 		close(release)
-		wg.Wait()
-		if st := h.status(); st.Addrs != 0 {
-			t.Errorf("a report that the loop never took stored %d addresses", st.Addrs)
+		synctest.Wait()
+		if got := h.saved("web"); len(got) != 0 {
+			t.Errorf("book web = %v; a report that gave up stored addresses", got)
 		}
 	})
 }

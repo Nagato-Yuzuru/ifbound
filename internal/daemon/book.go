@@ -12,6 +12,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
+	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 )
 
 // addrBook is the address book as the loop uses it. *addrstore.Store
@@ -55,6 +56,26 @@ func (l *loop) latestFacts() addrstore.BookFacts {
 	default:
 	}
 	return l.facts
+}
+
+// factsChan returns the channel of the facts of the open book, or nil when
+// the loop holds no book: a receive from nil blocks forever.
+func (l *loop) factsChan() <-chan addrstore.BookFacts {
+	if l.book == nil {
+		return nil
+	}
+	return l.book.Facts()
+}
+
+// publishView publishes the gate and the book for the reports. The
+// ledger is the book only while the gate is open: a closed gate needs
+// none.
+func (l *loop) publishView() {
+	var ledger reconcile.Ledger
+	if _, open := l.gate.State.(core.Open); open {
+		ledger = l.book
+	}
+	publishView(l.view, l.gate, ledger)
 }
 
 // openBookNow runs e. After a good open, the loop holds the book.

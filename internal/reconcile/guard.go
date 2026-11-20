@@ -3,7 +3,6 @@ package reconcile
 import (
 	"context"
 	"net/netip"
-	"sync"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
@@ -34,23 +33,68 @@ type Adder interface {
 //
 // The Guard counts the calls itself. A convergence cannot forget to
 // tell it about a write.
+//
+// The lock is made of channels, not of a sync.RWMutex: a goroutine that
+// waits on a channel is durably blocked in a testing/synctest bubble,
+// and one that waits on a mutex is not. A report that sleeps in its
+// shared section would else stop the fake clock while a convergence
+// waits. As sync.RWMutex does, a waiting Exclusive call stops new
+// Shared calls, so the reports cannot starve a convergence.
 type Guard struct {
-	mu    sync.RWMutex
-	b     Backend
-	epoch uint64 // written only while mu is locked for writing
+	b Backend
+	// turn is held by an Exclusive call from its start to its end. Each
+	// Shared call passes it first.
+	turn chan struct{}
+	// held is held by the Exclusive call that runs, or by the Shared
+	// calls that run, as a group.
+	held chan struct{}
+	// mu guards readers.
+	mu      chan struct{}
+	readers int
+	epoch   uint64 // written only while an Exclusive call holds held
 }
 
 // NewGuard returns a Guard for b with epoch 0. Every use of b must then
 // go through the Guard.
 func NewGuard(b Backend) *Guard {
-	return &Guard{b: b}
+	return &Guard{b: b, turn: make(chan struct{}, 1), held: make(chan struct{}, 1), mu: make(chan struct{}, 1)}
 }
 
 // Shared calls f with the Adder part of the Backend. Other calls of
 // Shared run at the same time. No call of Exclusive runs while f runs.
-func (g *Guard) Shared(f func(Adder) error) error {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
+// When ctx ends before f can start, Shared returns ctx.Err() and does
+// not call f: a report does not wait for a slow convergence after its
+// caller left.
+func (g *Guard) Shared(ctx context.Context, f func(Adder) error) error {
+	select {
+	case g.turn <- struct{}{}:
+		<-g.turn
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	select {
+	case g.mu <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if g.readers == 0 {
+		select {
+		case g.held <- struct{}{}:
+		case <-ctx.Done():
+			<-g.mu
+			return ctx.Err()
+		}
+	}
+	g.readers++
+	<-g.mu
+	defer func() {
+		g.mu <- struct{}{}
+		g.readers--
+		if g.readers == 0 {
+			<-g.held
+		}
+		<-g.mu
+	}()
 	return f(g.b)
 }
 
@@ -60,8 +104,12 @@ func (g *Guard) Shared(f func(Adder) error) error {
 // The Backend that f gets is valid only until f returns. A use after
 // that panics.
 func (g *Guard) Exclusive(f func(Backend)) uint64 {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	g.turn <- struct{}{}
+	g.held <- struct{}{}
+	defer func() {
+		<-g.held
+		<-g.turn
+	}()
 	w := &counted{g: g}
 	defer func() { w.g = nil }()
 	f(w)

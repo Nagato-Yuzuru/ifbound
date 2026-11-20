@@ -99,17 +99,18 @@ attributes:
     type: int
     stability: development
     brief: >-
-      The time that a DNS report waited for the loop of the daemon, in
-      microseconds. A report waits while the loop runs a convergence or
-      other requests.
+      The time that a DNS report waited for the new gate after a
+      convergence changed the enforcement during the report, in
+      microseconds. The report then ran again under the new gate.
     examples: [80000]
     annotations: {go: {name: ReportWaitUS}}
   - key: ifbound.report.observe_us
     type: int
     stability: development
     brief: >-
-      The time that the loop took to handle a DNS report, in microseconds.
-      It is not set when the loop did not take the report.
+      The time of the whole DNS report, in microseconds. It includes the
+      wait for a convergence that holds the enforcement, and
+      ifbound.report.wait_us.
     examples: [6900]
     annotations: {go: {name: ReportObserveUS}}
   - key: ifbound.enforcement.state

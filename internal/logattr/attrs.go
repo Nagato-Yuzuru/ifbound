@@ -59,13 +59,13 @@ const (
 	// The names of the policies that the event is about.
 	PolicyNames = "ifbound.policy.names"
 
-	// The time that the loop took to handle a DNS report, in microseconds. It is not set when the loop did not take the report.
+	// The time of the whole DNS report, in microseconds. It includes the wait for a convergence that holds the enforcement, and ifbound.report.wait_us.
 	ReportObserveUS = "ifbound.report.observe_us"
 
 	// The outcome of a DNS report from ifbound-dns.
 	ReportResult = "ifbound.report.result"
 
-	// The time that a DNS report waited for the loop of the daemon, in microseconds. A report waits while the loop runs a convergence or other requests.
+	// The time that a DNS report waited for the new gate after a convergence changed the enforcement during the report, in microseconds. The report then ran again under the new gate.
 	ReportWaitUS = "ifbound.report.wait_us"
 
 	// The round stopped before its end, because the configuration or the state changed. The lists hold only the names that were done.

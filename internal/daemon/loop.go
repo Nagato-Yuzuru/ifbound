@@ -10,10 +10,8 @@ import (
 	"time"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/addrstore"
-	"github.com/Nagato-Yuzuru/ifbound/internal/blockable"
 	"github.com/Nagato-Yuzuru/ifbound/internal/configstore"
 	"github.com/Nagato-Yuzuru/ifbound/internal/daemon/core"
-	"github.com/Nagato-Yuzuru/ifbound/internal/ipc"
 	"github.com/Nagato-Yuzuru/ifbound/internal/logattr"
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
@@ -43,8 +41,10 @@ type loop struct {
 	storeGID int
 	storeFn  storeFunc
 	log      *slog.Logger
-	// pub receives the status that Daemon.Status returns.
-	pub *atomic.Pointer[Status]
+	// pub receives the status that Daemon.Status returns, and view the
+	// view that Daemon.Observe reads.
+	pub  *atomic.Pointer[Status]
+	view *atomic.Pointer[reportView]
 
 	// core is the state that core.Step decides on. Only drive changes it.
 	core core.State
@@ -70,17 +70,13 @@ type loop struct {
 	// effect of core sets it. A second trigger before the pass does not
 	// replace the first. Each pass clears it (see converge).
 	pending string
-	// reportFailed is true after a report failure that core got, until a
-	// report succeeds. Only then does a success go to core.
-	reportFailed bool
-
 	// failed is the error.type and the error text of the last
 	// convergence, or "" when it succeeded. A failure that repeats is
 	// logged at debug.
 	failed string
 }
 
-func newLoop(c Config, store storeFunc, openBook openBookFunc, pub *atomic.Pointer[Status]) *loop {
+func newLoop(c Config, store storeFunc, openBook openBookFunc, pub *atomic.Pointer[Status], view *atomic.Pointer[reportView]) *loop {
 	s := core.New(time.Now(), c.Accounts != nil)
 	return &loop{
 		rec:       c.Platform,
@@ -92,6 +88,7 @@ func newLoop(c Config, store storeFunc, openBook openBookFunc, pub *atomic.Point
 		storeFn:   store,
 		log:       c.Logger,
 		pub:       pub,
+		view:      view,
 		core:      s,
 		gate:      core.GateOf(s),
 		logged:    core.PhaseOf(s),
@@ -323,53 +320,4 @@ func (l *loop) logApply(ctx context.Context, previous configstore.Digest, hadCon
 		attrs = append(attrs, slog.String(logattr.ErrorType, errType), slog.String(logattr.ExceptionMessage, err.Error()))
 	}
 	l.log.LogAttrs(ctx, level, "apply", attrs...)
-}
-
-// observe handles one DNS report. The report is untrusted: only the
-// policies that match its name get its addresses.
-//
-// core.Admit decides on a closed gate, a malformed name, and a name that
-// matches no policy (an unprotected ack, with no check). For a name that
-// matches a policy, reconcile.Record adds the addresses to the tables
-// and the book and checks the loaded ruleset, and core.AckAfterCheck
-// decides with the gate after the check. The check costs one LoadedID
-// read per report that matches a policy. ifbound-dns removes the
-// aliases from the reply when the ack is protected.
-//
-// A failure of the report path goes to core as a ReportFailed. After
-// one, the next protected ack sends a ReportSucceeded.
-func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
-	names, epoch, a, decided := core.Admit(l.gate, o.QName)
-	if !decided {
-		addrs := blockable.Filter(o.Addrs)
-		c, err := reconcile.Record(ctx, l.rec.Guard, l.book, reconcile.Sighting{
-			Names: names, Addrs: addrs, TTL: o.TTL, At: time.Now(), Epoch: epoch,
-		})
-		if err == nil && len(addrs) > 0 {
-			l.noteFacts(ctx)
-		}
-		a = core.AckAfterCheck(l.gate, c, err)
-	}
-	if step, err, ok := a.Failure(); ok {
-		l.reportFailed = true
-		l.drive(ctx, core.ReportFailed{At: time.Now(), Step: step, Err: err})
-	} else if a.Protected() && l.reportFailed {
-		l.reportFailed = false
-		l.drive(ctx, core.ReportSucceeded{At: time.Now()})
-	}
-	if err := a.Err(); err != nil {
-		return ipc.Ack{}, err
-	}
-	return ipc.Ack{Protected: a.Protected()}, nil
-}
-
-// noteFacts gives new facts of the book to core, when the book sent
-// some. A commit sends them.
-func (l *loop) noteFacts(ctx context.Context) {
-	select {
-	case f := <-l.book.Facts():
-		l.facts = f
-		l.drive(ctx, core.BookChanged{At: time.Now(), Facts: f})
-	default:
-	}
 }
