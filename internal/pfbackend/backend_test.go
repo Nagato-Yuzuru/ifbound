@@ -22,6 +22,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
+	"github.com/Nagato-Yuzuru/ifbound/pf"
 )
 
 const testPolicies = `
@@ -432,6 +433,113 @@ func TestAckPathStartsNoPfctl(t *testing.T) {
 	if len(r.k.states) != 0 {
 		t.Errorf("states after AddEntries = %v, want none", r.k.states)
 	}
+}
+
+// The ack path runs concurrently: reports call LoadedID and AddEntries at
+// the same time. The Backend here is new on a loaded kernel, as after a
+// restart, so it knows no token yet. The race detector then also finds a
+// LoadedID that takes the tokens from the anchor.
+func TestAckPathIsSafeForConcurrentUse(t *testing.T) {
+	r := newRig(t)
+	rs := compileRS(t, testPolicies)
+	mustLoad(t, r, rs)
+	dev := &serialDevice{Device: r.k}
+	b := pfbackend.New(r.k, dev, r.clk.now, slog.New(r.log))
+	const n = 8
+	var want []netip.Prefix
+	var wg sync.WaitGroup
+	for i := range n {
+		e := netip.PrefixFrom(netip.AddrFrom4([4]byte{198, 51, 100, byte(i + 1)}), 32)
+		want = append(want, e)
+		wg.Go(func() {
+			if err := b.AddEntries(t.Context(), "bing", []netip.Prefix{e}); err != nil {
+				t.Errorf("AddEntries(%v): %v", e, err)
+			}
+		})
+		wg.Go(func() {
+			if id, err := b.LoadedID(t.Context()); err != nil || id != rs.ID() {
+				t.Errorf("LoadedID = (%q, %v), want %q", id, err, rs.ID())
+			}
+		})
+	}
+	wg.Wait()
+	if got := r.k.tables[ifb]["bing"]; !maps.Equal(got, sortedTable(want)) {
+		t.Errorf("bing = %v, want %v", got, want)
+	}
+}
+
+// serialDevice runs one call of the Device at a time, as the kernel runs
+// one ioctl on /dev/pf at a time. The kernel model is not safe for
+// concurrent use.
+type serialDevice struct {
+	mu sync.Mutex
+	pfbackend.Device
+}
+
+func (d *serialDevice) Status() (pf.Status, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.Status()
+}
+
+func (d *serialDevice) Rules(rs pf.Ruleset) ([]pf.Rule, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.Rules(rs)
+}
+
+func (d *serialDevice) Anchors(anchor string) ([]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.Anchors(anchor)
+}
+
+func (d *serialDevice) CreateTable(t pf.Table) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.CreateTable(t)
+}
+
+func (d *serialDevice) AddAddrs(t pf.Table, addrs []pf.Addr) ([]pf.Feedback, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.AddAddrs(t, addrs)
+}
+
+func (d *serialDevice) DeleteAddrs(t pf.Table, addrs []pf.Addr) ([]pf.Feedback, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.DeleteAddrs(t, addrs)
+}
+
+func (d *serialDevice) Addrs(t pf.Table) ([]pf.Addr, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.Addrs(t)
+}
+
+func (d *serialDevice) KillStates(dst netip.Prefix) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.KillStates(dst)
+}
+
+func (d *serialDevice) StartRef() (uint64, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.StartRef()
+}
+
+func (d *serialDevice) StopRef(token uint64) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.StopRef(token)
+}
+
+func (d *serialDevice) Refs() ([]pf.Ref, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.Refs()
 }
 
 // sortedTable returns the table of a model that holds entries, none
