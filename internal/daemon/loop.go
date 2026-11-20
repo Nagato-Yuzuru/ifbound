@@ -328,105 +328,48 @@ func (l *loop) logApply(ctx context.Context, previous configstore.Digest, hadCon
 // observe handles one DNS report. The report is untrusted: only the
 // policies that match its name get its addresses.
 //
-// A name that matches no policy gets an unprotected ack, with no check.
-// For a name that matches a policy, the order is: record the addresses,
-// check that the installed ruleset is loaded, and only then ack as
-// protected. A report without an address skips record but not the check.
-// The check costs one LoadedID read per report that matches a policy.
-// ifbound-dns removes the aliases from the reply when the ack is
-// protected.
+// core.Admit decides on a closed gate, a malformed name, and a name that
+// matches no policy (an unprotected ack, with no check). For a name that
+// matches a policy, reconcile.Record adds the addresses to the tables
+// and the book and checks the loaded ruleset, and core.AckAfterCheck
+// decides with the gate after the check. The check costs one LoadedID
+// read per report that matches a policy. ifbound-dns removes the
+// aliases from the reply when the ack is protected.
+//
+// A failure of the report path goes to core as a ReportFailed. After
+// one, the next protected ack sends a ReportSucceeded.
 func (l *loop) observe(ctx context.Context, o ipc.Observation) (ipc.Ack, error) {
-	if c, ok := l.gate.State.(core.Closed); ok {
-		return ipc.Ack{}, c.Err
-	}
-	names, err := l.gate.Matcher.Match(o.QName)
-	if err != nil {
-		return ipc.Ack{}, fmt.Errorf("classifying qname: %w", err)
-	}
-	if len(names) == 0 {
-		return ipc.Ack{}, nil
-	}
-	if len(o.Addrs) > 0 {
-		if err := l.record(ctx, names, o); err != nil {
-			return ipc.Ack{}, err
+	names, epoch, a, decided := core.Admit(l.gate, o.QName)
+	if !decided {
+		addrs := blockable.Filter(o.Addrs)
+		c, err := reconcile.Record(ctx, l.rec.Guard, l.book, reconcile.Sighting{
+			Names: names, Addrs: addrs, TTL: o.TTL, At: time.Now(), Epoch: epoch,
+		})
+		if err == nil && len(addrs) > 0 {
+			l.noteFacts(ctx)
 		}
+		a = core.AckAfterCheck(l.gate, c, err)
 	}
-	if err := l.checkInstalled(ctx); err != nil {
-		return ipc.Ack{}, err
-	}
-	if l.reportFailed {
+	if step, err, ok := a.Failure(); ok {
+		l.reportFailed = true
+		l.drive(ctx, core.ReportFailed{At: time.Now(), Step: step, Err: err})
+	} else if a.Protected() && l.reportFailed {
 		l.reportFailed = false
 		l.drive(ctx, core.ReportSucceeded{At: time.Now()})
 	}
-	return ipc.Ack{Protected: true}, nil
+	if err := a.Err(); err != nil {
+		return ipc.Ack{}, err
+	}
+	return ipc.Ack{Protected: a.Protected()}, nil
 }
 
-// reportFailure gives a failure of the report path to core, and returns
-// err.
-func (l *loop) reportFailure(ctx context.Context, step reconcile.ReportStep, err error) error {
-	l.reportFailed = true
-	l.drive(ctx, core.ReportFailed{At: time.Now(), Step: step, Err: err})
-	return err
-}
-
-// record puts the addresses of o in the tables and the book of each
-// policy in names, in this order. It skips the addresses that
-// blockable.New refuses, so the book does not keep them either. The same
-// slice goes to the book and to the tables, so a table entry and its
-// book key cannot differ. An address is in the book only after its
-// commit: after a failure, the book does not have the new addresses, and
-// the report is not acknowledged. The gate is open, so the loop holds
-// the book.
-func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observation) error {
-	addrs := blockable.Filter(o.Addrs)
-	p, err := l.book.Touch(names, addrs, o.TTL, time.Now())
-	if err != nil {
-		return fmt.Errorf("recording addresses: %w", err)
-	}
-	err = l.rec.Guard.Shared(func(a reconcile.Adder) error {
-		for _, name := range names {
-			if err := reconcile.AddObserved(ctx, a, name, addrs); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
-	if err != nil {
-		return l.reportFailure(ctx, reconcile.StepTableAdd, err)
-	}
-	if err := l.book.Commit(ctx, p); err != nil {
-		return l.reportFailure(ctx, reconcile.StepCommit, fmt.Errorf("saving the address book: %w", err))
-	}
-	if !p.Empty() {
-		l.drive(ctx, core.BookChanged{At: time.Now(), Facts: l.latestFacts()})
-	}
-	return nil
-}
-
-// checkInstalled returns nil when the Backend has the installed ruleset
-// of the gate loaded. It reads the gate after the read of the Backend,
-// so it never trusts an older gate. When the gate is closed, it returns
-// the error of the gate. When another ruleset is loaded, something
-// outside ifbound changed it: the phase then stops acknowledging, Run
-// converges right after this request, and it returns ErrUnenforced.
-func (l *loop) checkInstalled(ctx context.Context) error {
-	var id string
-	err := l.rec.Guard.Shared(func(a reconcile.Adder) (err error) {
-		id, err = a.LoadedID(ctx)
-		return err
-	})
-	if err != nil {
-		return l.reportFailure(ctx, reconcile.StepLoadedID, fmt.Errorf("reading the loaded ruleset: %w", err))
-	}
-	switch g := l.gate.State.(type) {
-	case core.Closed:
-		return g.Err
-	case core.Open:
-		if id != g.Installed {
-			return l.reportFailure(ctx, reconcile.StepRuleset, ErrUnenforced)
-		}
-		return nil
+// noteFacts gives new facts of the book to core, when the book sent
+// some. A commit sends them.
+func (l *loop) noteFacts(ctx context.Context) {
+	select {
+	case f := <-l.book.Facts():
+		l.facts = f
+		l.drive(ctx, core.BookChanged{At: time.Now(), Facts: f})
 	default:
-		panic(fmt.Sprintf("daemon: unknown gate state %T", g))
 	}
 }
