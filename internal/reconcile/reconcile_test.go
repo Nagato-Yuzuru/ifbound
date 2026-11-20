@@ -84,7 +84,7 @@ func newFixture(t *testing.T, cfgText string) *fixture {
 	}
 	f.rec = reconcile.Reconciler{
 		Compiler:  reconciletest.Compiler{},
-		Backend:   f.world.Backend(),
+		Guard:     reconcile.NewGuard(f.world.Backend()),
 		Resolver:  f.world.Resolver(),
 		Inventory: f.inv,
 	}
@@ -148,7 +148,7 @@ func (f *fixture) inputs() reconcile.Inputs {
 
 func (f *fixture) converge(t *testing.T) reconcile.Report {
 	t.Helper()
-	rep, err := f.rec.Converge(t.Context(), f.inputs())
+	rep, _, err := f.rec.Converge(t.Context(), f.inputs())
 	if err != nil {
 		t.Fatalf("Converge: %v", err)
 	}
@@ -385,7 +385,7 @@ func TestConvergeAddOnlyRemovesNothing(t *testing.T) {
 	in := f.inputs()
 	in.AddOnly = true
 
-	rep, err := f.rec.Converge(t.Context(), in)
+	rep, _, err := f.rec.Converge(t.Context(), in)
 	if err != nil {
 		t.Fatalf("Converge: %v", err)
 	}
@@ -480,7 +480,7 @@ func TestConvergeReportsProblemsAfterTheLoad(t *testing.T) {
 			f.world.SetProblems([]reconcile.Problem{unreferenced}, nil)
 			f.world.SetEnableRefused(tt.refuse)
 
-			rep, err := f.rec.Converge(t.Context(), f.inputs())
+			rep, _, err := f.rec.Converge(t.Context(), f.inputs())
 
 			if !errors.Is(err, tt.wantErr) {
 				t.Fatalf("err = %v, want %v", err, tt.wantErr)
@@ -511,9 +511,9 @@ func (b *readOnce) Read(ctx context.Context) (reconcile.BackendState, error) {
 func TestConvergeNotInstalledWhenTheReadAfterTheLoadFails(t *testing.T) {
 	f := installV1(t)
 	f.world.DisableFirewall()
-	f.rec.Backend = &readOnce{Backend: f.world.Backend()}
+	f.rec.Guard = reconcile.NewGuard(&readOnce{Backend: f.world.Backend()})
 
-	rep, err := f.rec.Converge(t.Context(), f.inputs())
+	rep, _, err := f.rec.Converge(t.Context(), f.inputs())
 
 	if !errors.Is(err, reconciletest.ErrInjected) || rep.Installed != "" {
 		t.Errorf("err %v, installed %q; want ErrInjected and nothing installed", err, rep.Installed)
@@ -564,7 +564,7 @@ func TestConvergeNotInstalledWhenTheRulesetChangesDuringThePass(t *testing.T) {
 				}
 			})
 
-			rep, err := f.rec.Converge(t.Context(), f.inputs())
+			rep, _, err := f.rec.Converge(t.Context(), f.inputs())
 
 			if err == nil || rep.Installed != "" {
 				t.Errorf("err %v, installed %q; want an error and nothing installed", err, rep.Installed)
@@ -594,7 +594,7 @@ func TestConvergeReportsCompilerProblemsFirst(t *testing.T) {
 	in := f.inputs()
 	in.Accounts = reconcile.Accounts{Users: map[string]uint32{"b": 2, "a": 1}}
 
-	rep, err := f.rec.Converge(t.Context(), in)
+	rep, _, err := f.rec.Converge(t.Context(), in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -617,7 +617,7 @@ func TestConvergeRunsResolverPartWhenBackendFails(t *testing.T) {
 		return nil
 	})
 
-	rep, err := f.rec.Converge(t.Context(), f.inputs())
+	rep, _, err := f.rec.Converge(t.Context(), f.inputs())
 
 	if !errors.Is(err, reconciletest.ErrInjected) {
 		t.Fatalf("err = %v, want ErrInjected", err)
@@ -643,7 +643,7 @@ func TestConvergeInstallsDespiteResolverFailure(t *testing.T) {
 		return nil
 	})
 
-	rep, err := f.rec.Converge(t.Context(), f.inputs())
+	rep, _, err := f.rec.Converge(t.Context(), f.inputs())
 
 	if !errors.Is(err, reconciletest.ErrInjected) {
 		t.Fatalf("err = %v, want ErrInjected", err)
@@ -659,7 +659,7 @@ func TestConvergeNotInstalledWhenRemovalFails(t *testing.T) {
 	f.book.expire()
 	f.world.SetBeforeWrite(func(int) error { return reconciletest.ErrInjected })
 
-	rep, err := f.rec.Converge(t.Context(), f.inputs())
+	rep, _, err := f.rec.Converge(t.Context(), f.inputs())
 
 	if !errors.Is(err, reconciletest.ErrInjected) || rep.Installed != "" {
 		t.Errorf("err %v, installed %q; want ErrInjected and nothing installed", err, rep.Installed)
@@ -708,7 +708,7 @@ func TestAdoptableOfEmptyKernelIsEmpty(t *testing.T) {
 
 func TestAddObservedAddsHostEntries(t *testing.T) {
 	f := installV1(t)
-	if err := f.rec.AddObserved(t.Context(), "web", learned("203.0.113.7", "3fff::7")); err != nil {
+	if err := reconcile.AddObserved(t.Context(), f.world.Backend(), "web", learned("203.0.113.7", "3fff::7")); err != nil {
 		t.Fatalf("AddObserved: %v", err)
 	}
 
@@ -723,7 +723,7 @@ func TestAddObservedWithNoAddressWritesNothing(t *testing.T) {
 	f := installV1(t)
 	before := f.world.Writes()
 
-	if err := f.rec.AddObserved(t.Context(), "web", nil); err != nil {
+	if err := reconcile.AddObserved(t.Context(), f.world.Backend(), "web", nil); err != nil {
 		t.Fatalf("AddObserved: %v", err)
 	}
 	if f.world.Writes() != before {

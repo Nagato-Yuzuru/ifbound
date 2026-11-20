@@ -68,7 +68,7 @@ func TestLoopbackAnswerDoesNotBlockLocalService(t *testing.T) {
 	}
 	rec := reconcile.Reconciler{
 		Compiler:  pfrules.Compiler{},
-		Backend:   b,
+		Guard:     reconcile.NewGuard(b),
 		Resolver:  reconciletest.NewWorld().Resolver(),
 		Inventory: reconciletest.NewInventory(),
 	}
@@ -86,13 +86,15 @@ func TestLoopbackAnswerDoesNotBlockLocalService(t *testing.T) {
 	learned := netip.MustParseAddr("192.0.2.10")
 	// The daemon builds learned addresses with blockable.Filter, as here.
 	book := fixedBook(blockable.Filter(append(slices.Clone(local), learned)))
-	if _, err := rec.Converge(t.Context(), reconcile.Inputs{Policies: cfg.Policies, Book: book}); err != nil {
+	if _, _, err := rec.Converge(t.Context(), reconcile.Inputs{Policies: cfg.Policies, Book: book}); err != nil {
 		t.Fatalf("Converge: %v", err)
 	}
 	// A report with a refused and a valid address: only the valid one
 	// reaches the table.
 	reported := netip.MustParseAddr("192.0.2.11")
-	if err := rec.AddObserved(t.Context(), "e2e-lo", blockable.Filter([]netip.Addr{netip.MustParseAddr("127.0.0.53"), reported})); err != nil {
+	addrs := blockable.Filter([]netip.Addr{netip.MustParseAddr("127.0.0.53"), reported})
+	err = rec.Guard.Shared(func(a reconcile.Adder) error { return reconcile.AddObserved(t.Context(), a, "e2e-lo", addrs) })
+	if err != nil {
 		t.Fatalf("AddObserved: %v", err)
 	}
 

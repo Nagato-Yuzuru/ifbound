@@ -636,13 +636,13 @@ func TestReconcilerConvergesOnDirectory(t *testing.T) {
 	world := reconciletest.NewWorld()
 	rec := reconcile.Reconciler{
 		Compiler:  reconciletest.Compiler{},
-		Backend:   world.Backend(),
+		Guard:     reconcile.NewGuard(world.Backend()),
 		Resolver:  f.r,
 		Inventory: reconciletest.NewInventory(),
 	}
 	in := reconcile.Inputs{Apexes: []policy.Domain{domain(t, "example.test")}, Listen: listen}
 
-	rep, err := rec.Converge(t.Context(), in)
+	rep, _, err := rec.Converge(t.Context(), in)
 	if err != nil {
 		t.Fatalf("first Converge: %v", err)
 	}
@@ -655,13 +655,13 @@ func TestReconcilerConvergesOnDirectory(t *testing.T) {
 		t.Errorf("entries after the first convergence = %v, want %v", got, want)
 	}
 
-	if rep, err = rec.Converge(t.Context(), in); err != nil || rep.Writes != 0 {
+	if rep, _, err = rec.Converge(t.Context(), in); err != nil || rep.Writes != 0 {
 		t.Errorf("second Converge = %d writes, %v; want 0 writes and no error", rep.Writes, err)
 	}
 
 	in.Apexes = append(in.Apexes, domain(t, "foreign.test"))
 	f.put(t, "foreign.test", "nameserver 192.0.2.1\n")
-	rep, err = rec.Converge(t.Context(), in)
+	rep, _, err = rec.Converge(t.Context(), in)
 	if !errors.Is(err, ErrConflict) {
 		t.Errorf("Converge with a foreign file = %v, want an error that wraps ErrConflict", err)
 	}
@@ -678,18 +678,18 @@ func TestReconcilerReportsPreexistingShadowOnSecondConvergence(t *testing.T) {
 	f.conf.entries = scutilConf(t, defaultBlock, "  domain   : www.example.test\n  nameserver[0] : 192.0.2.1\n")
 	rec := reconcile.Reconciler{
 		Compiler:  reconciletest.Compiler{},
-		Backend:   reconciletest.NewWorld().Backend(),
+		Guard:     reconcile.NewGuard(reconciletest.NewWorld().Backend()),
 		Resolver:  f.r,
 		Inventory: reconciletest.NewInventory(),
 	}
 	in := reconcile.Inputs{Apexes: []policy.Domain{domain(t, "example.test")}, Listen: listen}
 
-	rep, err := rec.Converge(t.Context(), in)
+	rep, _, err := rec.Converge(t.Context(), in)
 	if err != nil || len(rep.Problems) != 0 {
 		t.Errorf("first Converge = %+v, %v; want no problem and no error", rep.Problems, err)
 	}
 
-	rep, err = rec.Converge(t.Context(), in)
+	rep, _, err = rec.Converge(t.Context(), in)
 	if err != nil || rep.Writes != 0 {
 		t.Fatalf("second Converge = %d writes, %v; want 0 writes and no error", rep.Writes, err)
 	}

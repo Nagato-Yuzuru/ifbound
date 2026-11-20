@@ -184,7 +184,7 @@ func (l *loop) converge(ctx context.Context, trigger string) error {
 	if loaded {
 		src = l.book
 	}
-	rep, err := l.rec.Converge(ctx, reconcile.Inputs{
+	rep, epoch, err := l.rec.Converge(ctx, reconcile.Inputs{
 		Policies: c.Active.Config.Policies,
 		Book:     src,
 		Hosts:    l.hostAddrs(ctx, c.Active),
@@ -193,7 +193,7 @@ func (l *loop) converge(ctx context.Context, trigger string) error {
 		Accounts: l.core.AccountIDs(),
 		AddOnly:  !loaded,
 	})
-	l.drive(ctx, core.Converged{At: time.Now(), Report: rep, Err: err})
+	l.drive(ctx, core.Converged{At: time.Now(), Report: rep, Err: err, Epoch: epoch})
 	l.logStatesEnded(ctx, logattr.StatesCauseNarrowed, rep.Narrowed)
 	l.notePhase(ctx)
 	errType := logattr.ErrorTypePlatform
@@ -367,10 +367,16 @@ func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observatio
 	if err != nil {
 		return fmt.Errorf("recording addresses: %w", err)
 	}
-	for _, name := range names {
-		if err := l.rec.AddObserved(ctx, name, addrs); err != nil {
-			return err
+	err = l.rec.Guard.Shared(func(a reconcile.Adder) error {
+		for _, name := range names {
+			if err := reconcile.AddObserved(ctx, a, name, addrs); err != nil {
+				return err
+			}
 		}
+		return nil
+	})
+	if err != nil {
+		return err
 	}
 	if err := l.book.Commit(ctx, p); err != nil {
 		return fmt.Errorf("saving the address book: %w", err)
@@ -388,7 +394,11 @@ func (l *loop) record(ctx context.Context, names []policy.Name, o ipc.Observatio
 // stops acknowledging, and Run converges right after this request. It
 // returns ErrUnenforced in this case.
 func (l *loop) checkInstalled(ctx context.Context) error {
-	id, err := l.rec.Backend.LoadedID(ctx)
+	var id string
+	err := l.rec.Guard.Shared(func(a reconcile.Adder) (err error) {
+		id, err = a.LoadedID(ctx)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("reading the loaded ruleset: %w", err)
 	}

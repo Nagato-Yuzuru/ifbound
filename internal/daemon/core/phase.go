@@ -96,13 +96,15 @@ type Phase struct {
 // Acks reports whether the phase acknowledges reports.
 func (p Phase) Acks() bool { return p.Installed != "" }
 
-// Converged is the result of one convergence pass: its report and its
-// error. The pass ran under the configuration and the book state of the
-// State that it read, because the pass runs inside one drain.
+// Converged is the result of one convergence pass: its report, its
+// error, and the epoch of the Guard after its Backend part. The pass ran
+// under the configuration and the book state of the State that it read,
+// because the pass runs inside one drain.
 type Converged struct {
 	At     time.Time
 	Report reconcile.Report
 	Err    error
+	Epoch  uint64
 }
 
 // RulesetMismatch tells that a report found a loaded ruleset that is not
@@ -118,8 +120,6 @@ type enforcement struct {
 	// last is the outcome of the latest convergence, or nil before the
 	// first one.
 	last *outcome
-	// epoch counts the convergences.
-	epoch uint64
 	// mismatch is true when a report found another loaded ruleset after
 	// the last convergence.
 	mismatch bool
@@ -128,7 +128,8 @@ type enforcement struct {
 // outcome is one convergence and the state that it ran under.
 type outcome struct {
 	// gen is the configuration generation of the pass.
-	gen     uint64
+	gen uint64
+	// epoch is the epoch of the Guard after the pass.
 	epoch   uint64
 	addOnly bool
 	report  reconcile.Report
@@ -145,8 +146,7 @@ func (s State) applyConverged(ev Converged, out []Effect) (State, []Effect) {
 		return s, out
 	}
 	_, loaded := c.Book.(BookLoaded)
-	s.enf.epoch++
-	s.enf.last = &outcome{gen: c.Active.Gen, epoch: s.enf.epoch, addOnly: !loaded, report: ev.Report, err: ev.Err}
+	s.enf.last = &outcome{gen: c.Active.Gen, epoch: ev.Epoch, addOnly: !loaded, report: ev.Report, err: ev.Err}
 	s.enf.mismatch = false
 	if ev.Report.Installed != "" && loaded {
 		out = append(out, PruneBook{Keep: policyNames(c.Active.Config.Policies)})
@@ -277,8 +277,9 @@ type Gate struct {
 type GateState interface{ isGateState() }
 
 // Open: reports get an ack while the Backend has the ruleset Installed
-// loaded. Epoch is the count of convergences when the gate opened: a
-// gate of a later convergence has a larger Epoch.
+// loaded and the Guard still has Epoch. Epoch is the epoch of the Guard
+// after the convergence that opened the gate. A later write that can
+// remove an entry or replace the ruleset moves the epoch of the Guard.
 type Open struct {
 	Epoch     uint64
 	Installed string
@@ -299,7 +300,7 @@ func GateOf(s State) Gate {
 	}
 	switch p := PhaseOf(s); {
 	case p.Acks():
-		g.State = Open{Epoch: s.enf.epoch, Installed: p.Installed}
+		g.State = Open{Epoch: s.enf.last.epoch, Installed: p.Installed}
 	case p.Lifecycle == Starting:
 		g.State = Closed{Err: ErrNotReady}
 	default:

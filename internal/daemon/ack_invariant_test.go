@@ -158,7 +158,7 @@ func newRig(t *testing.T, world *reconciletest.World, dir string, cfgText string
 		Hosts: &fakeHosts{},
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
-			Backend:   world.Backend(),
+			Guard:     reconcile.NewGuard(world.Backend()),
 			Resolver:  rigResolver{Resolver: world.Resolver(), fail: &rg.resFail},
 			Inventory: rg.inv,
 		},

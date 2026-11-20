@@ -776,7 +776,7 @@ func (r *omRun) start() {
 		Hosts: &fakeHosts{},
 		Platform: reconcile.Reconciler{
 			Compiler:  reconciletest.Compiler{},
-			Backend:   &omBackend{in: r.world.Backend(), r: r},
+			Guard:     reconcile.NewGuard(&omBackend{in: r.world.Backend(), r: r}),
 			Resolver:  &omResolver{in: r.world.Resolver(), r: r},
 			Inventory: r.inv,
 		},

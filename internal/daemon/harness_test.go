@@ -216,7 +216,7 @@ func launchHook(t *testing.T, s harnessSpec, hook func(*daemon.Daemon)) *harness
 		Logger:     slog.New(logs),
 		Platform: reconcile.Reconciler{
 			Compiler:  scopeCompiler{},
-			Backend:   s.be,
+			Guard:     reconcile.NewGuard(s.be),
 			Resolver:  s.world.Resolver(),
 			Inventory: s.inv,
 		},

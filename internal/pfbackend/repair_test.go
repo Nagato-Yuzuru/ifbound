@@ -33,12 +33,12 @@ func converge(t *testing.T, r *rig) reconcile.Report {
 	}
 	rec := reconcile.Reconciler{
 		Compiler:  pfrules.Compiler{},
-		Backend:   r.b,
+		Guard:     reconcile.NewGuard(r.b),
 		Resolver:  reconciletest.NewWorld().Resolver(),
 		Inventory: reconciletest.NewInventory(modelIfaces...),
 	}
 	// Callers inject pfctl faults on purpose and judge the loaded state.
-	rep, _ := rec.Converge(t.Context(), reconcile.Inputs{ //nolint:errcheck // the injected fault makes it fail
+	rep, _, _ := rec.Converge(t.Context(), reconcile.Inputs{ //nolint:errcheck // the injected fault makes it fail
 		Policies: cfg.Policies,
 		Book:     emptyBook{},
 		Listen:   netip.MustParseAddrPort("127.0.0.1:10053"),

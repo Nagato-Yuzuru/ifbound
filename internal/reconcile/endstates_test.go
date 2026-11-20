@@ -76,7 +76,7 @@ func newStatesFixture(t *testing.T, cfgText string, ifaces ...reconcile.Interfac
 	t.Helper()
 	w := reconciletest.NewWorld()
 	f := &statesFixture{world: w, inv: reconciletest.NewInventory(ifaces...)}
-	f.rec = reconcile.Reconciler{Compiler: pfrules.Compiler{}, Backend: w.Backend(), Resolver: w.Resolver(), Inventory: f.inv}
+	f.rec = reconcile.Reconciler{Compiler: pfrules.Compiler{}, Guard: reconcile.NewGuard(w.Backend()), Resolver: w.Resolver(), Inventory: f.inv}
 	f.in = reconcile.Inputs{Policies: parse(t, cfgText).Policies, Book: noAddrs{}}
 	f.converge(t)
 	return f
@@ -84,7 +84,7 @@ func newStatesFixture(t *testing.T, cfgText string, ifaces ...reconcile.Interfac
 
 func (f *statesFixture) converge(t *testing.T) {
 	t.Helper()
-	rep, err := f.rec.Converge(t.Context(), f.in)
+	rep, _, err := f.rec.Converge(t.Context(), f.in)
 	if err != nil {
 		t.Fatalf("Converge: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestConvergeEndsStatesAgainAfterFailure(t *testing.T) {
 		return nil
 	})
 	f.inv.Set(en0)
-	if _, err := f.rec.Converge(t.Context(), f.in); !errors.Is(err, reconciletest.ErrInjected) {
+	if _, _, err := f.rec.Converge(t.Context(), f.in); !errors.Is(err, reconciletest.ErrInjected) {
 		t.Fatalf("Converge = %v, want the injected fault", err)
 	}
 	if got, want := f.change(t, en0), prefixes("192.0.2.10/32", "192.0.2.11/32"); !slices.Equal(got, want) {
@@ -229,7 +229,7 @@ name = "wifi"
 to = ["198.51.100.8"]
 deny_via = ["en1"]
 `, en0, utun4)
-	fresh := reconcile.Reconciler{Compiler: pfrules.Compiler{}, Backend: f.world.Backend(), Resolver: f.world.Resolver(), Inventory: f.inv}
+	fresh := reconcile.Reconciler{Compiler: pfrules.Compiler{}, Guard: reconcile.NewGuard(f.world.Backend()), Resolver: f.world.Resolver(), Inventory: f.inv}
 	f.rec = fresh
 	mark := len(f.world.EndedStates())
 	f.converge(t)
@@ -252,7 +252,7 @@ func TestConvergeCopyStartsAgain(t *testing.T) {
 	f := newStatesFixture(t, onlyConfig, en0, utun4)
 	cp := f.rec
 	mark := len(f.world.EndedStates())
-	if _, err := cp.Converge(t.Context(), f.in); err != nil {
+	if _, _, err := cp.Converge(t.Context(), f.in); err != nil {
 		t.Fatalf("Converge of the copy: %v", err)
 	}
 	want := prefixes("192.0.2.10/32", "192.0.2.11/32", "198.51.100.7/32")
@@ -310,7 +310,7 @@ deny_via = ["en1"]
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			f := newStatesFixture(t, cfg, en0)
-			f.rec = reconcile.Reconciler{Compiler: tt.compiler, Backend: f.world.Backend(), Resolver: f.world.Resolver(), Inventory: f.inv}
+			f.rec = reconcile.Reconciler{Compiler: tt.compiler, Guard: reconcile.NewGuard(f.world.Backend()), Resolver: f.world.Resolver(), Inventory: f.inv}
 			// The first pass of the new Reconciler records its verdicts.
 			f.converge(t)
 			if got := f.change(t, en0, en2); !slices.Equal(got, tt.want) {
@@ -361,7 +361,7 @@ func TestConvergeAddOnlyEndsStatesToEveryKeptEntry(t *testing.T) {
 			f.in.Book = book
 			f.converge(t)
 			if tt.fresh {
-				f.rec = reconcile.Reconciler{Compiler: pfrules.Compiler{}, Backend: f.world.Backend(), Resolver: f.world.Resolver(), Inventory: f.inv}
+				f.rec = reconcile.Reconciler{Compiler: pfrules.Compiler{}, Guard: reconcile.NewGuard(f.world.Backend()), Resolver: f.world.Resolver(), Inventory: f.inv}
 			}
 			mark, id := len(f.world.EndedStates()), f.world.Ruleset().ID()
 			f.inv.Set(tt.after...)

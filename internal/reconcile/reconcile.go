@@ -115,8 +115,9 @@ type ResolverReport struct {
 }
 
 // Reconciler converges the platform state. All fields are required. The
-// platform parts are not safe for concurrent use: call it from one
-// goroutine, and use one Reconciler for one platform.
+// Guard is the only way to the Backend. The other platform parts are not
+// safe for concurrent use: call Converge from one goroutine, and use one
+// Reconciler for one platform.
 //
 // Converge keeps one value between calls: the verdict of each policy on
 // the interfaces of its last convergence (see Converge). A copy of a
@@ -128,7 +129,7 @@ type ResolverReport struct {
 // other methods work on a copy, also on a composite literal.
 type Reconciler struct {
 	Compiler  Compiler
-	Backend   Backend
+	Guard     *Guard
 	Resolver  SysResolver
 	Inventory IfInventory
 
@@ -145,8 +146,11 @@ type memory struct {
 }
 
 // Converge makes the actual state equal to the desired state for in.
+// It returns the epoch of the Guard after the Backend part.
 //
-// The Backend part runs in this order, and it stops at its first error.
+// The Backend part runs in one exclusive section of the Guard, so no
+// report runs between its read of in.Book and its last write. It runs
+// in this order, and it stops at its first error.
 // Before step 1, it refuses the zero blockable.Addr in Book or Hosts
 // (blockable.ErrZero): the Backend then gets no write.
 //
@@ -211,11 +215,14 @@ type memory struct {
 //
 // The error joins the errors of both parts. The Report holds what was
 // done and seen; the next call continues from there.
-func (r *Reconciler) Converge(ctx context.Context, in Inputs) (Report, error) {
+func (r *Reconciler) Converge(ctx context.Context, in Inputs) (Report, uint64, error) {
 	var rep Report
-	berr := r.convergeBackend(ctx, in, &rep)
+	var berr error
+	epoch := r.Guard.Exclusive(func(b Backend) {
+		berr = r.convergeBackend(ctx, b, in, &rep)
+	})
 	rerr := r.convergeResolver(ctx, in, &rep)
-	return rep, errors.Join(berr, rerr)
+	return rep, epoch, errors.Join(berr, rerr)
 }
 
 // ConvergeResolver runs only the SysResolver part of Converge. It uses
@@ -232,8 +239,8 @@ func (r Reconciler) ConvergeResolver(ctx context.Context, in Inputs) (Report, er
 // fast path for a DNS report: it neither reads the actual state nor
 // recompiles. A nil error means the Backend holds every address in the
 // table. It refuses a batch with the zero blockable.Addr
-// (blockable.ErrZero) and then calls no Backend method.
-func (r Reconciler) AddObserved(ctx context.Context, name policy.Name, addrs []blockable.Addr) error {
+// (blockable.ErrZero) and then calls no Adder method.
+func AddObserved(ctx context.Context, a Adder, name policy.Name, addrs []blockable.Addr) error {
 	if err := blockable.Check(addrs); err != nil {
 		return fmt.Errorf("adding to table %s: %w", name, err)
 	}
@@ -244,13 +251,13 @@ func (r Reconciler) AddObserved(ctx context.Context, name policy.Name, addrs []b
 	for i, a := range addrs {
 		entries[i] = host(a.Addr())
 	}
-	if err := r.Backend.AddEntries(ctx, name, entries); err != nil {
+	if err := a.AddEntries(ctx, name, entries); err != nil {
 		return fmt.Errorf("adding to table %s: %w", name, err)
 	}
 	return nil
 }
 
-func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report) error {
+func (r *Reconciler) convergeBackend(ctx context.Context, b Backend, in Inputs, rep *Report) error {
 	ifaces, err := r.Inventory.Interfaces(ctx)
 	if err != nil {
 		return fmt.Errorf("reading interfaces: %w", err)
@@ -260,7 +267,7 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 		return fmt.Errorf("compiling ruleset: %w", err)
 	}
 	rep.Problems = append(rep.Problems, rs.Problems()...)
-	actual, err := r.Backend.Read(ctx)
+	actual, err := b.Read(ctx)
 	if err != nil {
 		return fmt.Errorf("reading backend: %w", err)
 	}
@@ -274,10 +281,10 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 	for name, entries := range actual.Tables {
 		have[name] = newPrefixSet(entries)
 	}
-	if err := r.removeRefused(ctx, in.Policies, have, rep); err != nil {
+	if err := r.removeRefused(ctx, b, in.Policies, have, rep); err != nil {
 		return err
 	}
-	if err := r.addMissing(ctx, in.Policies, want, have, rep); err != nil {
+	if err := r.addMissing(ctx, b, in.Policies, want, have, rep); err != nil {
 		return err
 	}
 	if r.mem == nil || r.mem.owner != r {
@@ -290,22 +297,22 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 		kept = have
 	}
 	if actual.Ruleset != rs.ID() {
-		if err := r.Backend.Load(ctx, rs); err != nil {
+		if err := b.Load(ctx, rs); err != nil {
 			return fmt.Errorf("loading ruleset: %w", err)
 		}
 		rep.Writes++
 		rep.Narrowed = r.mem.narrowed(in.Policies, cur)
 		r.mem.enforced = cur
-	} else if err := r.endNarrowed(ctx, in.Policies, cur, kept, have, rep); err != nil {
+	} else if err := r.endNarrowed(ctx, b, in.Policies, cur, kept, have, rep); err != nil {
 		return err
 	}
 	if !in.AddOnly {
-		if err := r.removeUndesired(ctx, in.Policies, want, have, rep); err != nil {
+		if err := r.removeUndesired(ctx, b, in.Policies, want, have, rep); err != nil {
 			return err
 		}
 	}
 	if rep.Writes != writes {
-		if err := r.readAgain(ctx, rs.ID(), backendProblems, rep); err != nil {
+		if err := r.readAgain(ctx, b, rs.ID(), backendProblems, rep); err != nil {
 			return err
 		}
 	}
@@ -317,8 +324,8 @@ func (r *Reconciler) convergeBackend(ctx context.Context, in Inputs, rep *Report
 // read start at rep.Problems[from], and the Problems of this read replace
 // them: the writes can have repaired a Problem. id is the ID of the
 // ruleset of the pass.
-func (r Reconciler) readAgain(ctx context.Context, id string, from int, rep *Report) error {
-	after, err := r.Backend.Read(ctx)
+func (r Reconciler) readAgain(ctx context.Context, b Backend, id string, from int, rep *Report) error {
+	after, err := b.Read(ctx)
 	if err != nil {
 		return fmt.Errorf("reading backend after the writes: %w", err)
 	}
@@ -338,9 +345,13 @@ func (r Reconciler) readAgain(ctx context.Context, id string, from int, rep *Rep
 // daemon that starts without a snapshot adopts them, so a lost snapshot
 // keeps addresses blocked instead of unblocking them all. Host-file
 // addresses look learned too; the caller tells them apart. An entry
-// that blockable.New refuses is not adoptable: Converge removes it.
+// that blockable.New refuses is not adoptable: Converge removes it. The
+// read runs in an exclusive section of the Guard and does not move the
+// epoch.
 func (r Reconciler) Adoptable(ctx context.Context, policies []policy.Policy) (map[policy.Name][]blockable.Addr, error) {
-	actual, err := r.Backend.Read(ctx)
+	var actual BackendState
+	var err error
+	r.Guard.Exclusive(func(b Backend) { actual, err = b.Read(ctx) })
 	if err != nil {
 		return nil, fmt.Errorf("reading backend: %w", err)
 	}
@@ -377,14 +388,14 @@ func learnedLooking(name policy.Name, entries []netip.Prefix, policies []policy.
 
 // removeRefused is step 1 of Converge. It also removes the entries from
 // have, so the later steps do not remove them again.
-func (r Reconciler) removeRefused(ctx context.Context, policies []policy.Policy, have map[policy.Name]prefixSet, rep *Report) error {
+func (r Reconciler) removeRefused(ctx context.Context, b Backend, policies []policy.Policy, have map[policy.Name]prefixSet, rep *Report) error {
 	for _, name := range slices.Sorted(maps.Keys(have)) {
 		_, refused := learnedLooking(name, slices.Collect(maps.Keys(have[name])), policies)
 		if len(refused) == 0 {
 			continue
 		}
 		slices.SortFunc(refused, netip.Prefix.Compare)
-		if err := r.Backend.RemoveEntries(ctx, name, refused); err != nil {
+		if err := b.RemoveEntries(ctx, name, refused); err != nil {
 			return fmt.Errorf("removing from table %s: %w", name, err)
 		}
 		rep.Writes++
@@ -395,13 +406,13 @@ func (r Reconciler) removeRefused(ctx context.Context, policies []policy.Policy,
 	return nil
 }
 
-func (r Reconciler) addMissing(ctx context.Context, policies []policy.Policy, want, have map[policy.Name]prefixSet, rep *Report) error {
+func (r Reconciler) addMissing(ctx context.Context, b Backend, policies []policy.Policy, want, have map[policy.Name]prefixSet, rep *Report) error {
 	for _, p := range policies {
 		add := want[p.Name].minus(have[p.Name])
 		if len(add) == 0 {
 			continue
 		}
-		if err := r.Backend.AddEntries(ctx, p.Name, add); err != nil {
+		if err := b.AddEntries(ctx, p.Name, add); err != nil {
 			return fmt.Errorf("adding to table %s: %w", p.Name, err)
 		}
 		rep.Writes++
@@ -426,7 +437,7 @@ func (m *memory) narrowed(policies []policy.Policy, cur map[policy.Name]verdict)
 // entries that addMissing added in this pass are not in have: AddEntries
 // ended their states already. On an error, the narrowed policies that
 // are not done keep their old verdict, so the next pass tries again.
-func (r *Reconciler) endNarrowed(ctx context.Context, policies []policy.Policy, cur map[policy.Name]verdict, kept, have map[policy.Name]prefixSet, rep *Report) error {
+func (r *Reconciler) endNarrowed(ctx context.Context, b Backend, policies []policy.Policy, cur map[policy.Name]verdict, kept, have map[policy.Name]prefixSet, rep *Report) error {
 	next := make(map[policy.Name]verdict, len(cur))
 	for _, p := range policies {
 		next[p.Name] = cur[p.Name]
@@ -434,7 +445,7 @@ func (r *Reconciler) endNarrowed(ctx context.Context, policies []policy.Policy, 
 	narrowed := r.mem.narrowed(policies, cur)
 	for i, name := range narrowed {
 		if held := kept[name].and(have[name]); len(held) > 0 {
-			if err := r.Backend.AddEntries(ctx, name, held); err != nil {
+			if err := b.AddEntries(ctx, name, held); err != nil {
 				for _, n := range narrowed[i:] {
 					next[n] = r.mem.enforced[n]
 				}
@@ -450,13 +461,13 @@ func (r *Reconciler) endNarrowed(ctx context.Context, policies []policy.Policy, 
 }
 
 // removeUndesired runs only after the desired ruleset is loaded.
-func (r Reconciler) removeUndesired(ctx context.Context, policies []policy.Policy, want, have map[policy.Name]prefixSet, rep *Report) error {
+func (r Reconciler) removeUndesired(ctx context.Context, b Backend, policies []policy.Policy, want, have map[policy.Name]prefixSet, rep *Report) error {
 	for _, p := range policies {
 		extra := have[p.Name].minus(want[p.Name])
 		if len(extra) == 0 {
 			continue
 		}
-		if err := r.Backend.RemoveEntries(ctx, p.Name, extra); err != nil {
+		if err := b.RemoveEntries(ctx, p.Name, extra); err != nil {
 			return fmt.Errorf("removing from table %s: %w", p.Name, err)
 		}
 		rep.Writes++
@@ -469,7 +480,7 @@ func (r Reconciler) removeUndesired(ctx context.Context, policies []policy.Polic
 	}
 	slices.Sort(stale)
 	for _, name := range stale {
-		if err := r.Backend.DropTable(ctx, name); err != nil {
+		if err := b.DropTable(ctx, name); err != nil {
 			return fmt.Errorf("dropping table %s: %w", name, err)
 		}
 		rep.Writes++
