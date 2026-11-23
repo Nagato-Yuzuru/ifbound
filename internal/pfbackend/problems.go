@@ -22,10 +22,13 @@ const anchorStack = 64
 // problems returns the faults that void the ifbound rules:
 //
 //   - pf is disabled;
-//   - no rule of the main ruleset refers to `anchor "com.apple/*"` for
-//     all packets, so pf does not evaluate the ifbound anchor (a rule
-//     with parameters, such as `anchor "com.apple/*" in all`, evaluates
-//     it only for the packets that it matches);
+//   - no rule of the main ruleset calls the ifbound anchor for all
+//     packets, with `anchor "com.apple/*"` or with the entry rule, so pf
+//     does not evaluate the ifbound anchor (a rule with parameters, such
+//     as `anchor "com.apple/*" in all`, evaluates it only for the packets
+//     that it matches). LoadedID reports no ruleset when no rule calls
+//     the anchor, and Load adds the entry rule. A call with parameters
+//     stays a Problem: Load adds no entry rule for it;
 //   - a filter rule decides packets before the ifbound rules: a rule that
 //     passes packets quick, or a quick anchor rule that calls an anchor
 //     with a pass rule or a wildcard call, or that is a wildcard call;
@@ -94,8 +97,8 @@ func (b *Backend) ruleProblems(ctx context.Context) ([]reconcile.Problem, error)
 		return nil, err
 	}
 	rules := lines(out.Stdout)
-	if !slices.ContainsFunc(rules, refersToApple) {
-		return []reconcile.Problem{voids(`the main pf ruleset has no rule anchor "com.apple/*" for all packets, so pf does not evaluate the ifbound anchor`)}, nil
+	if !slices.ContainsFunc(rules, entersAnchor) {
+		return []reconcile.Problem{voids(`the main pf ruleset has no rule anchor "com.apple/*" and no rule anchor "` + Anchor + `" for all packets, so pf does not evaluate the ifbound anchor`)}, nil
 	}
 	w := walk{b: b, before: true, canPass: make(map[string]bool)}
 	for _, r := range rules {
@@ -136,9 +139,10 @@ type walk struct {
 	b  *Backend
 	ps []reconcile.Problem
 	// before is true until the walk comes to the position of the ifbound
-	// anchor: in the first rule of the main ruleset that refers to the
-	// anchors below com.apple for all packets, the first anchor whose path
-	// is the path of the ifbound anchor or comes after it in byte order.
+	// anchor: in the first rule of the main ruleset that calls it for all
+	// packets (see entersAnchor), the ifbound anchor itself, or for a
+	// call of the anchors below com.apple, the first anchor whose path is
+	// the path of the ifbound anchor or comes after it in byte order.
 	// The walk reads the rules in the order in which pf evaluates them, so
 	// a rule that it reads while before is true comes before the ifbound
 	// rules.
@@ -218,10 +222,10 @@ func (w *walk) call(ctx context.Context, path, rule string, words []string, dept
 			return false, "", err
 		}
 	}
-	apple := w.before && path == "" && refersToApple(rule)
+	enters := w.before && path == "" && entersAnchor(rule)
 	canPass = wildcard
 	for _, t := range targets {
-		if apple && t >= Anchor {
+		if enters && t >= Anchor {
 			w.before = false
 		}
 		p, err := w.ruleset(ctx, t, depth+1)
@@ -230,7 +234,7 @@ func (w *walk) call(ctx context.Context, path, rule string, words []string, dept
 		}
 		canPass = canPass || p
 	}
-	if apple {
+	if enters {
 		w.before = false
 	}
 	return canPass, "", nil

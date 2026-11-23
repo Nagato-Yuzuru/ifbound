@@ -25,6 +25,7 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile"
 	"github.com/Nagato-Yuzuru/ifbound/internal/reconcile/reconciletest"
 	"github.com/Nagato-Yuzuru/ifbound/internal/testnet"
+	"github.com/Nagato-Yuzuru/ifbound/pf"
 )
 
 // These tests load the ifbound anchor into the pf of the host. Each test
@@ -753,4 +754,165 @@ func references(t *testing.T) []string {
 	}
 	slices.Sort(toks)
 	return toks
+}
+
+// entryLabel is the label of the entry rule that Load adds to the main
+// ruleset.
+const entryLabel = "ifbound-entry"
+
+// restoreMain loads /etc/pf.conf into the main ruleset at the end of the
+// test, and enables pf again when it was enabled at the start. Call it
+// before newPfBackend: the cleanups run in reverse order, so the
+// restore runs after the Unload of the Backend.
+func restoreMain(t *testing.T) {
+	t.Helper()
+	h := openPf(t)
+	s, err := h.Status()
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+	t.Cleanup(func() {
+		// t.Context is already canceled when cleanups run.
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if out, err := exec.CommandContext(ctx, pfbackend.Path, "-f", "/etc/pf.conf").CombinedOutput(); err != nil {
+			t.Errorf("restore the main ruleset: %v: %s", err, out)
+		}
+		now, err := h.Status()
+		if err != nil {
+			t.Errorf("status: %v", err)
+			return
+		}
+		if s.Running && !now.Running {
+			if out, err := exec.CommandContext(ctx, pfbackend.Path, "-e").CombinedOutput(); err != nil {
+				t.Errorf("enable pf: %v: %s", err, out)
+			}
+		}
+	})
+}
+
+// requireEntry checks that the entry rule is the first filter rule of
+// the main ruleset, and that the main ruleset holds no second one. It
+// also shows what Handle.Rules gives for the call of the entry rule.
+func requireEntry(t *testing.T, h *pf.Handle) {
+	t.Helper()
+	rules, err := h.Rules(pf.Ruleset{})
+	if err != nil {
+		t.Fatalf("rules of the main ruleset: %v", err)
+	}
+	want := pf.Rule{Action: pf.ActionPass, Label: entryLabel, AnchorCall: pfbackend.Anchor}
+	n := 0
+	for _, r := range rules {
+		if r.Label == entryLabel {
+			n++
+		}
+	}
+	if len(rules) == 0 || rules[0] != want || n != 1 {
+		t.Fatalf("main filter rules = %+v, want %+v first and once (pfctl -sr:\n%s)", rules, want, pfctl(t, "-sr"))
+	}
+	if out := pfctl(t, "-sr"); !strings.Contains(out, `anchor "`+pfbackend.Anchor+`" all label "`+entryLabel+`"`) {
+		t.Errorf("pfctl -sr does not show the entry rule:\n%s", out)
+	}
+}
+
+func digest(t *testing.T, b *pfbackend.Backend) reconcile.Digest {
+	t.Helper()
+	d, err := b.Digest(t.Context())
+	if err != nil {
+		t.Fatalf("Digest: %v", err)
+	}
+	return d
+}
+
+// TestPfBackendRepairsTheEntry flushes the main ruleset, as some VPN
+// clients do. The anchor keeps its rules and tables, but pf no longer
+// evaluates it: LoadedID gives "", and a packet to a blocked address
+// leaves. Load adds the entry rule at the head of the main ruleset, and
+// pf blocks the address again. Unload removes the entry rule.
+func TestPfBackendRepairsTheEntry(t *testing.T) {
+	restoreMain(t)
+	b, _ := newPfBackend(t)
+	h := openPf(t)
+	rules, err := h.Rules(pf.Ruleset{})
+	if err != nil {
+		t.Fatalf("rules of the main ruleset: %v", err)
+	}
+	// pf_anchor_copyout gives the call of `anchor "com.apple/*"` in the
+	// main ruleset without a "/" first.
+	if !slices.ContainsFunc(rules, func(r pf.Rule) bool { return r.AnchorCall == "com.apple/*" }) {
+		t.Fatalf("main filter rules of /etc/pf.conf = %+v, want one with the call com.apple/*", rules)
+	}
+	config := "[[policy]]\nname = \"e2e-entry\"\nto = [\"192.0.2.13\"]\nonly_via = []\n"
+	rs := compilePolicies(t, config)
+	load(t, b, rs)
+	addEntries(t, b, "e2e-entry", "192.0.2.13/32")
+	dst := netip.MustParseAddrPort("192.0.2.13:9")
+	if err := udpExchange(t, dst); !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("UDP to %s with the stock main ruleset: %v, want ECONNREFUSED", dst, err)
+	}
+	if out := pfctl(t, "-sr"); strings.Contains(out, entryLabel) {
+		t.Errorf("Load added the entry rule to a main ruleset that calls the anchor:\n%s", out)
+	}
+	stock := digest(t, b)
+
+	pfctl(t, "-F", "rules")
+	requireLoadedID(t, b, "")
+	if err := udpExchange(t, dst); !errors.Is(err, errNoAnswer) {
+		t.Fatalf("UDP to %s with the main ruleset flushed: %v, want no answer (pf does not evaluate the anchor)", dst, err)
+	}
+	flushed := digest(t, b)
+	if flushed == stock {
+		t.Error("Digest after the flush of the main ruleset is the Digest before it")
+	}
+
+	for range 2 {
+		load(t, b, rs)
+		requireEntry(t, h)
+		requireLoadedID(t, b, rs.ID())
+		if ps := slices.DeleteFunc(readState(t, b).Problems, func(p reconcile.Problem) bool { return !p.Voids }); len(ps) != 0 {
+			t.Errorf("voiding Problems after the repair = %v, want none", ps)
+		}
+		if err := udpExchange(t, dst); !errors.Is(err, syscall.ECONNREFUSED) {
+			t.Errorf("UDP to %s after the repair: %v, want ECONNREFUSED", dst, err)
+		}
+	}
+	if d := digest(t, b); d == flushed || d != digest(t, b) {
+		t.Error("Digest after the repair does not differ from the Digest before it, or changes with no change")
+	}
+
+	if err := b.Unload(t.Context()); err != nil {
+		t.Fatalf("Unload: %v", err)
+	}
+	if out := pfctl(t, "-sr"); strings.Contains(out, entryLabel) {
+		t.Errorf("the main ruleset holds the entry rule after Unload:\n%s", out)
+	}
+}
+
+// TestPfBackendRepairsADisabledPfWithoutEntry disables pf and flushes the
+// main ruleset, as some VPN clients do when they stop. Load enables pf
+// and adds the entry rule.
+func TestPfBackendRepairsADisabledPfWithoutEntry(t *testing.T) {
+	restoreMain(t)
+	b, c := newPfBackend(t)
+	h := openPf(t)
+	config := "[[policy]]\nname = \"e2e-entry\"\nto = [\"192.0.2.14\"]\nonly_via = []\n"
+	rs := compilePolicies(t, config)
+	load(t, b, rs)
+	addEntries(t, b, "e2e-entry", "192.0.2.14/32")
+
+	pfctl(t, "-d")
+	pfctl(t, "-F", "rules")
+	requireLoadedID(t, b, "")
+
+	c.t = c.t.Add(pfbackend.EnableInterval)
+	load(t, b, rs)
+	if s, err := h.Status(); err != nil || !s.Running {
+		t.Fatalf("pf status after Load = %+v, %v; want running", s, err)
+	}
+	requireEntry(t, h)
+	requireLoadedID(t, b, rs.ID())
+	dst := netip.MustParseAddrPort("192.0.2.14:9")
+	if err := udpExchange(t, dst); !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Errorf("UDP to %s after the repair: %v, want ECONNREFUSED", dst, err)
+	}
 }

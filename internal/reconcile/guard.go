@@ -139,6 +139,10 @@ func (c *counted) Read(ctx context.Context) (BackendState, error) {
 	return c.backend().Read(ctx)
 }
 
+func (c *counted) Digest(ctx context.Context) (Digest, error) {
+	return c.backend().Digest(ctx)
+}
+
 func (c *counted) LoadedID(ctx context.Context) (string, error) {
 	return c.backend().LoadedID(ctx)
 }

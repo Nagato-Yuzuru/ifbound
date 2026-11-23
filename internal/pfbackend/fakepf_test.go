@@ -41,6 +41,9 @@ type fakePF struct {
 	anchors map[string][]string
 	// main holds the rules of the main ruleset.
 	main []string
+	// gen counts the loads, flushes, and rule changes of each ruleset; ""
+	// is the main ruleset. It goes into the Version.
+	gen map[string]uint32
 	// nat maps an anchor path to its NAT rules; "" is the main ruleset.
 	nat    map[string][]string
 	tables map[string]map[netip.Prefix]bool // entry to negated
@@ -68,6 +71,7 @@ func newFakePF() *fakePF {
 		main:   []string{`scrub-anchor "com.apple/*" all fragment reassemble`, `anchor "com.apple/*" all`},
 		nat:    map[string][]string{"": {`nat-anchor "com.apple/*" all`, `rdr-anchor "com.apple/*" all`}},
 		tables: make(map[string]map[netip.Prefix]bool),
+		gen:    make(map[string]uint32),
 		born:   make(map[string]time.Time),
 		owner:  make(map[string]int),
 		now:    time.Now,
@@ -178,19 +182,86 @@ func (f *fakePF) ioctl(name string, args ...string) error {
 	return nil
 }
 
-// Rules implements Device.
+// Rules implements Device. As pf.Handle does, it reads the count with
+// DIOCGETRULES and then each rule with DIOCGETRULE.
 func (f *fakePF) Rules(rs pf.Ruleset) ([]pf.Rule, error) {
+	lines, err := f.ruleLines(rs)
+	if err != nil {
+		return nil, err
+	}
+	rules := rulesOf(lines, rs.Kind)
+	for range rules {
+		if err := f.ioctl("DIOCGETRULE", rs.Anchor, rs.Kind.String()); err != nil {
+			return nil, err
+		}
+	}
+	return rules, nil
+}
+
+// ruleLines is the DIOCGETRULES call of Rules and Version.
+func (f *fakePF) ruleLines(rs pf.Ruleset) ([]string, error) {
 	if err := f.ioctl("DIOCGETRULES", rs.Anchor, rs.Kind.String()); err != nil {
 		return nil, err
 	}
-	lines := slices.Concat(f.main, f.nat[""])
-	if rs.Anchor != "" {
-		if !f.exists(rs.Anchor) {
-			return nil, fmt.Errorf("anchor %s: %w", rs.Anchor, pf.ErrNotFound)
-		}
-		lines = slices.Concat(f.anchors[rs.Anchor], f.nat[rs.Anchor])
+	if rs.Anchor == "" {
+		return slices.Concat(f.main, f.nat[""]), nil
 	}
-	return rulesOf(lines, rs.Kind), nil
+	if !f.exists(rs.Anchor) {
+		return nil, fmt.Errorf("anchor %s: %w", rs.Anchor, pf.ErrNotFound)
+	}
+	return slices.Concat(f.anchors[rs.Anchor], f.nat[rs.Anchor]), nil
+}
+
+// Version implements Device.
+func (f *fakePF) Version(rs pf.Ruleset) (pf.Version, error) {
+	lines, err := f.ruleLines(rs)
+	if err != nil {
+		return pf.Version{}, err
+	}
+	return versionOf(lines, rs.Kind, f.gen[rs.Anchor]), nil
+}
+
+// InsertAnchorCall implements Device.
+func (f *fakePF) InsertAnchorCall(anchor, call, label string) error {
+	if err := f.ioctl("DIOCCHANGERULE", anchor, "add-head", call, label); err != nil {
+		return err
+	}
+	if anchor != "" && !f.exists(anchor) {
+		return fmt.Errorf("anchor %s: %w", anchor, pf.ErrNotFound)
+	}
+	f.setFilter(anchor, insertCall(f.filter(anchor), call, label))
+	return nil
+}
+
+// RemoveLabeled implements Device.
+func (f *fakePF) RemoveLabeled(anchor, label string) (int, error) {
+	if err := f.ioctl("DIOCCHANGERULE", anchor, "remove", label); err != nil {
+		return 0, err
+	}
+	if anchor != "" && !f.exists(anchor) {
+		return 0, fmt.Errorf("anchor %s: %w", anchor, pf.ErrNotFound)
+	}
+	kept, n := removeLabeled(f.filter(anchor), label)
+	f.setFilter(anchor, kept)
+	return n, nil
+}
+
+// filter returns the rule lines of an anchor; "" is the main ruleset.
+func (f *fakePF) filter(anchor string) []string {
+	if anchor == "" {
+		return f.main
+	}
+	return f.anchors[anchor]
+}
+
+// setFilter replaces the rule lines of an anchor, and moves its gen.
+func (f *fakePF) setFilter(anchor string, lines []string) {
+	if anchor == "" {
+		f.main = lines
+	} else {
+		f.anchors[anchor] = lines
+	}
+	f.gen[anchor]++
 }
 
 // Anchors implements Device.
@@ -332,7 +403,7 @@ func (f *fakePF) anchor(path string, rest []string, stdin []byte) (Output, error
 	case r == "-sA" || r == "-sA -v":
 		return out(f.listAnchors(path, r == "-sA -v")), nil
 	case r == "-F rules":
-		f.anchors[path] = nil
+		f.setFilter(path, nil)
 		return Output{}, nil
 	case r == "-F Tables":
 		clear(f.tables)
@@ -361,6 +432,7 @@ func (f *fakePF) load(path string, stdin []byte) {
 		}
 	}
 	f.anchors[path] = rules
+	f.gen[path]++
 	for _, rule := range rules {
 		if name, _, ok := anchorRule(ruleWords(rule)); ok {
 			if _, ok := f.anchors[path+"/"+name]; !ok {

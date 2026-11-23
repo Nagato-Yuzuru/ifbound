@@ -542,6 +542,24 @@ func (d *serialDevice) Refs() ([]pf.Ref, error) {
 	return d.Device.Refs()
 }
 
+func (d *serialDevice) Version(rs pf.Ruleset) (pf.Version, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.Version(rs)
+}
+
+func (d *serialDevice) InsertAnchorCall(anchor, call, label string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.InsertAnchorCall(anchor, call, label)
+}
+
+func (d *serialDevice) RemoveLabeled(anchor, label string) (int, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.Device.RemoveLabeled(anchor, label)
+}
+
 // sortedTable returns the table of a model that holds entries, none
 // negated.
 func sortedTable(entries []netip.Prefix) map[netip.Prefix]bool {

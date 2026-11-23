@@ -48,9 +48,13 @@ type World struct {
 	bproblem []reconcile.Problem
 	rproblem []reconcile.Problem
 	writes   int
-	ended    []netip.Prefix
-	before   func(n int) error
-	after    func()
+	// rev counts the changes that Backend.Digest shows: a Load, and each
+	// external change of the ruleset, of the firewall, or of the rules
+	// around the anchor (see SetProblems).
+	rev    uint64
+	ended  []netip.Prefix
+	before func(n int) error
+	after  func()
 }
 
 // NewWorld returns an empty World: no ruleset, no tables, no resolver
@@ -91,10 +95,13 @@ func (w *World) SetAfterWrite(f func()) {
 // SetProblems sets the external problems that the Backend and the
 // Resolver report. They stay until the next SetProblems: no write
 // repairs them. DisableFirewall gives the Problem of a disabled firewall.
+// A Problem of the Backend comes from the rules around the anchor, so
+// SetProblems changes the Digest.
 func (w *World) SetProblems(backend, resolver []reconcile.Problem) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.bproblem, w.rproblem = slices.Clone(backend), slices.Clone(resolver)
+	w.rev++
 }
 
 // SetEnableRefused selects whether a Load can enable the firewall. When
@@ -235,7 +242,8 @@ func sortedEntries(m map[policy.Domain]netip.AddrPort) []reconcile.ResolverEntry
 }
 
 // FlushTable empties a table, as an external pfctl call would. It is not
-// a write: no hook runs.
+// a write: no hook runs. As in pf, a change of a table only does not
+// change the Digest.
 func (w *World) FlushTable(name policy.Name) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -244,10 +252,12 @@ func (w *World) FlushTable(name policy.Name) {
 }
 
 // FlushAll removes the ruleset and every table, as an external
-// "pfctl -a <anchor> -F all" would. It is not a write: no hook runs.
+// "pfctl -a <anchor> -F all" would. It is not a write: no hook runs. It
+// changes the Digest.
 func (w *World) FlushAll() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.rev++
 	w.ruleset = reconcile.Ruleset{}
 	clear(w.tables)
 	clear(w.negated)
@@ -273,20 +283,23 @@ func inside(n, p netip.Prefix) bool {
 }
 
 // ExternalLoad loads a ruleset with the given body, as another tool that
-// writes into the anchor would. It is not a write: no hook runs.
+// writes into the anchor would. It is not a write: no hook runs. It
+// changes the Digest.
 func (w *World) ExternalLoad(body []byte) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.rev++
 	w.ruleset = reconcile.NewRuleset(body)
 }
 
 // DisableFirewall disables the firewall, as an external "pfctl -d"
 // would. It is not a write: no hook runs. The ruleset and the tables
 // stay, but the Backend reports no loaded ruleset until a Load enables
-// the firewall again.
+// the firewall again. It changes the Digest.
 func (w *World) DisableFirewall() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.rev++
 	w.disabled = true
 }
 
@@ -371,6 +384,15 @@ func (b *Backend) Read(context.Context) (reconcile.BackendState, error) {
 	}, nil
 }
 
+// Digest implements reconcile.Backend. It changes at each Load and at
+// each external change that FlushAll, ExternalLoad, DisableFirewall, and
+// SetProblems make. A table change does not change it, as in pf.
+func (b *Backend) Digest(context.Context) (reconcile.Digest, error) {
+	b.w.mu.Lock()
+	defer b.w.mu.Unlock()
+	return reconcile.NewDigest(b.w.rev), nil
+}
+
 // LoadedID implements reconcile.Backend.
 func (b *Backend) LoadedID(context.Context) (string, error) {
 	b.w.mu.Lock()
@@ -395,6 +417,7 @@ func (b *Backend) Load(_ context.Context, rs reconcile.Ruleset) error {
 			return fmt.Errorf("enabling the firewall: %w", ErrInjected)
 		}
 		b.w.ruleset, b.w.disabled = rs, false
+		b.w.rev++
 		for _, name := range declared(rs) {
 			if b.w.tables[name] == nil {
 				b.w.tables[name] = make(map[netip.Prefix]struct{})

@@ -52,6 +52,9 @@ type kernel struct {
 	// with a nil value is an anchor that exists and has no rule.
 	rules map[string][]string
 	nat   map[string][]string
+	// gen counts the loads, flushes, and rule changes of each ruleset; ""
+	// is the main ruleset. It goes into the Version.
+	gen map[string]uint32
 	// tables maps an anchor path and a table name to the entries; the
 	// value is true for a negated entry.
 	tables map[string]map[string]map[netip.Prefix]bool
@@ -89,6 +92,7 @@ func newKernel() *kernel {
 			"com.apple/250.ApplicationFirewall": {`pass in quick on lo0 all`},
 		},
 		nat:         map[string][]string{},
+		gen:         map[string]uint32{},
 		tables:      map[string]map[string]map[netip.Prefix]bool{},
 		anchorMatch: map[string]bool{},
 		born:        map[string]time.Time{},
@@ -213,19 +217,95 @@ func (k *kernel) exists(anchor string) bool {
 	return len(pfbackend.Children(slices.Collect(maps.Keys(k.rules)), anchor)) > 0
 }
 
-// Rules implements pfbackend.Device.
+// Rules implements pfbackend.Device. As pf.Handle does, it reads the
+// count with DIOCGETRULES and then each rule with DIOCGETRULE.
 func (k *kernel) Rules(rs pf.Ruleset) ([]pf.Rule, error) {
+	lines, err := k.ruleLines(rs)
+	if err != nil {
+		return nil, err
+	}
+	rules := pfbackend.RulesOf(lines, rs.Kind)
+	for range rules {
+		if err := k.ioctl("DIOCGETRULE", rs.Anchor, rs.Kind.String()); err != nil {
+			return nil, err
+		}
+	}
+	return rules, nil
+}
+
+// ruleLines is the DIOCGETRULES call of Rules and Version. It returns
+// every rule line of the anchor of rs, as pfctl prints it.
+func (k *kernel) ruleLines(rs pf.Ruleset) ([]string, error) {
 	if err := k.ioctl("DIOCGETRULES", rs.Anchor, rs.Kind.String()); err != nil {
 		return nil, err
 	}
-	lines := slices.Concat(k.printed(""), k.mainNat)
-	if rs.Anchor != "" {
-		if !k.exists(rs.Anchor) {
-			return nil, fmt.Errorf("anchor %s: %w", rs.Anchor, pf.ErrNotFound)
-		}
-		lines = slices.Concat(k.printed(rs.Anchor), k.nat[rs.Anchor])
+	if rs.Anchor == "" {
+		return slices.Concat(k.printed(""), k.mainNat), nil
 	}
-	return pfbackend.RulesOf(lines, rs.Kind), nil
+	if !k.exists(rs.Anchor) {
+		return nil, fmt.Errorf("anchor %s: %w", rs.Anchor, pf.ErrNotFound)
+	}
+	return slices.Concat(k.printed(rs.Anchor), k.nat[rs.Anchor]), nil
+}
+
+// Version implements pfbackend.Device. It reads no rule.
+func (k *kernel) Version(rs pf.Ruleset) (pf.Version, error) {
+	lines, err := k.ruleLines(rs)
+	if err != nil {
+		return pf.Version{}, err
+	}
+	return pfbackend.VersionOf(lines, rs.Kind, k.gen[rs.Anchor]), nil
+}
+
+// InsertAnchorCall implements pfbackend.Device. As pf_anchor_setup does,
+// it creates the anchor that the call names when it is missing.
+func (k *kernel) InsertAnchorCall(anchor, call, label string) error {
+	if err := k.ioctl("DIOCCHANGERULE", anchor, "add-head", call, label); err != nil {
+		return err
+	}
+	if anchor != "" && !k.exists(anchor) {
+		return fmt.Errorf("anchor %s: %w", anchor, pf.ErrNotFound)
+	}
+	k.setFilter(anchor, pfbackend.InsertCall(k.filter(anchor), call, label))
+	if c, ok := setup(anchor, call); ok {
+		if _, ok := k.rules[c.path]; !ok {
+			k.rules[c.path] = nil
+		}
+	}
+	return nil
+}
+
+// RemoveLabeled implements pfbackend.Device. Each call gets a new change
+// ticket, so it changes the Version also when it removes no rule.
+func (k *kernel) RemoveLabeled(anchor, label string) (int, error) {
+	if err := k.ioctl("DIOCCHANGERULE", anchor, "remove", label); err != nil {
+		return 0, err
+	}
+	if anchor != "" && !k.exists(anchor) {
+		return 0, fmt.Errorf("anchor %s: %w", anchor, pf.ErrNotFound)
+	}
+	kept, n := pfbackend.RemoveRule(k.filter(anchor), label)
+	k.setFilter(anchor, kept)
+	return n, nil
+}
+
+// filter returns the rule lines of an anchor as they were loaded; "" is
+// the main ruleset.
+func (k *kernel) filter(anchor string) []string {
+	if anchor == "" {
+		return k.mainRules
+	}
+	return k.rules[anchor]
+}
+
+// setFilter replaces the rule lines of an anchor, and moves its gen.
+func (k *kernel) setFilter(anchor string, lines []string) {
+	if anchor == "" {
+		k.mainRules = lines
+	} else {
+		k.rules[anchor] = lines
+	}
+	k.gen[anchor]++
 }
 
 // Anchors implements pfbackend.Device.
@@ -438,6 +518,7 @@ func (k *kernel) load(anchor string, stdin []byte) {
 	}
 	k.rules[anchor] = rules
 	k.nat[anchor] = nat
+	k.gen[anchor]++
 	for _, r := range rules {
 		if _, c, ok := callOf(anchor, r); ok {
 			if _, ok := k.rules[c.path]; !ok {
@@ -558,11 +639,7 @@ func (k *kernel) printed(path string) []string {
 func (k *kernel) flushCmd(p pfctlArgs) (pfbackend.Output, error) {
 	switch p.flush {
 	case "rules":
-		if p.anchor == "" {
-			k.mainRules = nil
-		} else {
-			k.rules[p.anchor] = nil
-		}
+		k.setFilter(p.anchor, nil)
 	case "nat":
 		k.nat[p.anchor] = nil
 	case "Tables":

@@ -1,9 +1,20 @@
 // Package pfbackend implements reconcile.Backend with pfctl and with ioctl
 // calls on /dev/pf on macOS. It is the only part of ifbound that writes pf.
 //
-// pf is a shared resource. The Backend changes only the ifbound anchor
-// Anchor, its tables, and its sub-anchors. It reads the main ruleset and
-// the other anchors, and it reports what voids the ifbound rules there.
+// pf is a shared resource. The Backend changes the ifbound anchor
+// Anchor, its tables, and its sub-anchors. In the main ruleset it writes
+// only the entry rule, and only when no rule there calls the anchor. It
+// reads the other anchors, and it reports what voids the ifbound rules
+// there.
+//
+// macOS calls the anchor from the main ruleset with the rule
+// `anchor "com.apple/*"` of /etc/pf.conf. Other tools flush or replace the
+// main ruleset, and the anchor keeps its rules and tables, but pf no
+// longer evaluates it. Load then adds the entry rule
+// `anchor "com.apple/000.ifbound" all label "ifbound-entry"` before the
+// first filter rule of the main ruleset, through ioctl. It never loads
+// the main ruleset and never changes or removes a rule of another tool.
+// Unload removes the entry rule by its label.
 //
 // Load replaces the rules of the anchor in one transaction with
 // "pfctl -a <anchor> -f -". The ruleset of pfrules declares each table
@@ -18,16 +29,22 @@
 // ifbound does not write (a rule in a sub-anchor, which pf evaluates for
 // the packets that the anchor rule matches, a filter rule at the top
 // level that is not a block or an anchor rule, or a rule of another kind,
-// for example a NAT rule), or when pf is disabled. pf
-// replaces the rules of an anchor only as a whole, so another tool that
-// loads or flushes the anchor also removes the label. Load then repairs
-// the state: it loads the rules, flushes the rules of every sub-anchor,
-// and enables pf.
+// for example a NAT rule), when pf is disabled, or when no filter rule of
+// the main ruleset calls the anchor. In the last two cases no ifbound
+// rule is in effect. pf replaces the rules of an anchor only as a whole,
+// so another tool that loads or flushes the anchor also removes the
+// label. Load then repairs the state: it loads the rules, flushes the
+// rules of every sub-anchor, enables pf, and adds the entry rule.
 //
 // They also report no ruleset after a Load or an AddEntries that did not
 // finish, for example when the end of the states failed. The Reconciler
 // then loads again, and that Load ends the states. This mark is in
 // memory: a restart loses it.
+//
+// The ack path reads whether the main ruleset calls the anchor at each
+// check. It reads the version of the main ruleset (one ioctl), and it
+// reads the rules only when the version differs from the version at
+// which it last saw a call.
 //
 // pf keeps a sub-anchor after the rule that refers to it goes away, and
 // a flush does not remove it. The sub-anchor of a removed policy thus
@@ -117,6 +134,9 @@ type Device interface {
 	StartRef() (uint64, error)
 	StopRef(token uint64) error
 	Refs() ([]pf.Ref, error)
+	Version(rs pf.Ruleset) (pf.Version, error)
+	InsertAnchorCall(anchor, call, label string) error
+	RemoveLabeled(anchor, label string) (int, error)
 }
 
 var _ Device = (*pf.Handle)(nil)
@@ -124,11 +144,11 @@ var _ Device = (*pf.Handle)(nil)
 // Backend implements reconcile.Backend with pfctl and with ioctl calls
 // on /dev/pf. Build one with New.
 //
-// AddEntries and LoadedID are the methods of the ack path. They are safe
-// for concurrent use with each other: they call only the Device, and
-// they change no field of the Backend except unfinished, which is
-// atomic. Each other method needs exclusive use: no other call of the
-// Backend may run at the same time.
+// AddEntries, LoadedID, and Digest are the methods of the ack path and of
+// the watcher. They are safe for concurrent use with each other: they
+// call only the Device, and they change no field of the Backend except
+// unfinished and entered, which are atomic. Each other method needs
+// exclusive use: no other call of the Backend may run at the same time.
 type Backend struct {
 	run Runner
 	dev Device
@@ -143,6 +163,10 @@ type Backend struct {
 	// unfinished is true from the start of a Load until it finishes, and
 	// after an AddEntries that did not end the states.
 	unfinished atomic.Bool
+	// entered is the version of the main filter ruleset at which a rule
+	// of it called the anchor, or nil when no read saw a call yet. While
+	// the version stays the same, so do the rules.
+	entered atomic.Pointer[pf.Version]
 }
 
 var _ reconcile.Backend = (*Backend)(nil)
@@ -191,7 +215,8 @@ func (b *Backend) LoadedID(context.Context) (string, error) {
 
 // loaded reads whether pf is enabled, the ID of the loaded ruleset, and
 // the tokens in the labels of the anchor. The ID is "" when pf is
-// disabled: no rule is in effect then.
+// disabled or when no rule of the main ruleset calls the anchor: no rule
+// is in effect then.
 func (b *Backend) loaded() (enabled bool, id string, tokens []token, err error) {
 	enabled, err = b.enabled()
 	if err != nil || !enabled {
@@ -201,10 +226,86 @@ func (b *Backend) loaded() (enabled bool, id string, tokens []token, err error) 
 	if err != nil {
 		return true, "", tokens, err
 	}
-	if b.unfinished.Load() {
+	if id == "" || b.unfinished.Load() {
 		return true, "", tokens, nil
 	}
+	entered, err := b.isEntered()
+	if err != nil || !entered {
+		return true, "", tokens, err
+	}
 	return true, id, tokens, nil
+}
+
+// isEntered reports whether a filter rule of the main ruleset calls the
+// anchor. When the version of the main ruleset is the version at which
+// the last read saw a call, it reads no rule.
+//
+// It keeps a version only when the version after the read of the rules
+// is the same as before. Else the rules that it read can be of a later
+// version than the one that it keeps.
+func (b *Backend) isEntered() (bool, error) {
+	main := pf.Ruleset{}
+	v, err := b.dev.Version(main)
+	if err != nil {
+		return false, fmt.Errorf("reading the version of the main ruleset: %w", err)
+	}
+	if seen := b.entered.Load(); seen != nil && *seen == v {
+		return true, nil
+	}
+	rules, err := b.dev.Rules(main)
+	if err != nil {
+		return false, fmt.Errorf("reading the main ruleset: %w", err)
+	}
+	if !slices.ContainsFunc(rules, callsAnchor) {
+		return false, nil
+	}
+	if after, err := b.dev.Version(main); err == nil && after == v {
+		b.entered.Store(&v)
+	}
+	return true, nil
+}
+
+// callsAnchor reports whether a rule of the main ruleset calls the
+// anchor, as pf_anchor_copyout gives the call: `anchor "com.apple/*"`,
+// the entry rule, or the absolute form of one of them. In the main
+// ruleset a relative call and an absolute call name the same anchor. A
+// call with parameters, such as `anchor "com.apple/*" in all`, counts
+// too: the Device does not give the parameters. Read reports such a
+// call as a Problem that voids the enforcement (see ruleProblems).
+func callsAnchor(r pf.Rule) bool {
+	call := strings.TrimPrefix(r.AnchorCall, "/")
+	return call == appleAnchor+"/*" || call == Anchor
+}
+
+// Digest implements reconcile.Backend. It reads whether pf is enabled,
+// the version of the main filter ruleset, and the version of the filter
+// ruleset of the anchor: three ioctl calls, and no rule. So it changes
+// when another tool disables pf, loads or flushes the main ruleset, or
+// loads or flushes the anchor, and at each Load. A change of a table, of
+// a sub-anchor, or of another anchor does not change it.
+func (b *Backend) Digest(context.Context) (reconcile.Digest, error) {
+	s, err := b.dev.Status()
+	if err != nil {
+		return reconcile.Digest{}, fmt.Errorf("reading the pf status: %w", err)
+	}
+	main, err := b.dev.Version(pf.Ruleset{})
+	if err != nil {
+		return reconcile.Digest{}, fmt.Errorf("reading the version of the main ruleset: %w", err)
+	}
+	var running, found uint64
+	if s.Running {
+		running = 1
+	}
+	anchor, err := b.dev.Version(pf.Ruleset{Anchor: Anchor})
+	switch {
+	case errors.Is(err, pf.ErrNotFound):
+	case err != nil:
+		return reconcile.Digest{}, fmt.Errorf("reading the version of the anchor: %w", err)
+	default:
+		found = 1
+	}
+	return reconcile.NewDigest(running, uint64(main.Ticket), uint64(main.Count),
+		found, uint64(anchor.Ticket), uint64(anchor.Count)), nil
 }
 
 // adopt is loaded for a method with exclusive use. When the Backend
@@ -317,7 +418,8 @@ func (b *Backend) enabled() (bool, error) {
 // Load implements reconcile.Backend. It takes a new pf reference (this
 // enables pf when it is disabled), loads the ruleset with the sentinel
 // rules, gives back the references that ifbound held before, flushes the
-// rules of every sub-anchor, and then ends the states to every entry of
+// rules of every sub-anchor, adds the entry rule when no rule of the main
+// ruleset calls the anchor, and then ends the states to every entry of
 // every table of the anchor. The rate limit can refuse to enable pf: Load
 // then fails, and a later Load tries again.
 //
@@ -364,6 +466,9 @@ func (b *Backend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 	if err := b.flushSubAnchors(ctx); err != nil {
 		return err
 	}
+	if err := b.enter(); err != nil {
+		return err
+	}
 	tables, _, err := b.tables(ctx)
 	if err != nil {
 		return err
@@ -372,6 +477,24 @@ func (b *Backend) Load(ctx context.Context, rs reconcile.Ruleset) error {
 		return err
 	}
 	b.unfinished.Store(false)
+	return nil
+}
+
+// enter adds the entry rule at the head of the main filter ruleset when
+// no rule there calls the anchor. When a rule calls it, enter adds
+// nothing: so a Load adds at most one entry rule, and the main ruleset of
+// macOS stays as it is. The entry rule comes first, so the ifbound rules
+// come before each rule of another tool in the main ruleset. pf.ErrChanged
+// (another tool changed the main ruleset at the same time) fails Load,
+// and a later Load tries again.
+func (b *Backend) enter() error {
+	entered, err := b.isEntered()
+	if err != nil || entered {
+		return err
+	}
+	if err := b.dev.InsertAnchorCall("", Anchor, entryLabel); err != nil {
+		return fmt.Errorf("adding the entry rule to the main ruleset: %w", err)
+	}
 	return nil
 }
 
@@ -455,10 +578,10 @@ func (b *Backend) abandon(ctx context.Context, t token) {
 }
 
 // Unload removes the enforcement of ifbound from pf. It is for
-// uninstall. It gives back the pf references of ifbound, then flushes
-// the rules and the tables of the anchor. It never disables pf and never
-// flushes all of the anchor, so pf stays enabled while other references
-// exist.
+// uninstall. It gives back the pf references of ifbound, removes the
+// entry rule from the main ruleset, then flushes the rules and the tables
+// of the anchor. It never disables pf and never flushes all of the
+// anchor, so pf stays enabled while other references exist.
 //
 // The references go back first. Their labels are in the rules of the
 // anchor, so after a stop between the two steps the labels stay, and a
@@ -466,7 +589,8 @@ func (b *Backend) abandon(ctx context.Context, t token) {
 // kernel then lists no reference that matches a label exactly, and the
 // second Unload only removes the rules. When the Backend knows no token,
 // Unload reads them from the anchor first. A token that pf no longer
-// holds counts as given back. Thus Unload is idempotent.
+// holds counts as given back. A main ruleset without the entry rule is
+// not an error. Thus Unload is idempotent.
 //
 // Unload uses a new context with a timeout of cleanupWait, so a canceled
 // caller still removes the enforcement.
@@ -478,6 +602,9 @@ func (b *Backend) Unload(ctx context.Context) error {
 	}
 	if err := b.release(); err != nil {
 		return err
+	}
+	if _, err := b.dev.RemoveLabeled("", entryLabel); err != nil {
+		return fmt.Errorf("removing the entry rule from the main ruleset: %w", err)
 	}
 	if _, err := b.pfctl(ctx, nil, "-a", Anchor, "-F", "rules"); err != nil {
 		return fmt.Errorf("flushing the rules of the anchor: %w", err)

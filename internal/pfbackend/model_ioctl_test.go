@@ -1,6 +1,8 @@
 package pfbackend
 
 import (
+	"encoding/binary"
+	"hash/fnv"
 	"maps"
 	"net/netip"
 	"slices"
@@ -24,6 +26,10 @@ var (
 	AddrArgs   = addrArgs
 	RuleKindOf = ruleKind
 	CallTarget = callTarget
+	VersionOf  = versionOf
+	InsertCall = insertCall
+	RemoveRule = removeLabeled
+	EntryLabel = entryLabel
 )
 
 // ruleKind returns the ruleset of pf that holds a rule line.
@@ -159,4 +165,48 @@ func addrArgs(t pf.Table, addrs []pf.Addr) []string {
 		args = append(args, mark+a.Prefix.String())
 	}
 	return args
+}
+
+// versionOf returns the Version of the rules of the kind in lines, as
+// Handle.Version gives it. gen counts the changes that the model made to
+// the ruleset. The ticket is a digest of gen and of the rules: so a load
+// of the same rules gives a new Version, as in pf, and so does a change
+// that a test makes to the lines directly.
+func versionOf(lines []string, kind pf.RulesetKind, gen uint32) pf.Version {
+	h := fnv.New32a()
+	h.Write(binary.BigEndian.AppendUint32(nil, gen))
+	var n uint32
+	for _, l := range lines {
+		if ruleKind(l) == kind {
+			h.Write(append([]byte(l), 0))
+			n++
+		}
+	}
+	return pf.Version{Ticket: h.Sum32(), Count: n}
+}
+
+// insertCall adds the rule `anchor "<call>" all label "<label>"` before
+// the first filter rule in lines, as InsertAnchorCall does. pfctl prints
+// the rule in this form.
+func insertCall(lines []string, call, label string) []string {
+	line := `anchor "` + call + `" all label "` + label + `"`
+	i := slices.IndexFunc(lines, func(l string) bool { return ruleKind(l) == pf.RulesetFilter })
+	if i < 0 {
+		i = len(lines)
+	}
+	return slices.Insert(slices.Clone(lines), i, line)
+}
+
+// removeLabeled removes each filter rule with the label from lines, as
+// RemoveLabeled does, and returns the rest and the number of rules that
+// it removed.
+func removeLabeled(lines []string, label string) ([]string, int) {
+	var kept []string
+	for _, l := range lines {
+		if ruleKind(l) == pf.RulesetFilter && strings.Contains(l, `label "`+label+`"`) {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	return kept, len(lines) - len(kept)
 }
