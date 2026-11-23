@@ -120,6 +120,12 @@ func (m *enfModel) next() error {
 			m.now = maxTime(m.now, next)
 		}
 		return m.outside(Tick{At: m.now})
+	case k < 14:
+		return m.outside(FirewallChanged{At: m.now})
+	case k < 15 && m.rng.IntN(2) == 0:
+		return m.outside(WatchFailed{At: m.now, Err: errModel})
+	case k < 15:
+		return m.outside(WatchSucceeded{At: m.now})
 	default:
 		return m.outside(Tick{At: m.now})
 	}
@@ -309,7 +315,8 @@ func (m *enfModel) answer(e Effect) (Event, error) {
 			return nil, fmt.Errorf("a second account read %v while %v is in flight", e, *m.flight)
 		}
 		m.flight = &e
-	case AccountsOverdue, AccountLookupsFailed, HostsReadFailed, KernelHostsFailed, ReportPathFailed:
+	case AccountsOverdue, AccountLookupsFailed, HostsReadFailed, KernelHostsFailed, ReportPathFailed,
+		RepairPlanned, WatchFailing:
 	}
 	return nil, nil
 }

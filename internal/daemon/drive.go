@@ -58,6 +58,10 @@ func (l *loop) drive(ctx context.Context, ev core.Event) {
 			l.emit(ctx, e)
 		case core.ReportPathFailed:
 			l.emit(ctx, e)
+		case core.RepairPlanned:
+			l.emit(ctx, e)
+		case core.WatchFailing:
+			l.emit(ctx, e)
 		default:
 			panic(fmt.Sprintf("daemon: unknown effect %T", e))
 		}
@@ -117,6 +121,14 @@ func (l *loop) emit(ctx context.Context, e core.OutEffect) {
 		}
 		l.log.WarnContext(ctx, "DNS report got no ack",
 			slog.String(logattr.ErrorType, errType), slog.String(logattr.ExceptionMessage, e.Err.Error()))
+	case core.RepairPlanned:
+		// The Digest does not tell which part of the firewall changed, so
+		// the event does not tell it either. The convergence reads it.
+		l.log.LogAttrs(ctx, slog.LevelInfo, "firewall changed outside ifbound",
+			slog.Int64(logattr.BackoffMS, e.Wait.Milliseconds()))
+	case core.WatchFailing:
+		l.log.WarnContext(ctx, "watch of the firewall failed",
+			slog.String(logattr.ErrorType, logattr.ErrorTypePlatform), slog.String(logattr.ExceptionMessage, e.Err.Error()))
 	default:
 		panic(fmt.Sprintf("daemon: unknown out effect %T", e))
 	}

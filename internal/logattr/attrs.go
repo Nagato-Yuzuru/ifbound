@@ -130,6 +130,9 @@ const (
 
 	// A new configuration was applied.
 	TriggerConfig = "config"
+
+	// The watcher found a change of the firewall that ifbound did not make, such as a disabled pf or a new main ruleset.
+	TriggerFirewallChanged = "firewall_changed"
 )
 
 // Values of EnforcementState.

@@ -59,6 +59,11 @@ attributes:
           brief: A new configuration was applied.
           stability: development
           annotations: {go: {name: TriggerConfig}}
+        - id: firewall_changed
+          value: "firewall_changed"
+          brief: The watcher found a change of the firewall that ifbound did not make, such as a disabled pf or a new main ruleset.
+          stability: development
+          annotations: {go: {name: TriggerFirewallChanged}}
     stability: development
     brief: The cause of the convergence.
     annotations: {go: {name: ConvergeTrigger}}

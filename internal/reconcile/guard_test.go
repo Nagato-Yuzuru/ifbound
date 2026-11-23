@@ -2,9 +2,11 @@ package reconcile_test
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -211,4 +213,163 @@ func TestGuardWaitKeepsTheFakeClock(t *testing.T) {
 		wg.Go(func() { g.Exclusive(func(reconcile.Backend) {}) })
 		wg.Wait()
 	})
+}
+
+// changed calls g.Changed and fails the test on an error.
+func changed(t *testing.T, g *reconcile.Guard) bool {
+	t.Helper()
+	c, err := g.Changed(t.Context())
+	if err != nil {
+		t.Fatalf("Changed: %v", err)
+	}
+	return c
+}
+
+// The writes of an Exclusive call do not look like a change. A change
+// that another program makes looks like one, once.
+func TestGuardChangedSkipsOwnWrites(t *testing.T) {
+	rs := reconcile.NewRuleset([]byte("table web\n"))
+	for _, tt := range []struct {
+		name     string
+		external func(w *reconciletest.World)
+	}{
+		{"FlushAll", (*reconciletest.World).FlushAll},
+		{"DisableFirewall", (*reconciletest.World).DisableFirewall},
+		{"ExternalLoad", func(w *reconciletest.World) { w.ExternalLoad([]byte("other\n")) }},
+	} {
+		w := reconciletest.NewWorld()
+		g := reconcile.NewGuard(w.Backend())
+		g.Exclusive(func(b reconcile.Backend) { _ = b.Load(t.Context(), rs) }) //nolint:errcheck // the World does not fail
+		if changed(t, g) {
+			t.Errorf("%s: Changed after an own Load = true, want false", tt.name)
+		}
+		tt.external(w)
+		if !changed(t, g) {
+			t.Errorf("%s: Changed after the external change = false, want true", tt.name)
+		}
+		if changed(t, g) {
+			t.Errorf("%s: second Changed after the external change = true, want false: one change is reported once", tt.name)
+		}
+	}
+}
+
+// digestFails is a Backend whose Digest fails while fail is set.
+type digestFails struct {
+	reconcile.Backend
+	fail *atomic.Bool
+}
+
+func (b digestFails) Digest(ctx context.Context) (reconcile.Digest, error) {
+	if b.fail.Load() {
+		return reconcile.Digest{}, reconciletest.ErrInjected
+	}
+	return b.Backend.Digest(ctx)
+}
+
+// A failed read in Changed returns the error and keeps the expected
+// digest. A failed read after a write of an Exclusive call makes the
+// expected digest unknown, so the next Changed reports a change.
+func TestGuardChangedAfterDigestErrors(t *testing.T) {
+	var fail atomic.Bool
+	g := reconcile.NewGuard(digestFails{Backend: reconciletest.NewWorld().Backend(), fail: &fail})
+	if !changed(t, g) {
+		t.Error("first Changed of a new Guard = false, want true: the expected digest is unknown")
+	}
+	fail.Store(true)
+	if _, err := g.Changed(t.Context()); !errors.Is(err, reconciletest.ErrInjected) {
+		t.Errorf("Changed with a failing Digest = %v, want ErrInjected", err)
+	}
+	fail.Store(false)
+	if changed(t, g) {
+		t.Error("Changed after a failed Changed = true, want false: the failure kept the expected digest")
+	}
+	rs := reconcile.NewRuleset([]byte("table web\n"))
+	fail.Store(true)
+	g.Exclusive(func(b reconcile.Backend) { _ = b.Load(t.Context(), rs) }) //nolint:errcheck // the World does not fail
+	fail.Store(false)
+	if !changed(t, g) {
+		t.Error("Changed after an Exclusive call whose read failed = false, want true")
+	}
+}
+
+// insideDigests records, for each call of Digest, whether an Exclusive
+// section of the test was in f at the time.
+type insideDigests struct {
+	reconcile.Backend
+	inside *atomic.Bool
+	ev     *events
+}
+
+func (b insideDigests) Digest(ctx context.Context) (reconcile.Digest, error) {
+	if b.inside.Load() {
+		b.ev.add("digest inside f")
+	} else {
+		b.ev.add("digest")
+	}
+	return b.Backend.Digest(ctx)
+}
+
+// Changed never reads the Digest while an Exclusive section runs. The
+// test holds f open after a write, and synctest.Wait proves that Changed
+// is blocked before its read: the Guard waits on channels, so a blocked
+// Changed is durably blocked. The only read in f is the read after the
+// write.
+func TestGuardChangedWaitsForExclusive(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var inside atomic.Bool
+		var ev events
+		g := reconcile.NewGuard(insideDigests{Backend: reconciletest.NewWorld().Backend(), inside: &inside, ev: &ev})
+		rs := reconcile.NewRuleset([]byte("table web\n"))
+		entered, release := make(chan struct{}), make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			g.Exclusive(func(b reconcile.Backend) {
+				inside.Store(true)
+				_ = b.Load(t.Context(), rs) //nolint:errcheck // the World does not fail
+				close(entered)
+				<-release
+				inside.Store(false)
+			})
+		})
+		<-entered
+		result := make(chan bool, 1)
+		wg.Go(func() {
+			c, err := g.Changed(t.Context())
+			if err != nil {
+				t.Errorf("Changed: %v", err)
+			}
+			result <- c
+		})
+		synctest.Wait()
+		if got, want := ev.get(), []string{"digest inside f"}; !slices.Equal(got, want) {
+			t.Fatalf("Digest calls while f runs = %v, want %v: only the read after the write", got, want)
+		}
+		close(release)
+		wg.Wait()
+		if got, want := ev.get(), []string{"digest inside f", "digest"}; !slices.Equal(got, want) {
+			t.Errorf("Digest calls = %v, want %v: the read after the write, then the read of Changed", got, want)
+		}
+		if <-result {
+			t.Error("Changed after the Exclusive call = true, want false")
+		}
+	})
+}
+
+// A change by another program after a write of ifbound, while the same
+// Exclusive call goes on, shows to Changed: the Guard reads the expected
+// digest right after the write, not at the end of the call.
+func TestGuardChangedSeesAChangeLaterInTheSameSection(t *testing.T) {
+	w := reconciletest.NewWorld()
+	g := reconcile.NewGuard(w.Backend())
+	rs := reconcile.NewRuleset([]byte("table web\n"))
+	g.Exclusive(func(b reconcile.Backend) {
+		_ = b.Load(t.Context(), rs) //nolint:errcheck // the World does not fail
+		w.FlushAll()
+		if _, err := b.Read(t.Context()); err != nil {
+			t.Errorf("read: %v", err)
+		}
+	})
+	if !changed(t, g) {
+		t.Error("Changed after a flush that came after the own Load = false, want true")
+	}
 }

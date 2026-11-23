@@ -2,9 +2,10 @@
 //
 // One goroutine, started by Run, drives the platform through a
 // reconcile.Reconciler. Every event but a DNS report goes to it: an
-// interface change, the self-heal and expiry timers, and a configuration
-// change. Other goroutines talk to it only through requests with a reply
-// channel, so its state needs no lock. It holds the address book (see
+// interface change, the self-heal and expiry timers, a configuration
+// change, and a firewall change that the watcher finds. Other
+// goroutines talk to it only through requests with a reply channel, so
+// its state needs no lock. It holds the address book (see
 // addrstore); the committer goroutine of the book writes it. The
 // decisions, the phase, and the timers are in core.Step and
 // core.PhaseOf; the loop runs their effects (see drive).
@@ -149,9 +150,11 @@ type request func(ctx context.Context, l *loop)
 //
 // The daemon learns of a problem that voids enforcement and keeps the
 // loaded ruleset, such as a quick pass rule that comes before the anchor,
-// only at a convergence: for up to SelfHealInterval after it appears,
-// reports are still acknowledged, and addresses that were acknowledged
-// earlier are exposed in the same window.
+// only at a convergence: until then, reports are still acknowledged, and
+// addresses that were acknowledged earlier are exposed. The self-heal
+// comes every SelfHealInterval. When the change that made the problem
+// also changed the firewall digest, such as a new main ruleset, the
+// watcher usually starts a convergence earlier (see Run).
 //
 // A disabled firewall is not such a problem, and neither is a main
 // ruleset that does not call the anchor: the Backend then reports no
@@ -160,8 +163,8 @@ type request func(ctx context.Context, l *loop)
 // enables the firewall again and adds the call. In a phase that acknowledges, the next
 // report that matches a policy starts that convergence. In a phase that
 // does not acknowledge, a report starts no convergence: the next
-// convergence, usually the self-heal, does the Load. The Backend can
-// refuse the Load. The pf Backend enables the firewall at most once in
+// convergence, usually the one that the watcher starts, does the Load.
+// The Backend can refuse the Load. The pf Backend enables the firewall at most once in
 // pfbackend.EnableInterval, which is longer than SelfHealInterval. When
 // another tool disables the firewall again and again, the firewall can
 // stay disabled across several self-heals. The convergence that enables
@@ -313,6 +316,20 @@ func (c Config) check() error {
 // that reaches ifbound-dns removes the reason until the configuration
 // changes. A configuration without names has no warm-up, so it has no
 // self-test and no reason.
+//
+// Run polls the firewall for a change that another program makes, such
+// as a disabled pf or a flushed or replaced main ruleset (see
+// reconcile.Guard.Changed): every WatchPeriod, and every WatchFastPeriod
+// until WatchFastFor after the last interface change. A poll that finds
+// a change starts a convergence, which reads the firewall and loads the
+// ruleset again when the change took it out of effect. The gate stays
+// open meanwhile: the check of each report refuses the ack while the
+// ruleset is not in effect, and a harmless change must not stop the
+// acks. When changes come again soon after a repair, the convergence
+// waits from core.RepairBackoffMin up to core.RepairBackoffMax, until a
+// quiet time of core.RepairQuiet. The daemon never stops these repairs.
+// A poll that fails makes the state StateDegraded until a poll
+// succeeds.
 func (d *Daemon) Run(ctx context.Context) error {
 	if err := d.cfg.check(); err != nil {
 		return err
@@ -333,6 +350,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// the exclusive section waits for each report that runs.
 	defer d.cfg.Platform.Guard.Exclusive(func(reconcile.Backend) { l.closeBook() })
 	defer publishView(&d.view, core.Gate{State: core.Closed{Err: ErrStopped}}, nil)
+	watch := newWatcher(d.cfg.Platform.Guard.Changed)
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	var watching sync.WaitGroup
+	watching.Go(func() { watch.run(watchCtx) })
+	// The watcher stops first: it uses the Guard, and the loop no
+	// longer takes its results.
+	defer func() {
+		stopWatch()
+		watching.Wait()
+	}()
 	l.loadStored(ctx)
 	wake := time.NewTimer(0) // armWake sets it before the first select
 	defer wake.Stop()
@@ -361,7 +388,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			l.facts = f
 			l.drive(ctx, core.BookChanged{At: time.Now(), Facts: f})
 		case <-changes:
+			watch.kick()
 			l.drive(ctx, core.InterfacesChanged{At: time.Now()})
+		case ev := <-watch.events:
+			l.drive(ctx, ev)
 		case r := <-l.accountResults:
 			r.At = time.Now()
 			l.drive(ctx, r)
