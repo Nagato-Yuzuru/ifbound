@@ -18,8 +18,11 @@ import (
 // A field order that does not agree with the kernel shows here, not in
 // the unit tests.
 
+// openPf checks the environment first, so that a helper that opens pf
+// before the test checks it skips instead of failing.
 func openPf(t testing.TB) *pf.Handle {
 	t.Helper()
+	requireE2E(t)
 	h, err := pf.Open()
 	if err != nil {
 		t.Fatalf("open: %v", err)

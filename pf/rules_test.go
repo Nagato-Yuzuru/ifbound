@@ -2,6 +2,8 @@ package pf
 
 import (
 	"errors"
+	"io/fs"
+	"syscall"
 	"testing"
 )
 
@@ -23,5 +25,19 @@ func TestRulesetKindAction(t *testing.T) {
 	}
 	if _, err := RulesetKind(len(kinds)).action(); !errors.Is(err, errKind) {
 		t.Errorf("an unknown kind: got %v, want errKind", err)
+	}
+}
+
+// TestChangeErr checks the errors of a DIOCCHANGERULE change. A stale
+// ticket gives EINVAL, which the e2e tests cannot cause on demand.
+func TestChangeErr(t *testing.T) {
+	if got := changeErr(syscall.EINVAL); !errors.Is(got, ErrChanged) {
+		t.Errorf("changeErr(EINVAL) = %v, want ErrChanged", got)
+	}
+	if got := changeErr(syscall.EBUSY); !errors.Is(got, ErrChanged) {
+		t.Errorf("changeErr(EBUSY) = %v, want ErrChanged", got)
+	}
+	if got := changeErr(syscall.EPERM); !errors.Is(got, fs.ErrPermission) {
+		t.Errorf("changeErr(EPERM) = %v, want fs.ErrPermission", got)
 	}
 }

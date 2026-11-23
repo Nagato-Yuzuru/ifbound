@@ -144,34 +144,34 @@ type Rule struct {
 // ErrChanged when the ruleset changed during the read: read again. It
 // wraps ErrNotFound when the anchor does not exist.
 func (h *Handle) Rules(rs Ruleset) ([]Rule, error) {
-	rules, err := h.rules(rs)
+	_, rules, err := h.rulesWithTicket(rs)
 	if err != nil {
 		return nil, fmt.Errorf("pf: reading %s: %w", rs, err)
 	}
 	return rules, nil
 }
 
-// rules reads the ticket and the count of the ruleset, then each rule
-// with that ticket. The kernel returns EBUSY for a rule when the ticket is
-// not the ticket of the active rules (pf_ioctl.c, DIOCGETRULE).
-func (h *Handle) rules(rs Ruleset) ([]Rule, error) {
+// rulesWithTicket reads the ticket and the count of the ruleset, then each
+// rule with that ticket. The kernel returns EBUSY for a rule when the
+// ticket is not the ticket of the active rules (pf_ioctl.c, DIOCGETRULE).
+func (h *Handle) rulesWithTicket(rs Ruleset) (uint32, []Rule, error) {
 	var r pfiocRule
 	if err := r.set(rs); err != nil {
-		return nil, err
+		return 0, nil, err
 	}
 	if err := h.ioctl(diocGetRules, unsafe.Pointer(&r)); err != nil {
-		return nil, mapErrno(err, syscall.EINVAL)
+		return 0, nil, mapErrno(err, syscall.EINVAL)
 	}
 	ticket, n := r.u32(offIocRuleTicket), r.u32(offIocRuleNr)
 	rules := make([]Rule, 0, n)
 	for nr := range n {
 		if err := r.set(rs); err != nil {
-			return nil, err
+			return 0, nil, err
 		}
 		r.setU32(offIocRuleTicket, ticket)
 		r.setU32(offIocRuleNr, nr)
 		if err := h.ioctl(diocGetRule, unsafe.Pointer(&r)); err != nil {
-			return nil, mapErrno(err, syscall.EINVAL)
+			return 0, nil, mapErrno(err, syscall.EINVAL)
 		}
 		rules = append(rules, Rule{
 			Action:     Action(r.b[offIocRuleRule+offRuleAction]),
@@ -179,7 +179,7 @@ func (h *Handle) rules(rs Ruleset) ([]Rule, error) {
 			AnchorCall: cString(r.b[offIocRuleAnchorCall:offIocRuleRule]),
 		})
 	}
-	return rules, nil
+	return ticket, rules, nil
 }
 
 // Anchors returns the names of the child anchors of the anchor. Anchor ""

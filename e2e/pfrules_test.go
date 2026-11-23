@@ -5,6 +5,7 @@ package e2e
 import (
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Nagato-Yuzuru/ifbound/pf"
@@ -132,4 +133,82 @@ func BenchmarkPfReadRules(b *testing.B) {
 			pfctl(b, "-a", rs.Anchor, "-sr")
 		}
 	})
+}
+
+// TestPfInsertAnchorCall adds an anchor call before the rules of an
+// anchor, and removes it by its label. pfctl reads the result.
+func TestPfInsertAnchorCall(t *testing.T) {
+	requireE2E(t)
+	h := openPf(t)
+	rs := pf.Ruleset{Anchor: rulesAnchor}
+	loadAnchor(t, rs.Anchor, "block drop out quick inet to 192.0.2.1 label \"e2e-one\"\n")
+	loadAnchor(t, rs.Anchor+"/sub", "block drop out inet to 192.0.2.3\n")
+	before, err := h.Version(rs)
+	if err != nil {
+		t.Fatalf("version: %v", err)
+	}
+
+	if err := h.InsertAnchorCall(rs.Anchor, "sub", "e2e-entry"); err != nil {
+		t.Fatalf("InsertAnchorCall: %v", err)
+	}
+	rules, err := h.Rules(rs)
+	want := []pf.Rule{
+		{Action: pf.ActionPass, Label: "e2e-entry", AnchorCall: "sub"},
+		{Action: pf.ActionDrop, Label: "e2e-one"},
+	}
+	if err != nil || !slices.Equal(rules, want) {
+		t.Errorf("rules after the insert: %+v, %v; want %+v", rules, err, want)
+	}
+	out := pfctl(t, "-a", rs.Anchor, "-sr")
+	// The output also holds the ALTQ notes of pfctl, so compare the
+	// positions of the two rules.
+	call, block := strings.Index(out, `anchor "sub" all label "e2e-entry"`), strings.Index(out, "block drop out quick")
+	if call < 0 || block < call {
+		t.Errorf("pfctl -sr after the insert does not show the anchor call before the block rule:\n%s", out)
+	}
+	inserted, err := h.Version(rs)
+	if err != nil || inserted == before {
+		t.Errorf("version after the insert: %+v, %v; want a change from %+v", inserted, err, before)
+	}
+
+	n, err := h.RemoveLabeled(rs.Anchor, "e2e-entry")
+	if err != nil || n != 1 {
+		t.Fatalf("RemoveLabeled: %d, %v; want 1", n, err)
+	}
+	rules, err = h.Rules(rs)
+	if want := want[1:]; err != nil || !slices.Equal(rules, want) {
+		t.Errorf("rules after the removal: %+v, %v; want %+v", rules, err, want)
+	}
+	if n, err := h.RemoveLabeled(rs.Anchor, "e2e-entry"); err != nil || n != 0 {
+		t.Errorf("second RemoveLabeled: %d, %v; want 0", n, err)
+	}
+	if removed, err := h.Version(rs); err != nil || removed == inserted {
+		t.Errorf("version after the removal: %+v, %v; want a change from %+v", removed, err, inserted)
+	}
+}
+
+// TestPfVersion checks that a load and an insert by another process
+// change the Version, and that a missing anchor gives ErrNotFound.
+func TestPfVersion(t *testing.T) {
+	requireE2E(t)
+	h := openPf(t)
+	rs := pf.Ruleset{Anchor: rulesAnchor}
+	loadAnchor(t, rs.Anchor, "block drop out quick inet to 192.0.2.1\n")
+	v1, err := h.Version(rs)
+	if err != nil || v1.Count != 1 {
+		t.Fatalf("version: %+v, %v; want count 1", v1, err)
+	}
+	if v, err := h.Version(rs); err != nil || v != v1 {
+		t.Errorf("second read: %+v, %v; want %+v", v, err, v1)
+	}
+	loadAnchor(t, rs.Anchor, "block drop out quick inet to 192.0.2.1\n")
+	if v, err := h.Version(rs); err != nil || v == v1 {
+		t.Errorf("version after a load of the same rules: %+v, %v; want a change from %+v", v, err, v1)
+	}
+	if _, err := h.Version(pf.Ruleset{Anchor: rulesAnchor + "/missing"}); !errors.Is(err, pf.ErrNotFound) {
+		t.Errorf("version of a missing anchor: %v, want ErrNotFound", err)
+	}
+	if err := h.InsertAnchorCall(rulesAnchor+"/missing", "sub", "e2e-entry"); !errors.Is(err, pf.ErrNotFound) {
+		t.Errorf("insert into a missing anchor: %v, want ErrNotFound", err)
+	}
 }
