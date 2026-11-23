@@ -607,6 +607,8 @@ func (b *omBackend) Read(ctx context.Context) (reconcile.BackendState, error) {
 
 func (b *omBackend) LoadedID(ctx context.Context) (string, error) { return b.in.LoadedID(ctx) }
 
+func (b *omBackend) Digest(ctx context.Context) (reconcile.Digest, error) { return b.in.Digest(ctx) }
+
 func (b *omBackend) pre(kind int) {
 	r := b.r
 	r.mu.Lock()

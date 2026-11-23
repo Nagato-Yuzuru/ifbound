@@ -183,6 +183,27 @@ type BackendState struct {
 	Problems []Problem
 }
 
+// Digest is the result of Backend.Digest. Only == on two Digests has a
+// meaning: reconcile and the daemon never read the parts. Build one with
+// NewDigest. Equal Digests do not prove that the kernel did not change
+// between the two reads: a change and its reversal can give the same
+// Digest.
+type Digest struct {
+	parts string
+}
+
+// NewDigest returns the Digest of the parts. Equal parts in the same
+// order give equal Digests, and other parts give another Digest. Each
+// part has a fixed length in the encoding, so no two lists of parts give
+// the same Digest.
+func NewDigest(parts ...uint64) Digest {
+	b := make([]byte, 0, 8*len(parts))
+	for _, p := range parts {
+		b = binary.BigEndian.AppendUint64(b, p)
+	}
+	return Digest{parts: string(b)}
+}
+
 // Backend installs enforcement in the kernel.
 //
 // Contract:
@@ -204,17 +225,27 @@ type BackendState struct {
 //     the Backend sees that this does not hold (the anchor is not
 //     referenced, or a quick rule comes first), it reports a Problem with
 //     Voids set. A disabled firewall is also such a Problem.
-//   - Read and LoadedID derive the ruleset ID from the kernel content,
-//     never from a cache. After any external change to the ruleset they
-//     report "" or an ID that differs from the loaded one. A rule that
-//     another tool adds below the ruleset (for example in a sub-anchor
-//     that a rule of the ruleset refers to) is such a change, and Load
-//     removes it.
-//   - While the firewall is disabled, Read and LoadedID report "": no
-//     rule is in effect. Load enables the firewall again. Load can fail
-//     then: the Backend may refuse to enable the firewall, for example
-//     within a rate limit. A Load that fails so leaves the firewall
-//     disabled.
+//   - Read and LoadedID derive the ruleset ID from the kernel content at
+//     each call. A Backend can keep a fact that it read before only
+//     while a version that it reads from the kernel at each call shows
+//     that the content did not change. After any external change to the
+//     ruleset they report "" or an ID that differs from the loaded one.
+//     A rule that another tool adds below the ruleset (for example in a
+//     sub-anchor that a rule of the ruleset refers to) is such a change,
+//     and Load removes it.
+//   - Read and LoadedID report "" when the ruleset is not in effect: the
+//     firewall is disabled, or the kernel does not evaluate the ruleset
+//     (for example, another tool removed the rule that calls it). Load
+//     makes the ruleset take effect again. It enables the firewall and
+//     adds the missing call. Load can fail when the firewall is
+//     disabled: the Backend may refuse to enable the firewall, for
+//     example within a rate limit. A Load that fails so leaves the
+//     firewall disabled.
+//   - Digest reads only a few values of the kernel. Its result changes
+//     when the firewall is enabled or disabled, when the ruleset of
+//     ifbound changes, and when the rules that decide whether the
+//     kernel evaluates that ruleset change. A change of a table only
+//     need not change it.
 //   - The write methods are idempotent: adding an entry that is present,
 //     removing one that is absent, and dropping a table that is missing
 //     all succeed. A nil error from a write means the kernel holds the
@@ -227,6 +258,10 @@ type Backend interface {
 	Adder
 	// Read returns the actual state. It writes nothing.
 	Read(ctx context.Context) (BackendState, error)
+	// Digest returns a cheap digest of the enforcement in the kernel. It
+	// writes nothing. A watcher compares two results to find an external
+	// change without a full Read.
+	Digest(ctx context.Context) (Digest, error)
 	// Load installs the ruleset.
 	Load(ctx context.Context, rs Ruleset) error
 	// RemoveEntries removes entries from the table of a policy.

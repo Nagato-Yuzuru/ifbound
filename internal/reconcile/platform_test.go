@@ -37,3 +37,15 @@ func TestInterfacePossible(t *testing.T) {
 		t.Errorf("Uncertain gives name %q and class %v, want ppp0 and the zero Class", u.Name, u.Class)
 	}
 }
+
+func TestNewDigest(t *testing.T) {
+	want := reconcile.NewDigest(1, 2)
+	if parts := []uint64{1, 2}; reconcile.NewDigest(parts...) != want {
+		t.Error("equal parts give different Digests")
+	}
+	for _, other := range [][]uint64{{2, 1}, {1}, {1, 2, 0}, {1<<32 | 2}, nil} {
+		if reconcile.NewDigest(other...) == want {
+			t.Errorf("parts %v give the Digest of [1 2]", other)
+		}
+	}
+}

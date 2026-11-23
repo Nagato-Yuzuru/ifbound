@@ -15,13 +15,16 @@ import (
 	"github.com/Nagato-Yuzuru/ifbound/internal/pfbackend"
 )
 
-// unloadOrder returns the StopRef and -F calls in the order that they ran.
+// unloadOrder returns the StopRef, DIOCCHANGERULE, and -F calls in the
+// order that they ran.
 func unloadOrder(calls [][]string) []string {
 	var out []string
 	for _, c := range calls {
 		switch {
 		case slices.Contains(c, "DIOCSTOPREF"):
 			out = append(out, "DIOCSTOPREF")
+		case slices.Contains(c, "DIOCCHANGERULE"):
+			out = append(out, strings.Join(c, " "))
 		case slices.Contains(c, "-F"):
 			out = append(out, strings.Join(c, " "))
 		}
@@ -43,7 +46,7 @@ func TestUnloadRemovesTheEnforcement(t *testing.T) {
 	if err := r.b.Unload(t.Context()); err != nil {
 		t.Fatalf("Unload: %v", err)
 	}
-	want := []string{"DIOCSTOPREF", "-a " + ifb + " -F rules", "-a " + ifb + " -F Tables"}
+	want := []string{"DIOCSTOPREF", "DIOCCHANGERULE  remove " + pfbackend.EntryLabel, "-a " + ifb + " -F rules", "-a " + ifb + " -F Tables"}
 	if got := unloadOrder(r.k.calls[from:]); !slices.Equal(got, want) {
 		t.Errorf("Unload ran %v, want %v: the token goes back before the flush", got, want)
 	}
@@ -84,7 +87,7 @@ func TestUnloadAfterAFailedLoad(t *testing.T) {
 // two, another tool takes a reference, and pf can give it the value
 // that ifbound released.
 func TestUnloadResumesAfterAStop(t *testing.T) {
-	for _, step := range [][]string{{"DIOCGETSTARTERS"}, {"DIOCSTOPREF"}, {"-F", "rules"}, {"-F", "Tables"}} {
+	for _, step := range [][]string{{"DIOCGETSTARTERS"}, {"DIOCSTOPREF"}, {"DIOCCHANGERULE"}, {"-F", "rules"}, {"-F", "Tables"}} {
 		name := strings.Join(step, " ")
 		t.Run(name, func(t *testing.T) { unloadAfterAStop(t, step, false) })
 		t.Run(name+", another reference", func(t *testing.T) { unloadAfterAStop(t, step, true) })
@@ -100,6 +103,9 @@ func unloadAfterAStop(t *testing.T, step []string, other bool) {
 		}
 		keep = slices.Clone(r.k.refs)
 	}
+	// Another tool flushed the main ruleset, so Load adds the entry rule,
+	// and Unload must remove it.
+	flushMain(t, r.k)
 	mustLoad(t, r, compileRS(t, testPolicies))
 	if err := r.b.AddEntries(t.Context(), "bing", pfx("192.0.2.1/32")); err != nil {
 		t.Fatal(err)
@@ -120,8 +126,8 @@ func unloadAfterAStop(t *testing.T, step []string, other bool) {
 	if err := again.Unload(t.Context()); err != nil {
 		t.Fatalf("second Unload: %v", err)
 	}
-	if len(r.k.rules[ifb]) != 0 || len(r.k.tables[ifb]) != 0 {
-		t.Errorf("after the second Unload: rules %v tables %v, want none", r.k.rules[ifb], r.k.tables[ifb])
+	if len(r.k.rules[ifb]) != 0 || len(r.k.tables[ifb]) != 0 || r.k.entryRules() != 0 {
+		t.Errorf("after the second Unload: rules %v tables %v main %v, want none", r.k.rules[ifb], r.k.tables[ifb], r.k.mainRules)
 	}
 	if !slices.Equal(r.k.refs, keep) || !r.k.enabled {
 		t.Errorf("after the second Unload: refs %v enabled %v, want refs %v of the other tools", r.k.refs, r.k.enabled, keep)

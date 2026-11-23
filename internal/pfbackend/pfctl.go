@@ -82,6 +82,12 @@ const (
 	digestSize  = 32
 )
 
+// entryLabel is the label of the entry rule that Load adds to the main
+// ruleset. It starts with neither labelPrefix nor tokenPrefix, so it is
+// never read as a sentinel or a token label. Unload finds the rule by
+// this label, also in a new process.
+const entryLabel = "ifbound-entry"
+
 // sentinel returns the sentinel rule for a ruleset ID.
 func sentinel(id string) (string, error) {
 	sum, err := hex.DecodeString(id)
@@ -550,14 +556,25 @@ func natPass(rule string) bool {
 	return len(f) > 1 && (f[0] == "nat" || f[0] == "binat") && f[1] == "pass"
 }
 
-// refersToApple reports whether a printed rule of the main ruleset makes
-// pf evaluate the anchors below com.apple for every packet. pf.conf(5):
-// "When parameters are used, the anchor rule is only evaluated for
-// matching packets".
-func refersToApple(rule string) bool {
-	rest, ok := strings.CutPrefix(rule, `anchor "`+appleAnchor+`/*"`)
-	rest = strings.TrimSpace(rest)
-	return ok && (rest == "" || rest == "all")
+// entersAnchor reports whether a printed rule of the main ruleset makes
+// pf evaluate the ifbound anchor for every packet: `anchor "com.apple/*"`,
+// which calls each anchor below com.apple, or a call of the ifbound
+// anchor itself, such as the entry rule. A call can be absolute, with a
+// "/" first. pf.conf(5): "When parameters are used, the anchor rule is
+// only evaluated for matching packets". A label is not a parameter: it
+// does not change which packets the rule matches.
+func entersAnchor(rule string) bool {
+	words := ruleWords(rule)
+	call, _, ok := anchorRule(words)
+	call = strings.TrimPrefix(call, "/")
+	if !ok || call != appleAnchor+"/*" && call != Anchor {
+		return false
+	}
+	rest := words[2:]
+	if i := slices.Index(rest, "label"); i >= 0 && i+1 < len(rest) {
+		rest = slices.Delete(slices.Clone(rest), i, i+2)
+	}
+	return len(rest) == 0 || len(rest) == 1 && rest[0] == "all"
 }
 
 // stateAddr reads one address field of a state line.

@@ -45,11 +45,13 @@ func contractEntry() netip.Prefix { return netip.MustParsePrefix("203.0.113.7/32
 // for a disabled firewall: what Read and LoadedID report while the
 // firewall is disabled, a Load that the Backend refuses soon after an
 // enable, a Load after the rate limit, and AddEntries while the firewall
-// is disabled. It also runs a write with an invalid entry. Each case
+// is disabled. It also runs a write with an invalid entry, and checks
+// that the Digest changes at each Load and at each disable. Each case
 // gets a new target from newTarget.
 func RunBackendContract(t *testing.T, newTarget func(t *testing.T) ContractTarget) {
 	t.Helper()
 	t.Run("invalid entry is refused", func(t *testing.T) { runInvalidEntry(t, newTarget(t)) })
+	t.Run("digest changes", func(t *testing.T) { runDigest(t, newTarget(t)) })
 	tests := []struct {
 		name  string
 		steps []contractStep
@@ -159,4 +161,29 @@ func (tg ContractTarget) holds(t *testing.T) bool {
 		t.Fatalf("Read: %v", err)
 	}
 	return slices.Contains(st.Tables[tg.Table], contractEntry())
+}
+
+// runDigest checks that the Digest changes at each Load and at each
+// disable, and that it stays the same while nothing changes.
+func runDigest(t *testing.T, tg ContractTarget) {
+	digest := func() reconcile.Digest {
+		t.Helper()
+		d, err := tg.Backend.Digest(t.Context())
+		if err != nil {
+			t.Fatalf("Digest: %v", err)
+		}
+		return d
+	}
+	prev := digest()
+	for _, s := range []contractStep{stepLoad, stepDisable, stepElapse, stepLoad, stepLoad} {
+		tg.run(t, s)
+		d := digest()
+		if s != stepElapse && d == prev {
+			t.Errorf("Digest after step %d is the Digest before it", s)
+		}
+		if again := digest(); again != d {
+			t.Errorf("Digest changed with no change after step %d", s)
+		}
+		prev = d
+	}
 }

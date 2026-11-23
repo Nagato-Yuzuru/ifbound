@@ -148,15 +148,16 @@ type request func(ctx context.Context, l *loop)
 // ipc.ProbeHandler.
 //
 // The daemon learns of a problem that voids enforcement and keeps the
-// loaded ruleset, such as a main ruleset that does not reference the
-// anchor, only at a convergence: for up to SelfHealInterval after it
-// appears, reports are still acknowledged, and addresses that were
-// acknowledged earlier are exposed in the same window.
+// loaded ruleset, such as a quick pass rule that comes before the anchor,
+// only at a convergence: for up to SelfHealInterval after it appears,
+// reports are still acknowledged, and addresses that were acknowledged
+// earlier are exposed in the same window.
 //
-// A disabled firewall is not such a problem: the Backend then reports no
+// A disabled firewall is not such a problem, and neither is a main
+// ruleset that does not call the anchor: the Backend then reports no
 // loaded ruleset, so no report gets an acknowledgement. Addresses that
 // were acknowledged earlier are exposed until a Load of a convergence
-// enables the firewall again. In a phase that acknowledges, the next
+// enables the firewall again and adds the call. In a phase that acknowledges, the next
 // report that matches a policy starts that convergence. In a phase that
 // does not acknowledge, a report starts no convergence: the next
 // convergence, usually the self-heal, does the Load. The Backend can

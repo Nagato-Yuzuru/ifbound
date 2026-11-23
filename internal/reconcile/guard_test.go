@@ -28,6 +28,7 @@ func TestGuardEpochCountsTheCallsThatCanRemove(t *testing.T) {
 	}{
 		{"Read", func(ctx context.Context, b reconcile.Backend) error { _, err := b.Read(ctx); return err }, 0},
 		{"LoadedID", func(ctx context.Context, b reconcile.Backend) error { _, err := b.LoadedID(ctx); return err }, 0},
+		{"Digest", func(ctx context.Context, b reconcile.Backend) error { _, err := b.Digest(ctx); return err }, 0},
 		{"AddEntries", func(ctx context.Context, b reconcile.Backend) error { return b.AddEntries(ctx, "web", host7) }, 0},
 		{"Load", func(ctx context.Context, b reconcile.Backend) error { return b.Load(ctx, rs) }, 1},
 		{"RemoveEntries", func(ctx context.Context, b reconcile.Backend) error { return b.RemoveEntries(ctx, "web", host7) }, 1},

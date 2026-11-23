@@ -175,21 +175,51 @@ func TestNatPass(t *testing.T) {
 	}
 }
 
-func TestRefersToApple(t *testing.T) {
+func TestEntersAnchor(t *testing.T) {
 	tests := []struct {
 		rule string
 		want bool
 	}{
 		{`anchor "com.apple/*" all`, true},
 		{`anchor "com.apple/*"`, true},
+		{`anchor "/com.apple/*" all`, true},
+		{`anchor "com.apple/000.ifbound" all label "ifbound-entry"`, true},
+		{`anchor "/com.apple/000.ifbound" all`, true},
+		{`anchor "com.apple/*" all label "x y"`, true},
 		{`anchor "com.apple/*" in all`, false},
 		{`anchor "com.apple/*" on lo0 all`, false},
+		{`anchor "com.apple/000.ifbound" in all label "ifbound-entry"`, false},
+		{`anchor "com.apple/000.ifbound" quick all label "ifbound-entry"`, false},
 		{`anchor "com.apple/x" all`, false},
+		{`anchor "com.apple/000.ifbound/*" all`, false},
+		{`anchor "com.apple" all`, false},
 		{`scrub-anchor "com.apple/*" all fragment reassemble`, false},
 	}
 	for _, tt := range tests {
-		if got := refersToApple(tt.rule); got != tt.want {
-			t.Errorf("refersToApple(%q) = %v, want %v", tt.rule, got, tt.want)
+		if got := entersAnchor(tt.rule); got != tt.want {
+			t.Errorf("entersAnchor(%q) = %v, want %v", tt.rule, got, tt.want)
+		}
+	}
+}
+
+func TestCallsAnchor(t *testing.T) {
+	tests := []struct {
+		call string
+		want bool
+	}{
+		{"com.apple/*", true},
+		{"/com.apple/*", true},
+		{"com.apple/000.ifbound", true},
+		{"/com.apple/000.ifbound", true},
+		{"", false},
+		{"com.apple", false},
+		{"*", false},
+		{"com.apple/000.ifbound/*", false},
+		{"com.apple/200.AirDrop", false},
+	}
+	for _, tt := range tests {
+		if got := callsAnchor(pf.Rule{Action: pf.ActionPass, AnchorCall: tt.call}); got != tt.want {
+			t.Errorf("callsAnchor(%q) = %v, want %v", tt.call, got, tt.want)
 		}
 	}
 }
