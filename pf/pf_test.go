@@ -30,6 +30,8 @@ func TestLayout(t *testing.T) {
 		{"DIOCKILLSTATES", diocKillStates, unsafe.Sizeof(pfiocStateKill{})},
 		{"DIOCGETRULES", diocGetRules, unsafe.Sizeof(pfiocRule{})},
 		{"DIOCGETRULE", diocGetRule, unsafe.Sizeof(pfiocRule{})},
+		{"DIOCCHANGERULE", diocChangeRule, unsafe.Sizeof(pfiocRule{})},
+		{"DIOCBEGINADDRS", diocBeginAddrs, unsafe.Sizeof(pfiocPooladdr{})},
 		{"DIOCGETRULESETS", diocGetRulesets, unsafe.Sizeof(pfiocRuleset{})},
 		{"DIOCGETRULESET", diocGetRuleset, unsafe.Sizeof(pfiocRuleset{})},
 		{"DIOCSTARTREF", diocStartRef, unsafe.Sizeof(uint64(0))},

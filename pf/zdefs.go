@@ -88,11 +88,15 @@ const (
 	sizeofPfiocRule      = 0xc20
 	offIocRuleAction     = 0x0
 	offIocRuleTicket     = 0x4
+	offIocRulePoolTicket = 0x8
 	offIocRuleNr         = 0xc
 	offIocRuleAnchor     = 0x10
 	offIocRuleAnchorCall = 0x410
 	offIocRuleRule       = 0x810
 	ruleLabelSize        = 0x40
+
+	sizeofPfiocPooladdr = 0x470
+	offPooladdrTicket   = 0x4
 
 	sizeofPfiocToken  = 0x54
 	offTokenTimestamp = 0x8
@@ -109,6 +113,8 @@ const (
 	diocGetStatus   = 0xc1b84415
 	diocGetRules    = 0xcc204406
 	diocGetRule     = 0xcc204407
+	diocChangeRule  = 0xcc20441a
+	diocBeginAddrs  = 0xc4704433
 	diocKillStates  = 0xc0d84429
 	diocGetRulesets = 0xc444443a
 	diocGetRuleset  = 0xc444443b
@@ -134,6 +140,10 @@ const (
 	pfrFbDeleted   = 0x3
 	pfrFbDuplicate = 0x6
 	pfrFbConflict  = 0x8
+
+	pfChangeAddHead   = 0x1
+	pfChangeRemove    = 0x5
+	pfChangeGetTicket = 0x6
 
 	pfPass         = 0x0
 	pfDrop         = 0x1

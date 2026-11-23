@@ -10,7 +10,10 @@
 //   - references: take a reference to pf (which enables it), give it back
 //     (pf stops with the last reference), and list the references;
 //   - rules: the rules of a ruleset (the action, the label, and the anchor
-//     call of each rule), and the child anchors of an anchor.
+//     call of each rule), the Version of a ruleset (one ioctl, to see a
+//     change), and the child anchors of an anchor;
+//   - anchor calls: add a call of an anchor before the first rule of a
+//     ruleset, and remove rules by their label.
 //
 // It cannot load rules. Most operations need root.
 //

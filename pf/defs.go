@@ -21,10 +21,16 @@ enum {
 	sizeofPfiocRule = sizeof(struct pfioc_rule),
 	offIocRuleAction = offsetof(struct pfioc_rule, action),
 	offIocRuleTicket = offsetof(struct pfioc_rule, ticket),
+	offIocRulePoolTicket = offsetof(struct pfioc_rule, pool_ticket),
 	offIocRuleNr = offsetof(struct pfioc_rule, nr),
 	offIocRuleAnchor = offsetof(struct pfioc_rule, anchor),
 	offIocRuleAnchorCall = offsetof(struct pfioc_rule, anchor_call),
 	offIocRuleRule = offsetof(struct pfioc_rule, rule),
+
+	// struct pfioc_pooladdr holds a struct pf_pooladdr with kernel
+	// pointers. The package uses only its ticket.
+	sizeofPfiocPooladdr = sizeof(struct pfioc_pooladdr),
+	offPooladdrTicket = offsetof(struct pfioc_pooladdr, ticket),
 
 	// struct pfioc_token is packed: its size is 84, but a Go struct with a
 	// uint64 field has the size 88. The package reads it as bytes.
@@ -59,11 +65,15 @@ const (
 	sizeofPfiocRule      = C.sizeofPfiocRule
 	offIocRuleAction     = C.offIocRuleAction
 	offIocRuleTicket     = C.offIocRuleTicket
+	offIocRulePoolTicket = C.offIocRulePoolTicket
 	offIocRuleNr         = C.offIocRuleNr
 	offIocRuleAnchor     = C.offIocRuleAnchor
 	offIocRuleAnchorCall = C.offIocRuleAnchorCall
 	offIocRuleRule       = C.offIocRuleRule
 	ruleLabelSize        = C.PF_RULE_LABEL_SIZE
+
+	sizeofPfiocPooladdr = C.sizeofPfiocPooladdr
+	offPooladdrTicket   = C.offPooladdrTicket
 
 	sizeofPfiocToken  = C.sizeofPfiocToken
 	offTokenTimestamp = C.offTokenTimestamp
@@ -80,6 +90,8 @@ const (
 	diocGetStatus   = C.DIOCGETSTATUS
 	diocGetRules    = C.DIOCGETRULES
 	diocGetRule     = C.DIOCGETRULE
+	diocChangeRule  = C.DIOCCHANGERULE
+	diocBeginAddrs  = C.DIOCBEGINADDRS
 	diocKillStates  = C.DIOCKILLSTATES
 	diocGetRulesets = C.DIOCGETRULESETS
 	diocGetRuleset  = C.DIOCGETRULESET
@@ -105,6 +117,10 @@ const (
 	pfrFbDeleted   = C.PFR_FB_DELETED
 	pfrFbDuplicate = C.PFR_FB_DUPLICATE
 	pfrFbConflict  = C.PFR_FB_CONFLICT
+
+	pfChangeAddHead   = C.PF_CHANGE_ADD_HEAD
+	pfChangeRemove    = C.PF_CHANGE_REMOVE
+	pfChangeGetTicket = C.PF_CHANGE_GET_TICKET
 
 	pfPass         = C.PF_PASS
 	pfDrop         = C.PF_DROP
