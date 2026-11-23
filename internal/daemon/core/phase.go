@@ -193,6 +193,9 @@ func (s State) configuredPhase(c Configured) Phase {
 	if p, ok := reportProblem(s); ok {
 		problems = append(problems, p)
 	}
+	if p, ok := watchProblem(s); ok {
+		problems = append(problems, p)
+	}
 	b, loaded := c.Book.(BookLoaded)
 	if p, ok := bookProblem(b); loaded && ok {
 		problems = append(problems, p)

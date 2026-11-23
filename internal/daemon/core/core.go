@@ -53,6 +53,7 @@ type State struct {
 	enf      enforcement
 	reports  reports
 	selfTest selfTest
+	watch    watch
 
 	// healAt is the time of the next self-heal, or zero for none.
 	healAt time.Time
@@ -192,6 +193,12 @@ func Step(s State, ev Event) (State, []Effect) {
 		}
 	case BookChanged:
 		s, _ = s.setFacts(ev.Facts)
+	case FirewallChanged:
+		s, out, trigger = s.applyFirewallChanged(out)
+	case WatchFailed:
+		s, out = s.applyWatchFailed(ev, out)
+	case WatchSucceeded:
+		s.watch.failure = nil
 	}
 	if trigger = cmp.Or(trigger, timer); trigger != "" {
 		out = append(out, Converge{Trigger: trigger})
@@ -200,8 +207,9 @@ func Step(s State, ev Event) (State, []Effect) {
 }
 
 // fireTimers runs each timer whose time s.now reached: the self-heal,
-// the interface debounce, and the expiry of the book. It returns the
-// trigger of the convergence that a timer wants, or "".
+// the interface debounce, the repair of a firewall change, and the
+// expiry of the book. It returns the trigger of the convergence that a
+// timer wants, or "".
 func (s State) fireTimers(out []Effect) (State, []Effect, string) {
 	_, configured := s.Config().(Configured)
 	var trigger string
@@ -219,6 +227,9 @@ func (s State) fireTimers(out []Effect) (State, []Effect, string) {
 			trigger = cmp.Or(trigger, logattr.TriggerInterfaces)
 		}
 	}
+	var repair string
+	s, repair = s.fireRepair()
+	trigger = cmp.Or(trigger, repair)
 	if b, ok := s.loadedBook(); ok {
 		if next, due := b.expiry(); due && !s.now.Before(next) {
 			b.expired = s.now
@@ -243,6 +254,7 @@ func NextWake(s State) (time.Time, bool) {
 	}
 	add(s.healAt)
 	add(s.debounceAt)
+	add(s.watch.repairAt)
 	if b, ok := s.loadedBook(); ok {
 		if t, due := b.expiry(); due {
 			add(t)

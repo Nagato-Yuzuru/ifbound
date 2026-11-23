@@ -253,7 +253,8 @@ func NewDigest(parts ...uint64) Digest {
 //   - AddEntries and RemoveEntries refuse a batch with an invalid entry,
 //     for example the zero netip.Prefix. They return an error and change
 //     nothing.
-//   - The methods of Adder are safe for concurrent use with each other.
+//   - The methods of Adder and Digest are safe for concurrent use with
+//     each other: Guard.Changed reads Digest while reports add entries.
 type Backend interface {
 	Adder
 	// Read returns the actual state. It writes nothing.

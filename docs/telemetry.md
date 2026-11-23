@@ -58,6 +58,7 @@ OpenTelemetry semantic conventions do not define these attributes.
 | `self_test` | The warm-up self-test result asked for a convergence. |
 | `expiry` | Address entries expired. |
 | `config` | A new configuration was applied. |
+| `firewall_changed` | The watcher found a change of the firewall that ifbound did not make, such as a disabled pf or a new main ruleset. |
 
 ### Values of `ifbound.enforcement.state`
 

@@ -119,7 +119,9 @@ func TestConvergenceEvent(t *testing.T) {
 			logattr.EnforcementState: logattr.StateReady,
 		})
 
-		h.world.FlushAll()
+		// A flush of a table does not change the Digest, so the watcher
+		// does not start a convergence before the self-heal.
+		h.world.FlushTable("web")
 		h.failWrites()
 		heal()
 		failed := h.last("convergence")
@@ -149,7 +151,7 @@ func TestConvergenceEvent(t *testing.T) {
 			t.Errorf("recovered pass level = %v, want info", ok.level)
 		}
 		h.failWrites()
-		h.world.FlushAll()
+		h.world.FlushTable("web")
 		heal()
 		if f := h.last("convergence"); f.level != slog.LevelWarn {
 			t.Errorf("failure after a recovery: level = %v, want warn", f.level)
@@ -437,23 +439,25 @@ func TestReportWaitsBehindConvergence(t *testing.T) {
 		before := len(h.logs.events("report"))
 		done := make(chan error, 1)
 		var total time.Duration
+		// The watcher finds the flush at its first poll and starts the
+		// convergence that loads the ruleset.
 		go func() {
-			time.Sleep(daemon.SelfHealInterval + time.Millisecond)
+			time.Sleep(daemon.WatchPeriod + time.Millisecond)
 			began := time.Now()
 			err := h.observe(obs("www.example.net", "203.0.113.1"))
 			total = time.Since(began)
 			done <- err
 		}()
-		heal()
 		if err := <-done; err != nil {
 			t.Fatalf("Observe = %v, want a protected ack after the convergence", err)
 		}
+		synctest.Wait()
 
 		conv := h.last("convergence")
-		wantAttrs(t, conv, map[string]any{logattr.ConvergeTrigger: logattr.TriggerSelfHeal})
+		wantAttrs(t, conv, map[string]any{logattr.ConvergeTrigger: logattr.TriggerFirewallChanged})
 		convMS := conv.attrs[logattr.ConvergeDurationMS].Int64()
 		if convMS == 0 {
-			t.Fatal("the self-heal took no time; the test proves nothing")
+			t.Fatal("the repair took no time; the test proves nothing")
 		}
 		evs := h.logs.events("report")
 		if len(evs) != before+1 {

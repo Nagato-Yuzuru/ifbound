@@ -2,7 +2,9 @@ package reconcile
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
+	"sync"
 
 	"github.com/Nagato-Yuzuru/ifbound/internal/policy"
 )
@@ -52,6 +54,14 @@ type Guard struct {
 	mu      chan struct{}
 	readers int
 	epoch   uint64 // written only while an Exclusive call holds held
+	// seen guards expected and known. Exclusive writes them, and so does
+	// Changed in a shared section. The lock is held only for the
+	// compare, never across a call of the Backend.
+	seen sync.Mutex
+	// expected is the last digest that ifbound read or wrote, when known
+	// is true.
+	expected Digest
+	known    bool
 }
 
 // NewGuard returns a Guard for b with epoch 0. Every use of b must then
@@ -66,6 +76,16 @@ func NewGuard(b Backend) *Guard {
 // not call f: a report does not wait for a slow convergence after its
 // caller left.
 func (g *Guard) Shared(ctx context.Context, f func(Adder) error) error {
+	if err := g.lockShared(ctx); err != nil {
+		return err
+	}
+	defer g.unlockShared()
+	return f(g.b)
+}
+
+// lockShared starts a shared section. It returns ctx.Err() when ctx ends
+// before the section can start.
+func (g *Guard) lockShared(ctx context.Context) error {
 	select {
 	case g.turn <- struct{}{}:
 		<-g.turn
@@ -87,19 +107,28 @@ func (g *Guard) Shared(ctx context.Context, f func(Adder) error) error {
 	}
 	g.readers++
 	<-g.mu
-	defer func() {
-		g.mu <- struct{}{}
-		g.readers--
-		if g.readers == 0 {
-			<-g.held
-		}
-		<-g.mu
-	}()
-	return f(g.b)
+	return nil
 }
 
-// Exclusive calls f with the Backend. No other call of Shared or
-// Exclusive runs while f runs. It returns the epoch after f.
+// unlockShared ends a shared section that lockShared started.
+func (g *Guard) unlockShared() {
+	g.mu <- struct{}{}
+	g.readers--
+	if g.readers == 0 {
+		<-g.held
+	}
+	<-g.mu
+}
+
+// Exclusive calls f with the Backend. No other call of Shared,
+// Exclusive, or Changed runs while f runs. It returns the epoch after f.
+//
+// After each write of f (Load, RemoveEntries, DropTable), and before f
+// goes on, the Backend of f reads Backend.Digest and keeps it as the
+// expected digest (see Changed). So the writes of ifbound never look like
+// a change to the watcher. When the read fails, the expected digest is
+// unknown, and the next call of Changed reports a change. A call that
+// writes nothing keeps the expected digest.
 //
 // The Backend that f gets is valid only until f returns. A use after
 // that panics.
@@ -114,6 +143,40 @@ func (g *Guard) Exclusive(f func(Backend)) uint64 {
 	defer func() { w.g = nil }()
 	f(w)
 	return g.epoch
+}
+
+// Changed reads Backend.Digest in a shared section and compares it with
+// the expected digest. It reports true when they differ, or when the
+// expected digest is unknown. It then keeps the new digest as the
+// expected one, so it reports each change once. It is for a watcher that
+// finds the changes that another program makes.
+//
+// The expected digest is the one that the Guard read after the last
+// write of ifbound, or the one that the last call of Changed read.
+// Changed never runs in an Exclusive section, so a write of ifbound never
+// looks like a change. The cost is a short gap: when another program
+// changes the kernel during a write of ifbound, after the last step of
+// the write that reads the state, the digest after the write includes
+// that change, and Changed does not report it. The next convergence (the
+// self-heal) reads the state and finds it.
+//
+// When ctx ends before the shared section can start, Changed returns
+// ctx.Err(). When the read fails, it returns the error, and the expected
+// digest does not change.
+func (g *Guard) Changed(ctx context.Context) (bool, error) {
+	if err := g.lockShared(ctx); err != nil {
+		return false, err
+	}
+	defer g.unlockShared()
+	d, err := g.b.Digest(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reading the digest: %w", err)
+	}
+	g.seen.Lock()
+	defer g.seen.Unlock()
+	changed := !g.known || d != g.expected
+	g.expected, g.known = d, true
+	return changed, nil
 }
 
 // counted is the Backend of one Exclusive call. It moves the epoch
@@ -152,13 +215,29 @@ func (c *counted) AddEntries(ctx context.Context, table policy.Name, entries []n
 }
 
 func (c *counted) Load(ctx context.Context, rs Ruleset) error {
+	defer c.expect(ctx)
 	return c.write().Load(ctx, rs)
 }
 
 func (c *counted) RemoveEntries(ctx context.Context, table policy.Name, entries []netip.Prefix) error {
+	defer c.expect(ctx)
 	return c.write().RemoveEntries(ctx, table, entries)
 }
 
 func (c *counted) DropTable(ctx context.Context, table policy.Name) error {
+	defer c.expect(ctx)
 	return c.write().DropTable(ctx, table)
+}
+
+// expect reads the digest after a write and keeps it as the expected
+// digest. It reads right after the write, not at the end of the
+// Exclusive call: a change by another program after the write then
+// shows to Changed, also while the convergence goes on. A write that
+// failed can have changed the kernel too, so expect reads after it as
+// well.
+func (c *counted) expect(ctx context.Context) {
+	d, err := c.backend().Digest(ctx)
+	c.g.seen.Lock()
+	c.g.expected, c.g.known = d, err == nil
+	c.g.seen.Unlock()
 }
