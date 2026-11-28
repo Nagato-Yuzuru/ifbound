@@ -3,10 +3,10 @@ go = "1.27.4"
 "go:golang.org/x/vuln/cmd/govulncheck" = "1.8.0"
 "github:open-telemetry/weaver" = "0.28.0"
 golangci-lint = "2.15.0"
-jactionlint = "v2.4.0"
-prek = "0.5.9"
+jactionlint = "v2.6.0"
+prek = "0.5.11"
 # The local end-to-end VM needs a macOS host. CI sets MISE_DISABLE_TOOLS=tart.
-tart = { version = "2.41.1", os = ["macos"] }
+tart = { version = "2.42.0", os = ["macos"] }
 
 [env]
 # Base image of the end-to-end guest, pinned by digest. A registry mirror
